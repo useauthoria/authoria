@@ -13,6 +13,18 @@ import {
   SupabaseClientError,
 } from '../_shared/utils.ts';
 import type { BlogPostContent } from '../backend/src/core/BlogComposer.ts';
+// Static imports for backend modules (converted from dynamic imports for Deno compatibility)
+import { PlanTrialManager } from '../backend/src/core/PlanTrialManager.ts';
+import { GDPRDataGuard } from '../backend/src/core/GDPRDataGuard.ts';
+import { BlogComposer } from '../backend/src/core/BlogComposer.ts';
+import { KeywordMiner } from '../backend/src/core/KeywordMiner.ts';
+import { SEOOptimizer } from '../backend/src/core/SEOOptimizer.ts';
+import { ContentGraph } from '../backend/src/core/ContentGraph.ts';
+import { ProductContextEngine } from '../backend/src/core/ProductContextEngine.ts';
+import { ImageGenerator } from '../backend/src/core/ImageGenerator.ts';
+import { PlanQuotaManager } from '../backend/src/core/PlanQuotaManager.ts';
+import { JobQueue } from '../backend/src/core/JobQueue.ts';
+import { ShopifyClient } from '../backend/src/integrations/ShopifyClient.ts';
 
 interface DenoEnv {
   readonly get?: (key: string) => string | undefined;
@@ -657,7 +669,6 @@ async function handleCreatePost(ctx: RequestContext): Promise<Response> {
     const contentPreferences = storeData.content_preferences || {};
 
     // Check plan limits using enterprise-grade PlanTrialManager with distributed locking
-    const { PlanTrialManager } = await import('../backend/src/core/PlanTrialManager.ts');
     const planTrialManager = new PlanTrialManager(supabase);
 
     const enforcementResult = await retryOperation(
@@ -681,7 +692,6 @@ async function handleCreatePost(ctx: RequestContext): Promise<Response> {
       );
     }
 
-    const { GDPRDataGuard } = await import('../backend/src/core/GDPRDataGuard.ts');
     const gdprGuard = new GDPRDataGuard(supabase);
 
     if (!CONFIG.OPENAI_API_KEY) {
@@ -690,8 +700,6 @@ async function handleCreatePost(ctx: RequestContext): Promise<Response> {
 
     const toneMatrix = (storeData.tone_matrix as Readonly<Record<string, number>> | null) ?? DEFAULT_TONE_MATRIX;
 
-    const { BlogComposer } = await import('../backend/src/core/BlogComposer.ts');
-    const { KeywordMiner } = await import('../backend/src/core/KeywordMiner.ts');
     const blogComposer = new BlogComposer(CONFIG.OPENAI_API_KEY, toneMatrix, storeData.brand_dna ?? {});
     const keywordMiner = new KeywordMiner(CONFIG.OPENAI_API_KEY);
 
@@ -774,8 +782,6 @@ async function handleCreatePost(ctx: RequestContext): Promise<Response> {
     let seoMetadata: Readonly<Record<string, unknown>> | undefined;
     if (CONFIG.ENABLE_SEO_OPTIMIZATION) {
       try {
-        const { SEOOptimizer } = await import('../backend/src/core/SEOOptimizer.ts');
-        const { ContentGraph } = await import('../backend/src/core/ContentGraph.ts');
         const contentGraph = new ContentGraph(supabase, CONFIG.OPENAI_API_KEY);
         const seoOptimizer = new SEOOptimizer(CONFIG.OPENAI_API_KEY, supabase, contentGraph, storeData.shop_domain);
         
@@ -831,8 +837,6 @@ async function handleCreatePost(ctx: RequestContext): Promise<Response> {
     let productMentions: ReadonlyArray<unknown> | undefined;
     if (params.products && params.products.length > 0 && CONFIG.ENABLE_PRODUCT_MENTIONS) {
       try {
-        const { ProductContextEngine } = await import('../backend/src/core/ProductContextEngine.ts');
-        const { ShopifyClient } = await import('../backend/src/integrations/ShopifyClient.ts');
         const shopifyClient = new ShopifyClient(storeData.shop_domain, storeData.access_token);
         
         const productContextEngine = new ProductContextEngine(
@@ -879,7 +883,6 @@ async function handleCreatePost(ctx: RequestContext): Promise<Response> {
     let featuredImageUrl: string | null = null;
     if (CONFIG.ENABLE_IMAGE_GENERATION && CONFIG.FLUX_API_KEY && postContent.imagePrompt) {
       try {
-        const { ImageGenerator } = await import('../backend/src/core/ImageGenerator.ts');
         const imageGenerator = new ImageGenerator(CONFIG.FLUX_API_KEY);
 
         const imageResult = await retryOperation(
@@ -895,7 +898,6 @@ async function handleCreatePost(ctx: RequestContext): Promise<Response> {
         );
 
         try {
-          const { ShopifyClient } = await import('../backend/src/integrations/ShopifyClient.ts');
           const shopifyClient = new ShopifyClient(storeData.shop_domain, storeData.access_token);
 
           const cdnResult = await retryOperation(
@@ -1036,7 +1038,6 @@ async function handleCreatePost(ctx: RequestContext): Promise<Response> {
     await retryOperation(
       async () => {
         // Record usage using PlanQuotaManager
-        const { PlanQuotaManager } = await import('../backend/src/core/PlanQuotaManager.ts');
         const quotaManager = new PlanQuotaManager(supabase);
         await quotaManager.recordUsage(params.storeId, (post as DatabasePost)[COLUMN_ID] as string, 'generated');
         return { data: true };
@@ -1049,7 +1050,6 @@ async function handleCreatePost(ctx: RequestContext): Promise<Response> {
     // Generate internal links after post creation
     if (CONFIG.ENABLE_INTERNAL_LINKS) {
       try {
-        const { ContentGraph } = await import('../backend/src/core/ContentGraph.ts');
         const contentGraph = new ContentGraph(supabase, CONFIG.OPENAI_API_KEY);
         
         await retryOperation(
@@ -1084,7 +1084,6 @@ async function handleCreatePost(ctx: RequestContext): Promise<Response> {
 
     if (CONFIG.ENABLE_LLM_SNIPPETS) {
       try {
-        const { JobQueue } = await import('../backend/src/core/JobQueue.ts');
         const jobQueue = new JobQueue(supabase);
         await retryOperation(
           async () =>

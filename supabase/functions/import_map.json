@@ -2,6 +2,7 @@
     "imports": {
         "axios": "https://esm.sh/axios@1.6.2",
         "openai": "https://esm.sh/openai@4.50.0",
-        "zod": "https://esm.sh/zod@3.22.4"
+        "zod": "https://esm.sh/zod@3.22.4",
+        "@supabase/supabase-js": "https://esm.sh/@supabase/supabase-js@2"
     }
 }
