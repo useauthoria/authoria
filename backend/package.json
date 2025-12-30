@@ -1,0 +1,27 @@
+{
+  "name": "authoria-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "supabase functions serve",
+    "build": "tsc",
+    "deploy": "supabase functions deploy",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:ui": "vitest --ui",
+    "test:coverage": "vitest run --coverage"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.38.4",
+    "axios": "^1.6.2",
+    "openai": "^4.50.0",
+    "zod": "^3.22.4"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.5",
+    "@vitest/coverage-v8": "^1.6.1",
+    "@vitest/ui": "^1.6.1",
+    "typescript": "^5.2.2",
+    "vitest": "^1.6.1"
+  }
+}
