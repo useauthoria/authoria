@@ -805,7 +805,7 @@ async function handleQuota(ctx: RequestContext): Promise<Response> {
     // If store has no plan, initialize trial using enterprise-grade manager
     if (!storeData.plan_id) {
       const { PlanTrialManager } = await import('../backend/src/core/PlanTrialManager.ts');
-      const planTrialManager = new PlanTrialManager(supabase);
+      const planTrialManager = new PlanTrialManager(serviceSupabase);
 
       const initResult = await retryOperation(
         async () => {
