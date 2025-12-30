@@ -833,7 +833,8 @@ async function handleQuota(ctx: RequestContext): Promise<Response> {
 
     const { data: quotaStatus, error } = await retryOperation(
       async () => {
-        const result = await supabase.rpc(RPC_GET_STORE_QUOTA_STATUS, {
+        // Use service role client for RPC call as well to ensure consistency
+        const result = await serviceSupabase.rpc(RPC_GET_STORE_QUOTA_STATUS, {
           [PARAM_STORE_UUID]: storeId,
         });
         if (result.error) {
