@@ -16,6 +16,7 @@ build/
 
 # Supabase
 .supabase/
+supabase/.temp/
 
 # Shopify
 .shopify/
