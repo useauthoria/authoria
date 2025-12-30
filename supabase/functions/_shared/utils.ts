@@ -942,9 +942,10 @@ export async function validateJWT(
       }
     }
 
-    // Extract user ID
+    // Extract user ID (anon keys might not have a sub field)
     const userId = payload.sub;
-    if (!userId) {
+    // Anon keys are valid even without a subject - they're service keys
+    if (!userId && payload.role !== 'anon') {
       return { valid: false, error: 'JWT missing subject' };
     }
 
