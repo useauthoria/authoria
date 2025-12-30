@@ -756,17 +756,26 @@ async function handleQuota(ctx: RequestContext): Promise<Response> {
   }
 
   try {
+    // Use service role client to bypass RLS when fetching store
+    // The anon client might not have permission to read stores due to RLS policies
+    const serviceSupabase = await getSupabaseClient({ clientType: 'service' });
+    
     // First, ensure store has a plan - assign free_trial if missing
     const { data: store, error: storeCheckError } = await retryOperation(
       async () => {
-        const result = await supabase
+        const result = await serviceSupabase
           .from(TABLE_STORES)
           .select(`${COLUMN_ID}, ${COLUMN_PLAN_ID}, ${COLUMN_TRIAL_STARTED_AT}, ${COLUMN_TRIAL_ENDS_AT}`)
           .eq(COLUMN_ID, storeId)
           .single();
         if (result.error) {
-          // Log detailed error for debugging
+          // Check if it's a "not found" error
           const errorCode = (result.error as { code?: string })?.code;
+          if (errorCode === 'PGRST116') {
+            // Return a result that indicates not found
+            return { data: null, error: result.error };
+          }
+          // Log detailed error for debugging
           const errorMessage = (result.error as { message?: string })?.message || String(result.error);
           const errorDetails = (result.error as { details?: string })?.details;
           const errorHint = (result.error as { hint?: string })?.hint;
