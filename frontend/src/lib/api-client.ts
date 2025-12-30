@@ -209,9 +209,14 @@ class EnhancedAPIClient {
         // Add authentication - use Supabase anon key for Shopify app context
         // In Shopify apps, we don't use Supabase auth sessions, so we use the anon key
         if (!config.headers.Authorization) {
-          const anonKey = (import.meta.env as { readonly VITE_SUPABASE_ANON_KEY?: string }).VITE_SUPABASE_ANON_KEY;
+          const anonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
           if (anonKey) {
             config.headers.Authorization = `Bearer ${anonKey}`;
+          } else {
+            // Log warning in development - in production this will be minified/removed
+            if (typeof window !== 'undefined' && window.location.hostname !== 'localhost') {
+              console.error('[API Client] VITE_SUPABASE_ANON_KEY is missing! API requests will fail with 401.');
+            }
           }
         }
 
@@ -814,8 +819,13 @@ class EnhancedAPIClient {
 // Supabase Client
 // ============================================================================
 
-const supabaseUrl = (import.meta.env as { readonly VITE_SUPABASE_URL?: string }).VITE_SUPABASE_URL || '';
-const supabaseAnonKey = (import.meta.env as { readonly VITE_SUPABASE_ANON_KEY?: string }).VITE_SUPABASE_ANON_KEY || '';
+const supabaseUrl = import.meta.env.VITE_SUPABASE_URL || '';
+const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY || '';
+
+// Log if anon key is missing (helpful for debugging deployment issues)
+if (!supabaseAnonKey && typeof window !== 'undefined') {
+  console.error('[API Client] VITE_SUPABASE_ANON_KEY is not set. Please set it in Render environment variables and redeploy.');
+}
 
 export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
   auth: {
