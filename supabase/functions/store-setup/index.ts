@@ -12,7 +12,7 @@ import {
   UtilsError,
   SupabaseClientError,
 } from '../_shared/utils.ts';
-import type { BrandAnalysis } from '../../../backend/src/core/BrandManager.ts';
+import type { BrandAnalysis } from '../backend/src/core/BrandManager.ts';
 
 interface DenoEnv {
   readonly get?: (key: string) => string | undefined;
@@ -994,7 +994,7 @@ async function handleStoreSetup(ctx: RequestContext): Promise<Response> {
     logProgress(correlationId, STAGE_FETCHING_STORE_CONTENT, PERCENTAGE_FETCHING_STORE_CONTENT);
 
     // Import Shopify API to fetch store content
-    const { ShopifyAPI } = await import('../../../backend/src/integrations/ShopifyClient.ts');
+    const { ShopifyAPI } = await import('../backend/src/integrations/ShopifyClient.ts');
     const shopifyAPI = new ShopifyAPI(storeData.shop_domain, storeData.access_token);
 
     // Fetch ALL store content in parallel

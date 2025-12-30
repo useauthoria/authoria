@@ -781,7 +781,7 @@ async function handleQuota(ctx: RequestContext): Promise<Response> {
     
     // If store has no plan, initialize trial using enterprise-grade manager
     if (!storeData.plan_id) {
-      const { PlanTrialManager } = await import('../../../backend/src/core/PlanTrialManager.ts');
+      const { PlanTrialManager } = await import('../backend/src/core/PlanTrialManager.ts');
       const planTrialManager = new PlanTrialManager(supabase);
 
       const initResult = await retryOperation(
@@ -1362,7 +1362,7 @@ async function handleQueue(ctx: RequestContext): Promise<Response> {
         return createErrorResponse('storeId is required', STATUS_BAD_REQUEST, correlationId);
       }
       
-      const { ArticlesQueue } = await import('../../../backend/src/core/ArticlesQueue.ts');
+      const { ArticlesQueue } = await import('../backend/src/core/ArticlesQueue.ts');
       const serviceSupabase = await getSupabaseClient({ clientType: 'service' });
       const queue = new ArticlesQueue(serviceSupabase);
       const metrics = await queue.getQueueMetrics(targetStoreId);
@@ -1379,7 +1379,7 @@ async function handleQueue(ctx: RequestContext): Promise<Response> {
         return createErrorResponse('storeId is required', STATUS_BAD_REQUEST, correlationId);
       }
       
-      const { ArticlesQueue } = await import('../../../backend/src/core/ArticlesQueue.ts');
+      const { ArticlesQueue } = await import('../backend/src/core/ArticlesQueue.ts');
       const serviceSupabase = await getSupabaseClient({ clientType: 'service' });
       
       // Get store data for AI generation
@@ -1415,7 +1415,7 @@ async function handleQueue(ctx: RequestContext): Promise<Response> {
         return createErrorResponse('articleIds array is required', STATUS_BAD_REQUEST, correlationId);
       }
       
-      const { ArticlesQueue } = await import('../../../backend/src/core/ArticlesQueue.ts');
+      const { ArticlesQueue } = await import('../backend/src/core/ArticlesQueue.ts');
       const serviceSupabase = await getSupabaseClient({ clientType: 'service' });
       const queue = new ArticlesQueue(serviceSupabase);
       
@@ -1439,7 +1439,7 @@ async function handleQueue(ctx: RequestContext): Promise<Response> {
         return createErrorResponse('articleId is required', STATUS_BAD_REQUEST, correlationId);
       }
       
-      const { ArticlesQueue } = await import('../../../backend/src/core/ArticlesQueue.ts');
+      const { ArticlesQueue } = await import('../backend/src/core/ArticlesQueue.ts');
       const serviceSupabase = await getSupabaseClient({ clientType: 'service' });
       
       // Get store data for AI generation
@@ -1475,7 +1475,7 @@ async function handleQueue(ctx: RequestContext): Promise<Response> {
       return createErrorResponse('storeId is required', STATUS_BAD_REQUEST, correlationId);
     }
     
-    const { ArticlesQueue } = await import('../../../backend/src/core/ArticlesQueue.ts');
+    const { ArticlesQueue } = await import('../backend/src/core/ArticlesQueue.ts');
     const serviceSupabase = await getSupabaseClient({ clientType: 'service' });
     const queue = new ArticlesQueue(serviceSupabase);
     const queueList = await queue.getQueue(targetStoreId);
@@ -1574,7 +1574,7 @@ async function handleCompleteSetup(ctx: RequestContext): Promise<Response> {
       
       // Only reset if no plan OR trial has expired
       if (!planId || trialExpired) {
-        const { PlanTrialManager } = await import('../../../backend/src/core/PlanTrialManager.ts');
+        const { PlanTrialManager } = await import('../backend/src/core/PlanTrialManager.ts');
         const planTrialManager = new PlanTrialManager(serviceSupabase);
 
         const initResult = await planTrialManager.initializeTrial(
@@ -1625,7 +1625,7 @@ async function handleCompleteSetup(ctx: RequestContext): Promise<Response> {
 
   // After setup is complete, ensure queue is filled
   try {
-    const { ArticlesQueue } = await import('../../../backend/src/core/ArticlesQueue.ts');
+    const { ArticlesQueue } = await import('../backend/src/core/ArticlesQueue.ts');
     
     // Get store data for AI generation
     const { data: store } = await serviceSupabase

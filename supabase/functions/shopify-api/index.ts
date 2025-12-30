@@ -322,7 +322,7 @@ async function submitSitemapToGSC(
     }
 
     // Import GoogleSearchConsole
-    const { GoogleSearchConsole } = await import('../../../backend/src/integrations/GoogleSearchConsole.ts');
+    const { GoogleSearchConsole } = await import('../backend/src/integrations/GoogleSearchConsole.ts');
     const gsc = new GoogleSearchConsole({
       accessToken: credentials.access_token,
       siteUrl: credentials.site_url,
@@ -610,7 +610,7 @@ async function syncProducts(
   store: DatabaseStore,
   correlationId: string,
 ): Promise<{ synced: number; errors: number }> {
-  const { ShopifyAPI, ShopifyError, ShopifyErrorType } = await import('../../../backend/src/integrations/ShopifyClient.ts');
+  const { ShopifyAPI, ShopifyError, ShopifyErrorType } = await import('../backend/src/integrations/ShopifyClient.ts');
   const shopifyAPI = new ShopifyAPI(store.shop_domain, store.access_token);
 
   try {
@@ -713,7 +713,7 @@ async function syncCollections(
   store: DatabaseStore,
   correlationId: string,
 ): Promise<{ synced: number; errors: number }> {
-  const { ShopifyAPI, ShopifyError, ShopifyErrorType } = await import('../../../backend/src/integrations/ShopifyClient.ts');
+  const { ShopifyAPI, ShopifyError, ShopifyErrorType } = await import('../backend/src/integrations/ShopifyClient.ts');
   const shopifyAPI = new ShopifyAPI(store.shop_domain, store.access_token);
 
   try {
@@ -799,7 +799,7 @@ async function syncStoreMetadata(
   store: DatabaseStore,
   correlationId: string,
 ): Promise<{ synced: boolean; metadata: Readonly<Record<string, unknown>> }> {
-  const { ShopifyAPI, ShopifyError, ShopifyErrorType } = await import('../../../backend/src/integrations/ShopifyClient.ts');
+  const { ShopifyAPI, ShopifyError, ShopifyErrorType } = await import('../backend/src/integrations/ShopifyClient.ts');
   const shopifyAPI = new ShopifyAPI(store.shop_domain, store.access_token);
 
   try {
@@ -940,7 +940,7 @@ async function handlePublishToShopify(ctx: RequestContext): Promise<Response> {
     const postData = post as unknown as DatabasePost;
 
     // Import Shopify client
-    const { ShopifyClient } = await import('../../../backend/src/integrations/ShopifyClient.ts');
+    const { ShopifyClient } = await import('../backend/src/integrations/ShopifyClient.ts');
     const shopifyClient = new ShopifyClient(storeData.shop_domain, storeData.access_token);
     const shopifyAPI = shopifyClient.rest;
 
@@ -1285,7 +1285,7 @@ async function handleCreateSubscription(ctx: RequestContext): Promise<Response> 
     }
 
     // 3. Import ShopifyBilling
-    const { ShopifyBilling } = await import('../../../backend/src/integrations/ShopifyBilling.ts');
+    const { ShopifyBilling } = await import('../backend/src/integrations/ShopifyBilling.ts');
     const shopifyBilling = new ShopifyBilling(supabase, storeData.shop_domain, storeData.access_token);
 
     // 4. Create Subscription via Shopify Billing API

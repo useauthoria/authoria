@@ -89,8 +89,8 @@ async function handleSubscriptionUpdate(
   }
 
   // Use enterprise-grade plan transition manager
-  const { PlanTrialManager } = await import('../../../backend/src/core/PlanTrialManager.ts');
-  const { ShopifyBilling } = await import('../../../backend/src/integrations/ShopifyBilling.ts');
+  const { PlanTrialManager } = await import('../backend/src/core/PlanTrialManager.ts');
+  const { ShopifyBilling } = await import('../backend/src/integrations/ShopifyBilling.ts');
   
   const planTrialManager = new PlanTrialManager(supabase);
   

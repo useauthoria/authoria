@@ -302,7 +302,7 @@ async function handleProcessScheduledPosts(ctx: RequestContext): Promise<Respons
     }
 
     // Import Scheduler
-    const { Scheduler } = await import('../../../backend/src/core/Scheduler.ts');
+    const { Scheduler } = await import('../backend/src/core/Scheduler.ts');
     const scheduler = new Scheduler(
       CONFIG.SUPABASE_URL,
       CONFIG.SUPABASE_SERVICE_ROLE_KEY,

@@ -5,7 +5,9 @@
   "scripts": {
     "dev": "supabase functions serve",
     "build": "tsc",
-    "deploy": "supabase functions deploy",
+    "prepare-functions": "bash ../scripts/prepare-functions.sh",
+    "deploy": "npm run prepare-functions && supabase functions deploy",
+    "deploy:all": "npm run prepare-functions && supabase functions deploy --no-verify-jwt",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:ui": "vitest --ui",
