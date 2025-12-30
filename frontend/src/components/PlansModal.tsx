@@ -1,7 +1,6 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect } from 'react';
 import { supabase } from '../lib/api-client';
 import { useAppBridge, useAppBridgeToast } from '../hooks/useAppBridge';
-import { getShopDomain } from '../lib/app-bridge';
 import { formatAPIErrorMessage } from '../utils/error-messages';
 
 interface Plan {
@@ -206,7 +205,7 @@ export default function PlansModal({ isOpen, onClose, currentPlanName, storeId }
 
   const handleSelectPlan = async (planName: string) => {
     if (!storeId) {
-      showToast({ message: "Store information is missing. Please refresh the page.", isError: true });
+      showToast("Store information is missing. Please refresh the page.", { isError: true });
       return;
     }
 

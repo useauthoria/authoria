@@ -29,19 +29,6 @@ export default function ArticlesQueue({ storeId, onArticleClick, showTitle = tru
     refetchInterval: 30000, // Refetch every 30 seconds to ensure queue stays filled
   });
 
-  // Auto-refill queue when it's below target - ensure queue is always filled for active stores
-  useEffect(() => {
-    if (metrics && metrics.targetCount > 0 && metrics.needsRefill && !refillMutation.isPending) {
-      // Small delay to avoid race conditions with other refetches
-      const timer = setTimeout(() => {
-        if (queue.length < metrics.targetCount) {
-          refillMutation.mutate();
-        }
-      }, 2000); // 2 second delay to batch refills
-      return () => clearTimeout(timer);
-    }
-  }, [metrics?.needsRefill, metrics?.targetCount, queue.length, refillMutation, metrics]);
-
   const displayedQueue = maxItems ? queue.slice(0, maxItems) : queue;
 
   const reorderMutation = useMutation({
@@ -84,6 +71,19 @@ export default function ArticlesQueue({ storeId, onArticleClick, showTitle = tru
       // Don't show error toast for auto-refill
     },
   });
+
+  // Auto-refill queue when it's below target - ensure queue is always filled for active stores
+  useEffect(() => {
+    if (metrics && metrics.targetCount > 0 && metrics.needsRefill && !refillMutation.isPending) {
+      // Small delay to avoid race conditions with other refetches
+      const timer = setTimeout(() => {
+        if (queue.length < metrics.targetCount) {
+          refillMutation.mutate();
+        }
+      }, 2000); // 2 second delay to batch refills
+      return () => clearTimeout(timer);
+    }
+  }, [metrics?.needsRefill, metrics?.targetCount, queue.length, refillMutation, metrics]);
 
   const handleDragStart = useCallback((index: number) => {
     setDraggedIndex(index);

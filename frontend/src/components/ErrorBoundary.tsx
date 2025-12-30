@@ -2,7 +2,7 @@
  * Error Boundary Component
  * Catches React errors and displays a user-friendly error UI
  */
-import React, { Component, ReactNode, ErrorInfo } from 'react';
+import { Component, ReactNode, ErrorInfo } from 'react';
 
 interface ErrorBoundaryProps {
   children: ReactNode;

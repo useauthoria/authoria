@@ -27,8 +27,8 @@ export function AppBridgeContextualSaveBar({ visible, options }: AppBridgeContex
     if (!visible) {
       if (isShownRef.current) {
         waitForAppBridge().then((appBridge) => {
-          if (appBridge?.contextualSaveBar?.hide) {
-            appBridge.contextualSaveBar.hide();
+          if ((appBridge as any)?.contextualSaveBar?.hide) {
+            (appBridge as any).contextualSaveBar.hide();
             isShownRef.current = false;
           }
         });
@@ -37,8 +37,8 @@ export function AppBridgeContextualSaveBar({ visible, options }: AppBridgeContex
     }
 
     waitForAppBridge().then((appBridge) => {
-      if (appBridge?.contextualSaveBar?.show) {
-        appBridge.contextualSaveBar.show({
+      if ((appBridge as any)?.contextualSaveBar?.show) {
+        (appBridge as any).contextualSaveBar.show({
           saveAction: options.saveAction
             ? {
                 onAction: async () => {
@@ -66,8 +66,8 @@ export function AppBridgeContextualSaveBar({ visible, options }: AppBridgeContex
     return () => {
       if (isShownRef.current) {
         waitForAppBridge().then((appBridge) => {
-          if (appBridge?.contextualSaveBar?.hide) {
-            appBridge.contextualSaveBar.hide();
+          if ((appBridge as any)?.contextualSaveBar?.hide) {
+            (appBridge as any).contextualSaveBar.hide();
           }
         });
       }

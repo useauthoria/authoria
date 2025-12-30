@@ -5,7 +5,7 @@ type RequestPriority = 'low' | 'medium' | 'high' | 'critical';
 
 type ErrorCategory = 'network' | 'timeout' | 'auth' | 'validation' | 'server' | 'client' | 'unknown';
 
-interface RequestConfig extends AxiosRequestConfig {
+interface RequestConfig extends Omit<AxiosRequestConfig, 'cancelToken'> {
   priority?: RequestPriority;
   timeout?: number;
   retry?: RetryConfig;
@@ -128,10 +128,25 @@ class EnhancedAPIClient {
   private offlineQueue: Array<{ readonly id: string; readonly config: RequestConfig; readonly resolve: (value: unknown) => void; readonly reject: (error: unknown) => void }> = [];
   private isOnline: boolean = navigator.onLine;
 
+  private config: {
+    enableDeduplication?: boolean;
+    enableCaching?: boolean;
+    enableRetry?: boolean;
+    enableCompression?: boolean;
+    enableLogging?: boolean;
+    enableMetrics?: boolean;
+    enableBatching?: boolean;
+    enableRateLimiting?: boolean;
+    enableOffline?: boolean;
+    defaultTimeout?: number;
+    defaultRetry?: RetryConfig;
+    apiVersion?: string;
+  };
+
   constructor(
     baseURL: string,
     private supabaseClient: ReturnType<typeof createClient>,
-    private config: {
+    config: {
       enableDeduplication?: boolean;
       enableCaching?: boolean;
       enableRetry?: boolean;
@@ -146,6 +161,7 @@ class EnhancedAPIClient {
       apiVersion?: string;
     } = {},
   ) {
+    this.config = config;
     this.instance = axios.create({
       baseURL,
       headers: {
@@ -298,7 +314,7 @@ class EnhancedAPIClient {
       const cached = this.cache.get(cacheKey);
       if (cached && cached.expiresAt > Date.now()) {
         this.metrics.cacheHits++;
-        const url = (config as AxiosRequestConfig).url;
+        const url = (config as unknown as AxiosRequestConfig).url;
         if (this.config.enableMetrics && url) {
           this.updateMetrics(url, true, Date.now() - startTime);
         }
@@ -375,7 +391,8 @@ class EnhancedAPIClient {
         }
 
         // Execute request
-        const response = await this.instance.request<T>(config);
+        const { cancelToken, ...axiosConfig } = config;
+        const response = await this.instance.request<T>(axiosConfig as unknown as unknown as AxiosRequestConfig);
 
         // Cache response
         if (this.config.enableCaching && config.cache?.enabled !== false) {
@@ -391,7 +408,7 @@ class EnhancedAPIClient {
         const latency = Date.now() - startTime;
         this.metrics.successfulRequests++;
         this.metrics.totalRequests++;
-        const url = (config as AxiosRequestConfig).url;
+        const url = (config as unknown as AxiosRequestConfig).url;
         if (this.config.enableMetrics && url) {
           this.updateMetrics(url, true, latency);
         }
@@ -418,7 +435,7 @@ class EnhancedAPIClient {
         const latency = Date.now() - startTime;
         this.metrics.failedRequests++;
         this.metrics.totalRequests++;
-        const url = (config as AxiosRequestConfig).url;
+        const url = (config as unknown as AxiosRequestConfig).url;
         if (this.config.enableMetrics && url) {
           this.updateMetrics(url, false, latency);
         }
@@ -541,17 +558,17 @@ class EnhancedAPIClient {
     if (config.cache?.key) {
       return config.cache.key;
     }
-    const method = (config as AxiosRequestConfig).method || 'GET';
-    const url = (config as AxiosRequestConfig).url || '';
-    const params = (config as AxiosRequestConfig).params || {};
-    const data = (config as AxiosRequestConfig).data || {};
+    const method = (config as unknown as AxiosRequestConfig).method || 'GET';
+    const url = (config as unknown as AxiosRequestConfig).url || '';
+    const params = (config as unknown as AxiosRequestConfig).params || {};
+    const data = (config as unknown as AxiosRequestConfig).data || {};
     return `${method}:${url}:${JSON.stringify(params)}:${JSON.stringify(data)}`;
   }
 
   private getDedupeKey(config: RequestConfig): string {
-    const method = (config as AxiosRequestConfig).method || 'GET';
-    const url = (config as AxiosRequestConfig).url || '';
-    const data = (config as AxiosRequestConfig).data || {};
+    const method = (config as unknown as AxiosRequestConfig).method || 'GET';
+    const url = (config as unknown as AxiosRequestConfig).url || '';
+    const data = (config as unknown as AxiosRequestConfig).data || {};
     return `${method}:${url}:${JSON.stringify(data)}`;
   }
 
@@ -626,14 +643,15 @@ class EnhancedAPIClient {
 
   private async executeBatch(batch: BatchRequest): Promise<void> {
     try {
-      const promises = batch.requests.map((req) =>
-        this.instance.request({
-          method: req.method as AxiosRequestConfig['method'],
+      const promises = batch.requests.map((req) => {
+        const { cancelToken, ...axiosConfig } = req.config || {};
+        return this.instance.request({
+          method: req.method as unknown as AxiosRequestConfig['method'],
           url: req.url,
           data: req.data,
-          ...req.config,
-        }),
-      );
+          ...axiosConfig,
+        } as unknown as AxiosRequestConfig);
+      });
 
       const results = await Promise.allSettled(promises);
       const data = results.map((result) =>
@@ -812,7 +830,7 @@ export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
 // Use relative URL so Vite proxy handles it, or absolute URL in production
 const API_BASE_URL = (import.meta.env as { readonly VITE_API_BASE_URL?: string }).VITE_API_BASE_URL || '/functions/v1';
 
-export const api = new EnhancedAPIClient(API_BASE_URL, supabase, {
+export const api = new EnhancedAPIClient(API_BASE_URL, supabase as any, {
   enableDeduplication: true,
   enableCaching: true,
   enableRetry: true,
@@ -933,10 +951,11 @@ export const storeApi = {
     // They are client-side settings. If persistence is needed, add a notifications JSONB column
     // to the stores table or create a separate notifications_preferences table
 
-    if (settings.generation_frequency !== undefined || settings.articles_per_period !== undefined) {
+    // Handle frequency settings if provided
+    if ('generation_frequency' in settings || 'articles_per_period' in settings) {
       updates.frequency_settings = {
-        interval: settings.generation_frequency || 'weekly',
-        count: settings.articles_per_period || 2,
+        interval: (settings as any).generation_frequency || 'weekly',
+        count: (settings as any).articles_per_period || 2,
       };
     }
 

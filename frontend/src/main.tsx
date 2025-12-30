@@ -31,7 +31,7 @@ if (typeof window !== 'undefined') {
   import('./lib/webVitals')
     .then(({ initWebVitalsMonitoring }) => {
       const checkAppBridge = (): void => {
-        const shopify = (window as WindowWithShopify).shopify;
+        const shopify = ((window as unknown) as WindowWithShopify).shopify;
 
         if (shopify?.webVitals) {
           initWebVitalsMonitoring(() => {});
@@ -79,7 +79,7 @@ rootElement.innerHTML = `
 
 // Dismiss App Bridge loading if available
 const dismissLoading = () => {
-  const shopify = (window as WindowWithShopify).shopify;
+  const shopify = ((window as unknown) as WindowWithShopify).shopify;
   if (shopify && typeof (shopify as { loading?: () => void }).loading === 'function') {
     try {
       (shopify as { loading: (show: boolean) => void }).loading(false);

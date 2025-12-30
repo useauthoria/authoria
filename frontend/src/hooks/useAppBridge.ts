@@ -53,8 +53,8 @@ export function useAppBridgeToast(): {
 } {
   const showToast = useCallback(async (message: string, options?: ToastOptions) => {
     const appBridge = await waitForAppBridge();
-    if (appBridge?.toast?.show) {
-      appBridge.toast.show(message, {
+    if ((appBridge as any)?.toast?.show) {
+      (appBridge as any).toast.show(message, {
         duration: options?.duration ?? 3000,
         isError: options?.isError ?? false,
       });

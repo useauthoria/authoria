@@ -3,7 +3,7 @@ export interface WebVitalsMetrics {
   readonly shopId?: string;
   readonly userId?: string;
   readonly appLoadId?: string;
-  readonly metrics?: readonly Array<{
+  readonly metrics?: Array<{
     readonly name: string;
     readonly value: number;
     readonly id: string;

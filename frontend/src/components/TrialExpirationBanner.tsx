@@ -238,14 +238,14 @@ export default function TrialExpirationBanner({
           } else {
             // Fallback to settings page
             navigate('/settings');
-            showToast({ message: 'Please navigate to the Billing section to upgrade', isError: false });
+            showToast('Please navigate to the Billing section to upgrade', { isError: false });
           }
         }
       } catch (error) {
         console.error('Failed to navigate to billing:', error);
         // Fallback to settings page
         navigate('/settings');
-        showToast({ message: 'Please navigate to the Billing section to upgrade', isError: false });
+        showToast('Please navigate to the Billing section to upgrade', { isError: false });
       }
     }
   }, [onUpgrade, appBridge, navigate, showToast]);

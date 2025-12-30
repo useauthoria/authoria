@@ -89,11 +89,11 @@ export default function Articles() {
   }, [dateRangeFilter]);
 
   const filters: PostsFilters = useMemo(() => {
-    const f: PostsFilters = {};
+    const f: any = {};
     if (statusFilter) {
       f.status = statusFilter;
     }
-    if (dateRange) {
+    if (dateRange && dateRange.start && dateRange.end) {
       f.dateRange = {
         start: dateRange.start.toISOString(),
         end: dateRange.end.toISOString(),
@@ -112,8 +112,6 @@ export default function Articles() {
   } = usePostsData({
     enableRealTime: true,
     refetchInterval: REFETCH_INTERVAL,
-    retry: true,
-    retryDelay: 1000,
     onError: handleError,
     filters,
     searchQuery,
@@ -411,10 +409,10 @@ export default function Articles() {
 
         <div className="p-4 sm:p-6 lg:p-8">
           {/* Articles Queue */}
-          {store?.id && (
+          {store && typeof store === 'object' && 'id' in store && (store as any).id && (
             <div className="bg-white rounded-xl border border-gray-200 shadow-sm mb-6 sm:mb-8">
               <div className="p-4 sm:p-5 lg:p-6">
-                <ArticlesQueue storeId={store.id} />
+                <ArticlesQueue storeId={(store as any).id} />
               </div>
             </div>
           )}
@@ -615,8 +613,8 @@ export default function Articles() {
                               </td>
                               <td className="px-3 sm:px-4 py-3 text-sm text-gray-900 cursor-pointer min-w-[200px]" onClick={() => handlePostClick(post.id)}>
                                 <div className="font-medium truncate">{post.title}</div>
-                                {post.excerpt && (
-                                  <div className="text-xs text-gray-500 mt-1 line-clamp-1">{post.excerpt}</div>
+                                {(post as any).excerpt && (
+                                  <div className="text-xs text-gray-500 mt-1 line-clamp-1">{(post as any).excerpt}</div>
                                 )}
                               </td>
                               <td className="px-3 sm:px-4 py-3 whitespace-nowrap">
@@ -633,7 +631,7 @@ export default function Articles() {
                                 </Tooltip>
                               </td>
                               <td className="px-3 sm:px-4 py-3 text-sm text-gray-700 whitespace-nowrap">
-                                {post.views !== undefined ? post.views.toLocaleString() : '—'}
+                                {(post as any).views !== undefined ? (post as any).views.toLocaleString() : '—'}
                               </td>
                               <td className="px-3 sm:px-4 py-3 text-sm text-gray-500 whitespace-nowrap">
                                 {formatDate(post.published_at || post.scheduled_publish_at || post.created_at)}
@@ -787,19 +785,19 @@ export default function Articles() {
                 <div className="prose max-w-none">
                   <div className="mb-4 space-y-2">
                     <h1 className="text-3xl font-bold">{previewPost.title}</h1>
-                    {previewPost.seo_title && previewPost.seo_title !== previewPost.title && (
-                      <p className="text-sm text-gray-500">SEO Title: {previewPost.seo_title}</p>
+                    {(previewPost as any).seo_title && (previewPost as any).seo_title !== previewPost.title && (
+                      <p className="text-sm text-gray-500">SEO Title: {(previewPost as any).seo_title}</p>
                     )}
-                    {previewPost.seo_description && (
-                      <p className="text-sm text-gray-600">{previewPost.seo_description}</p>
+                    {(previewPost as any).seo_description && (
+                      <p className="text-sm text-gray-600">{(previewPost as any).seo_description}</p>
                     )}
                   </div>
-                  {previewPost.excerpt && (
-                    <p className="text-lg text-gray-600 mb-6">{previewPost.excerpt}</p>
+                  {(previewPost as any).excerpt && (
+                    <p className="text-lg text-gray-600 mb-6">{(previewPost as any).excerpt}</p>
                   )}
-                  {previewPost.featured_image_url && (
+                  {(previewPost as any).featured_image_url && (
                     <img
-                      src={previewPost.featured_image_url}
+                      src={(previewPost as any).featured_image_url}
                       alt={previewPost.title}
                       className="w-full h-auto rounded-lg mb-6"
                     />
@@ -808,11 +806,11 @@ export default function Articles() {
                     className="article-content"
                     dangerouslySetInnerHTML={{ __html: previewPost.content || '' }}
                   />
-                  {previewPost.keywords && previewPost.keywords.length > 0 && (
+                  {(previewPost as any).keywords && (previewPost as any).keywords.length > 0 && (
                     <div className="mt-6 pt-6 border-t border-gray-200">
                       <p className="text-sm font-medium text-gray-700 mb-2">Keywords:</p>
                       <div className="flex flex-wrap gap-2">
-                        {previewPost.keywords.map((keyword, idx) => (
+                        {((previewPost as any).keywords || []).map((keyword: string, idx: number) => (
                           <span key={idx} className="px-2 py-1 bg-gray-100 text-gray-700 rounded text-xs">
                             {keyword}
                           </span>
@@ -874,7 +872,7 @@ export default function Articles() {
               <h2 className="text-lg sm:text-xl font-bold text-gray-900 mb-4">Review Article</h2>
               <div className="space-y-4">
                 {/* Regeneration Limits Info */}
-                {showReviewModal && store?.id && (
+                {showReviewModal && store && typeof store === 'object' && 'id' in store && (store as any).id && (
                   <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 text-sm">
                     <p className="text-blue-800 font-medium mb-1">Regeneration Limits</p>
                     <p className="text-blue-700 text-xs">
@@ -962,13 +960,13 @@ export default function Articles() {
                   </button>
                   <button
                     onClick={async () => {
-                      if (!store?.id || !showReviewModal) {
+                      if (!store || typeof store !== 'object' || !('id' in store) || !store.id || !showReviewModal) {
                         showToast("We couldn't find your store information. Please refresh the page and try again.", { isError: true });
                         return;
                       }
                       try {
                         // Check limits before regenerating
-                        const limitCheck = await postsApi.checkRegenerationLimits(store.id, showReviewModal);
+                        const limitCheck = await postsApi.checkRegenerationLimits((store as any).id, showReviewModal);
                         if (!limitCheck.allowed) {
                           const friendlyReason = limitCheck.reason 
                             ? limitCheck.reason.replace(/regeneration limit/i, 'You\'ve reached your monthly regeneration limit')
@@ -977,7 +975,7 @@ export default function Articles() {
                           return;
                         }
 
-                        await postsApi.regenerate(showReviewModal, reviewFeedback, store.id);
+                        await postsApi.regenerate(showReviewModal, reviewFeedback, (store as any).id);
                         queryClient.invalidateQueries({ queryKey: ['posts'] });
                         setShowReviewModal(null);
                         setReviewFeedback({});

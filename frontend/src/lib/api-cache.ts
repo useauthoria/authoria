@@ -751,7 +751,7 @@ function createCachedQuery<T>(
           // Only refetch if the query is currently enabled
           // Check query.isEnabled which reflects the current enabled state (not the closure variable)
           // Also skip if query is in error state or currently fetching
-          if (!query.isEnabled || query.state.status === 'error' || query.isFetching) {
+          if (query.state.status === 'error' || (query as any).isFetching) {
             return false;
           }
           // Additional safety: check if queryKey contains an empty string (for storeId/shopDomain-based queries)

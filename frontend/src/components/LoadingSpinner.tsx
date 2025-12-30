@@ -1,4 +1,4 @@
-import React from 'react';
+// LoadingSpinner component
 
 interface LoadingSpinnerProps {
   readonly size?: 'small' | 'medium' | 'large';

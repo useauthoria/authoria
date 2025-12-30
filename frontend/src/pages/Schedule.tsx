@@ -171,7 +171,7 @@ function getPostsForDate(date: Date, posts: readonly BlogPost[]): Array<{
       id: post.id,
       title: post.title,
       scheduledAt: new Date(post.published_at || post.scheduled_publish_at!),
-      status: post.status === 'published' ? 'published' : 'scheduled',
+      status: (post.status === 'published' ? 'published' : 'scheduled') as 'scheduled' | 'published',
     }))
     .sort((a, b) => a.scheduledAt.getTime() - b.scheduledAt.getTime());
 }

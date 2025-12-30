@@ -14,10 +14,10 @@ interface ArticleEditorProps {
 export default function ArticleEditor({ post, onSave, onCancel, autoSaveInterval = 30000 }: ArticleEditorProps) {
   const [title, setTitle] = useState(post.title);
   const [content, setContent] = useState(post.content || '');
-  const [excerpt, setExcerpt] = useState(post.excerpt || '');
-  const [seoTitle, setSeoTitle] = useState(post.seo_title || '');
-  const [seoDescription, setSeoDescription] = useState(post.seo_description || '');
-  const [keywords, setKeywords] = useState<string[]>(post.keywords || []);
+  const [excerpt, setExcerpt] = useState((post as any).excerpt || '');
+  const [seoTitle, setSeoTitle] = useState((post as any).seo_title || '');
+  const [seoDescription, setSeoDescription] = useState((post as any).seo_description || '');
+  const [keywords, setKeywords] = useState<string[]>((post as any).keywords || []);
   const [keywordInput, setKeywordInput] = useState('');
   const [showPreview, setShowPreview] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
@@ -44,11 +44,11 @@ export default function ArticleEditor({ post, onSave, onCancel, autoSaveInterval
         updates: {
           title,
           content,
-          excerpt,
+          excerpt: excerpt as any,
           seo_title: seoTitle,
           seo_description: seoDescription,
-          keywords,
-        },
+          keywords: keywords as any,
+        } as any,
       });
       lastSaveRef.current = currentState;
       setLastSaved(new Date());

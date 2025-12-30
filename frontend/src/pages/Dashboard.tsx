@@ -139,10 +139,6 @@ export default function Dashboard() {
     error,
     refetch,
   } = useDashboardData({
-    enableRealTime: true,
-    refetchInterval: REFETCH_INTERVAL,
-    retry: true,
-    retryDelay: 1000,
     onError: handleError,
   });
 

@@ -197,12 +197,12 @@ export default function Settings() {
     if (connected === 'google_analytics_4') {
       setGoogleAnalyticsConnected(true);
       setGoogleAnalyticsEnabled(true);
-      showToast({ message: 'Google Analytics connected successfully', isError: false });
+      showToast('Google Analytics connected successfully', { isError: false });
       window.history.replaceState({}, '', window.location.pathname);
     } else if (connected === 'google_search_console') {
       setGoogleSearchConsoleConnected(true);
       setGoogleSearchConsoleEnabled(true);
-      showToast({ message: 'Google Search Console connected successfully', isError: false });
+      showToast('Google Search Console connected successfully', { isError: false });
       window.history.replaceState({}, '', window.location.pathname);
     }
   }, [showToast]);
@@ -286,12 +286,12 @@ export default function Settings() {
 
   const handleSave = useCallback(async () => {
     if (!store?.id) {
-      showToast({ message: "We couldn't load your store information. Please refresh the page and try again.", isError: true });
+      showToast("We couldn't load your store information. Please refresh the page and try again.", { isError: true });
       return;
     }
 
     if (!isOnline) {
-      showToast({ message: "You're currently offline. Please check your internet connection and try again.", isError: true });
+      showToast("You're currently offline. Please check your internet connection and try again.", { isError: true });
       return;
     }
 
@@ -342,11 +342,11 @@ export default function Settings() {
       // This also invalidates cache, but we do it explicitly above to ensure immediate sync
       saveSettings();
 
-      showToast({ message: 'Settings saved successfully', isError: false });
+      showToast('Settings saved successfully', { isError: false });
     } catch (error) {
       console.error('Failed to save settings:', error);
       const errorMessage = formatAPIErrorMessage(error, { action: 'save settings', resource: 'settings' });
-      showToast({ message: errorMessage, isError: true });
+      showToast(errorMessage, { isError: true });
     }
   }, [
     store,
@@ -443,7 +443,7 @@ export default function Settings() {
 
   const handleResetSettings = useCallback(async () => {
     if (!store?.id) {
-      showToast({ message: "We couldn't load your store information. Please refresh the page and try again.", isError: true });
+      showToast("We couldn't load your store information. Please refresh the page and try again.", { isError: true });
       return;
     }
 
@@ -473,14 +473,14 @@ export default function Settings() {
       }
 
       resetSettings();
-      showToast({ message: 'Settings reset successfully. Reloading page...', isError: false });
+      showToast('Settings reset successfully. Reloading page...', { isError: false });
       setTimeout(() => {
         window.location.reload();
       }, 1000);
     } catch (error) {
       console.error('Failed to reset settings:', error);
       const errorMessage = formatAPIErrorMessage(error, { action: 'reset settings', resource: 'settings' });
-      showToast({ message: errorMessage, isError: true });
+      showToast(errorMessage, { isError: true });
     }
   }, [store, resetSettings, showToast]);
 
@@ -719,7 +719,7 @@ export default function Settings() {
                         type="button"
                         onClick={async () => {
                           if (!googleAnalyticsPropertyId) {
-                            showToast({ message: 'Please enter your Google Analytics Property ID before connecting.', isError: true });
+                            showToast('Please enter your Google Analytics Property ID before connecting.', { isError: true });
                             return;
                           }
                           setIsConnectingGoogle('ga4');
@@ -734,7 +734,7 @@ export default function Settings() {
                             );
 
                             if (!popup) {
-                              showToast({ message: 'Popup blocked. Please allow popups for this site.', isError: true });
+                              showToast('Popup blocked. Please allow popups for this site.', { isError: true });
                               setIsConnectingGoogle(null);
                               return;
                             }
@@ -749,14 +749,16 @@ export default function Settings() {
                               if (event.data.type === 'oauth-success') {
                                 window.removeEventListener('message', messageHandler);
                                 popup.close();
-                                showToast({ message: 'Google Analytics connected successfully!', isError: false });
-                                queryClient.invalidateQueries({ queryKey: queryKeys.store(shopDomain) });
+                                showToast('Google Analytics connected successfully!', { isError: false });
+                                if (shopDomain) {
+                                  queryClient.invalidateQueries({ queryKey: queryKeys.store(shopDomain) });
+                                }
                                 setIsConnectingGoogle(null);
                               } else if (event.data.type === 'oauth-error') {
                                 window.removeEventListener('message', messageHandler);
                                 popup.close();
                                 const errorMsg = event.data.error || 'We couldn\'t complete the connection';
-                                showToast({ message: `Connection failed: ${errorMsg}. Please try again.`, isError: true });
+                                showToast(`Connection failed: ${errorMsg}. Please try again.`, { isError: true });
                                 setIsConnectingGoogle(null);
                               }
                             };
@@ -773,7 +775,7 @@ export default function Settings() {
                             }, 1000);
                           } catch (error) {
                             const errorMessage = formatAPIErrorMessage(error, { action: 'connect Google Analytics', resource: 'integration' });
-                            showToast({ message: errorMessage, isError: true });
+                            showToast(errorMessage, { isError: true });
                             setIsConnectingGoogle(null);
                           }
                         }}
@@ -831,7 +833,7 @@ export default function Settings() {
                         type="button"
                         onClick={async () => {
                           if (!googleSearchConsoleSiteUrl) {
-                            showToast({ message: 'Please enter your site URL before connecting.', isError: true });
+                            showToast('Please enter your site URL before connecting.', { isError: true });
                             return;
                           }
                           setIsConnectingGoogle('gsc');
@@ -846,7 +848,7 @@ export default function Settings() {
                             );
 
                             if (!popup) {
-                              showToast({ message: 'Popup blocked. Please allow popups for this site.', isError: true });
+                              showToast('Popup blocked. Please allow popups for this site.', { isError: true });
                               setIsConnectingGoogle(null);
                               return;
                             }
@@ -861,14 +863,16 @@ export default function Settings() {
                               if (event.data.type === 'oauth-success') {
                                 window.removeEventListener('message', messageHandler);
                                 popup.close();
-                                showToast({ message: 'Google Search Console connected successfully!', isError: false });
-                                queryClient.invalidateQueries({ queryKey: queryKeys.store(shopDomain) });
+                                showToast('Google Search Console connected successfully!', { isError: false });
+                                if (shopDomain) {
+                                  queryClient.invalidateQueries({ queryKey: queryKeys.store(shopDomain) });
+                                }
                                 setIsConnectingGoogle(null);
                               } else if (event.data.type === 'oauth-error') {
                                 window.removeEventListener('message', messageHandler);
                                 popup.close();
                                 const errorMsg = event.data.error || 'We couldn\'t complete the connection';
-                                showToast({ message: `Connection failed: ${errorMsg}. Please try again.`, isError: true });
+                                showToast(`Connection failed: ${errorMsg}. Please try again.`, { isError: true });
                                 setIsConnectingGoogle(null);
                               }
                             };
@@ -885,7 +889,7 @@ export default function Settings() {
                             }, 1000);
                           } catch (error) {
                             const errorMessage = formatAPIErrorMessage(error, { action: 'connect Google Analytics', resource: 'integration' });
-                            showToast({ message: errorMessage, isError: true });
+                            showToast(errorMessage, { isError: true });
                             setIsConnectingGoogle(null);
                           }
                         }}
