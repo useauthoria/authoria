@@ -1097,6 +1097,13 @@ async function handleStore(ctx: RequestContext): Promise<Response> {
             // Return a result that indicates not found
             return { data: null, error: result.error };
           }
+          // Log the actual error for debugging
+          logger.error('Supabase query error when fetching store', {
+            shopDomain,
+            errorCode,
+            errorMessage: (result.error as { message?: string })?.message || String(result.error),
+            errorDetails: result.error,
+          });
           throw new SupabaseClientError('Failed to fetch store', result.error);
         }
         return result;
@@ -1115,12 +1122,16 @@ async function handleStore(ctx: RequestContext): Promise<Response> {
 
     if (error && !isNotFoundError) {
       // Real error (not just "not found") - log and return
-      const errorObj = error as { code?: string; message?: string };
+      const errorObj = error as { code?: string; message?: string; details?: string; hint?: string };
       logger.error('Store fetch error', {
         correlationId,
         error: error instanceof Error ? error.message : String(error),
         shopDomain,
         errorCode: errorObj.code,
+        errorMessage: errorObj.message,
+        errorDetails: errorObj.details,
+        errorHint: errorObj.hint,
+        fullError: errorObj,
       });
       return createErrorResponse(
         error instanceof Error ? error.message : 'Failed to fetch store',
