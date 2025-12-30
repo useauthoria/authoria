@@ -56,7 +56,7 @@ function mapStoreToSettings(store: StoreWithSettings | null): SettingsData | nul
 export function useSettingsData(options: UseSettingsDataOptions = {}): UseSettingsDataReturn {
   const {
     enableRealTime = false,
-    refetchInterval = 300000, // Increased from 60s to 5min to reduce ngrok rate limit issues
+    refetchInterval = 300000, // 5 minute interval to reduce API load
     autoSave = false,
     autoSaveDelay = 2000,
     onError,

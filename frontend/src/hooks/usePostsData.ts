@@ -81,7 +81,7 @@ function compareValues(a: string | number | Date, b: string | number | Date, dir
 export function usePostsData(options: UsePostsDataOptions = {}): PostsData {
   const {
     enableRealTime = false,
-    refetchInterval = 300000, // Increased from 60s to 5min to reduce ngrok rate limit issues
+    refetchInterval = 300000, // 5 minute interval to reduce API load
     onError,
     filters = {},
     sortBy = 'date',

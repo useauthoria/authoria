@@ -809,7 +809,7 @@ export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
 // API Client Instances
 // ============================================================================
 
-// Use relative URL so Vite proxy handles it (works through ngrok)
+// Use relative URL so Vite proxy handles it, or absolute URL in production
 const API_BASE_URL = (import.meta.env as { readonly VITE_API_BASE_URL?: string }).VITE_API_BASE_URL || '/functions/v1';
 
 export const api = new EnhancedAPIClient(API_BASE_URL, supabase, {

@@ -7,8 +7,6 @@ export default defineConfig({
     port: 3000,
     host: true,
     allowedHosts: [
-      '.ngrok-free.dev',
-      '.ngrok.app',
       'localhost',
     ],
     proxy: {
