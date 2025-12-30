@@ -93,22 +93,18 @@ function groupScheduledArticles(posts: readonly BlogPost[]): {
 }
 
 function getShopName(): string {
-  try {
-    const domain = getShopDomain();
-    if (!domain) return 'Merchant';
-    let name = domain;
-    if (domain.includes('.')) {
-      name = domain.split('.')[0];
-    }
-    return name
-      .replace(/[-_]/g, ' ')
-      .replace(/([a-z])([A-Z])/g, '$1 $2')
-      .split(' ')
-      .map((word) => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
-      .join(' ');
-  } catch {
-    return 'Merchant';
+  const domain = getShopDomain();
+  if (!domain) return 'Merchant';
+  let name = domain;
+  if (domain.includes('.')) {
+    name = domain.split('.')[0];
   }
+  return name
+    .replace(/[-_]/g, ' ')
+    .replace(/([a-z])([A-Z])/g, '$1 $2')
+    .split(' ')
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
+    .join(' ');
 }
 
 function getCurrentDate(): string {

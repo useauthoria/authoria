@@ -143,8 +143,9 @@ function getShopFromHostname(): string | null {
 
 /**
  * Get the shop domain from App Bridge, URL, or hostname
+ * Returns null if shop domain cannot be determined (e.g., when not in Shopify context)
  */
-export function getShopDomain(): string {
+export function getShopDomain(): string | null {
   const appBridgeShop = getShopFromAppBridge();
   if (appBridgeShop) {
     return appBridgeShop;
@@ -164,6 +165,7 @@ export function getShopDomain(): string {
     return DEV_SHOP_DOMAIN;
   }
 
-  throw new Error('Unable to determine shop domain');
+  // Return null instead of throwing - allows app to handle missing shop domain gracefully
+  return null;
 }
 

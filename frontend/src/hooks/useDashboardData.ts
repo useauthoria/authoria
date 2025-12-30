@@ -31,14 +31,11 @@ export function useDashboardData(options: UseDashboardDataOptions = {}): Dashboa
   const { isOnline } = useNetworkStatus();
 
   const shopDomain = useMemo(() => {
-    try {
-      return getShopDomain();
-    } catch (error) {
-      if (onError && error instanceof Error) {
-        onError(error);
-      }
-      return null;
+    const domain = getShopDomain();
+    if (!domain && onError) {
+      onError(new Error('Shop domain not available'));
     }
+    return domain;
   }, [onError]);
 
   const {

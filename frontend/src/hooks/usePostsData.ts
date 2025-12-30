@@ -92,14 +92,11 @@ export function usePostsData(options: UsePostsDataOptions = {}): PostsData {
   const { isOnline } = useNetworkStatus();
 
   const shopDomain = useMemo(() => {
-    try {
-      return getShopDomain();
-    } catch (error) {
-      if (onError && error instanceof Error) {
-        onError(error);
-      }
-      return null;
+    const domain = getShopDomain();
+    if (!domain && onError) {
+      onError(new Error('Shop domain not available'));
     }
+    return domain;
   }, [onError]);
 
   const {

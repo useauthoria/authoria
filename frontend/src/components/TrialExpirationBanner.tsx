@@ -227,7 +227,7 @@ export default function TrialExpirationBanner({
           appBridge.navigate('/settings/billing');
         } else {
           // Fallback: construct Shopify admin billing URL
-          const shop = shopDomain || appBridge.shop;
+          const shop = shopDomain || (appBridge as any).shop;
           if (shop) {
             const billingUrl = `https://${shop}/admin/settings/billing`;
             if (appBridge.isEmbedded) {

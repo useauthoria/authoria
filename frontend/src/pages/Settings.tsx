@@ -55,13 +55,7 @@ export default function Settings() {
   const navigate = useNavigate();
   const appBridge = useAppBridge();
   const queryClient = useQueryClient();
-  const shopDomain = useMemo(() => {
-    try {
-      return getShopDomain();
-    } catch {
-      return null;
-    }
-  }, []);
+  const shopDomain = useMemo(() => getShopDomain(), []);
 
   const {
     data: storeRaw,

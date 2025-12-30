@@ -256,13 +256,7 @@ export default function Schedule() {
     console.error('[Schedule] Error:', error);
   }, []);
 
-  const shopDomain = useMemo(() => {
-    try {
-      return getShopDomain();
-    } catch {
-      return null;
-    }
-  }, []);
+  const shopDomain = useMemo(() => getShopDomain(), []);
 
   const {
     data: store,
