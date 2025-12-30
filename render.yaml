@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: authoria-frontend
+    env: static
+    buildCommand: cd frontend && npm ci && npm run build
+    staticPublishPath: frontend/dist
+    pullRequestPreviewsEnabled: false
+    envVars:
+      - key: VITE_SUPABASE_URL
+        sync: false
+      - key: VITE_SUPABASE_ANON_KEY
+        sync: false
+      - key: VITE_API_BASE_URL
+        sync: false
+      - key: VITE_SHOPIFY_API_KEY
+        sync: false
+      - key: VITE_ADMIN_API_KEY
+        sync: false
+
