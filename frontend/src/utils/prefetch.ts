@@ -22,12 +22,7 @@ export function setupLinkPrefetching(): void {
 export function prefetchCriticalRoutes(): void {
   if (typeof document === 'undefined') return;
 
-  const criticalRoutes = ['/dashboard', '/posts', '/analytics', '/settings'];
-
-  criticalRoutes.forEach((route) => {
-    const linkElement = document.createElement('link');
-    linkElement.rel = 'prefetch';
-    linkElement.href = route;
-    document.head.appendChild(linkElement);
-  });
+  // Don't prefetch routes - React Router handles client-side routing
+  // Prefetching routes as static files causes 404 errors on static hosts
+  // The routes are handled client-side by React Router, so prefetching isn't needed
 }
