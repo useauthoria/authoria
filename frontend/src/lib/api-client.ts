@@ -827,8 +827,12 @@ export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
 // API Client Instances
 // ============================================================================
 
-// Use relative URL so Vite proxy handles it, or absolute URL in production
-const API_BASE_URL = (import.meta.env as { readonly VITE_API_BASE_URL?: string }).VITE_API_BASE_URL || '/functions/v1';
+// Use Supabase functions URL in production, or relative URL for local dev with Vite proxy
+const API_BASE_URL = (import.meta.env as { readonly VITE_API_BASE_URL?: string }).VITE_API_BASE_URL 
+  || (import.meta.env.DEV 
+    ? '/functions/v1'  // Local dev: use Vite proxy
+    : 'https://mzfugvrgehzgupuowgme.supabase.co/functions/v1'  // Production: direct to Supabase
+  );
 
 export const api = new EnhancedAPIClient(API_BASE_URL, supabase as any, {
   enableDeduplication: true,
