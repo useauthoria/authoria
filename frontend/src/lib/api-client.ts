@@ -829,7 +829,7 @@ export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
 
 // Use Supabase functions URL in production, or relative URL for local dev with Vite proxy
 const API_BASE_URL = (import.meta.env as { readonly VITE_API_BASE_URL?: string }).VITE_API_BASE_URL 
-  || (import.meta.env.DEV 
+  || (import.meta.env.MODE === 'development'
     ? '/functions/v1'  // Local dev: use Vite proxy
     : 'https://mzfugvrgehzgupuowgme.supabase.co/functions/v1'  // Production: direct to Supabase
   );
