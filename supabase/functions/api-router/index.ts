@@ -765,6 +765,20 @@ async function handleQuota(ctx: RequestContext): Promise<Response> {
           .eq(COLUMN_ID, storeId)
           .single();
         if (result.error) {
+          // Log detailed error for debugging
+          const errorCode = (result.error as { code?: string })?.code;
+          const errorMessage = (result.error as { message?: string })?.message || String(result.error);
+          const errorDetails = (result.error as { details?: string })?.details;
+          const errorHint = (result.error as { hint?: string })?.hint;
+          logger.error('Failed to fetch store in handleQuota', {
+            correlationId,
+            storeId,
+            errorCode,
+            errorMessage,
+            errorDetails,
+            errorHint,
+            fullError: result.error,
+          });
           throw new SupabaseClientError('Failed to fetch store', result.error);
         }
         return result;
