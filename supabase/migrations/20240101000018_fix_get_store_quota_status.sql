@@ -1,10 +1,11 @@
--- Fix get_store_quota_status function to use correct column names
--- The plan_limits table uses article_limit_monthly and article_limit_weekly
--- not monthly_article_limit and daily_article_limit
+-- Fix get_store_quota_status function
+-- 1. Use correct column names from plan_limits table (article_limit_weekly, article_limit_monthly)
+-- 2. Rename parameter to p_store_uuid to avoid ambiguity with return table column
+-- 3. Fully qualify all column references to avoid ambiguity
 
 DROP FUNCTION IF EXISTS get_store_quota_status(UUID);
 
-CREATE FUNCTION get_store_quota_status(store_uuid UUID)
+CREATE FUNCTION get_store_quota_status(p_store_uuid UUID)
 RETURNS TABLE (
   store_id UUID,
   plan_name TEXT,
@@ -32,11 +33,11 @@ DECLARE
   v_today DATE := CURRENT_DATE;
   v_month_start DATE := DATE_TRUNC('month', CURRENT_DATE)::DATE;
 BEGIN
-  -- Get store and plan information (single query with join)
+  -- Get store and plan information
   SELECT 
     s.id,
     COALESCE(pl.plan_name, 'free_trial')::TEXT,
-    COALESCE(pl.article_limit_weekly, 3)::INTEGER,  -- Use weekly limit as daily limit (approximation)
+    COALESCE(pl.article_limit_weekly, 3)::INTEGER,
     COALESCE(pl.article_limit_monthly, 0)::INTEGER,
     s.trial_ends_at
   INTO 
@@ -47,31 +48,31 @@ BEGIN
     v_trial_ends_at
   FROM stores s
   LEFT JOIN plan_limits pl ON s.plan_id = pl.id
-  WHERE s.id = store_uuid;
+  WHERE s.id = p_store_uuid;
   
   IF v_store_id IS NULL THEN
     RETURN;
   END IF;
   
-  -- Get usage counts in a single query (much faster than separate queries)
+  -- Return quota data with fully qualified column names (au. prefix avoids ambiguity)
   RETURN QUERY
   SELECT 
-    v_store_id,
-    v_plan_name,
-    COALESCE(SUM(CASE WHEN usage_date = v_today AND usage_type = 'generated' THEN 1 ELSE 0 END), 0)::INTEGER as articles_generated_today,
-    COALESCE(SUM(CASE WHEN usage_date = v_today AND usage_type = 'published' THEN 1 ELSE 0 END), 0)::INTEGER as articles_published_today,
-    v_weekly_limit as daily_limit,  -- Use weekly limit as daily approximation
+    v_store_id AS store_id,
+    v_plan_name AS plan_name,
+    COALESCE(SUM(CASE WHEN au.usage_date = v_today AND au.usage_type = 'generated' THEN 1 ELSE 0 END), 0)::INTEGER,
+    COALESCE(SUM(CASE WHEN au.usage_date = v_today AND au.usage_type = 'published' THEN 1 ELSE 0 END), 0)::INTEGER,
+    v_weekly_limit,
     v_monthly_limit,
-    COALESCE(SUM(CASE WHEN usage_date >= v_month_start AND usage_type = 'generated' THEN 1 ELSE 0 END), 0)::INTEGER as articles_generated_this_month,
-    COALESCE(SUM(CASE WHEN usage_date >= v_month_start AND usage_type = 'published' THEN 1 ELSE 0 END), 0)::INTEGER as articles_published_this_month,
-    GREATEST(0, v_weekly_limit - COALESCE(SUM(CASE WHEN usage_date = v_today AND usage_type = 'generated' THEN 1 ELSE 0 END), 0))::INTEGER as remaining_daily,
-    GREATEST(0, v_monthly_limit - COALESCE(SUM(CASE WHEN usage_date >= v_month_start AND usage_type = 'generated' THEN 1 ELSE 0 END), 0))::INTEGER as remaining_monthly,
+    COALESCE(SUM(CASE WHEN au.usage_date >= v_month_start AND au.usage_type = 'generated' THEN 1 ELSE 0 END), 0)::INTEGER,
+    COALESCE(SUM(CASE WHEN au.usage_date >= v_month_start AND au.usage_type = 'published' THEN 1 ELSE 0 END), 0)::INTEGER,
+    GREATEST(0, v_weekly_limit - COALESCE(SUM(CASE WHEN au.usage_date = v_today AND au.usage_type = 'generated' THEN 1 ELSE 0 END), 0))::INTEGER,
+    GREATEST(0, v_monthly_limit - COALESCE(SUM(CASE WHEN au.usage_date >= v_month_start AND au.usage_type = 'generated' THEN 1 ELSE 0 END), 0))::INTEGER,
     v_trial_ends_at,
-    (v_trial_ends_at IS NULL OR v_trial_ends_at > NOW())::BOOLEAN as is_trial_active
-  FROM article_usage
-  WHERE store_id = v_store_id
-    AND (usage_date = v_today OR usage_date >= v_month_start)
-  GROUP BY store_id;
+    (v_trial_ends_at IS NULL OR v_trial_ends_at > NOW())::BOOLEAN
+  FROM article_usage au
+  WHERE au.store_id = v_store_id
+    AND (au.usage_date = v_today OR au.usage_date >= v_month_start)
+  GROUP BY au.store_id;
   
   -- If no usage records exist, return zeros
   IF NOT FOUND THEN
@@ -93,5 +94,5 @@ END;
 $$;
 
 COMMENT ON FUNCTION get_store_quota_status(UUID) IS 
-  'Get store quota status with correct column names from plan_limits table. Uses article_limit_weekly and article_limit_monthly.';
+  'Get store quota status. Uses p_store_uuid parameter and au. table alias to avoid column ambiguity.';
 
