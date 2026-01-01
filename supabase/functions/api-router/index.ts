@@ -1040,24 +1040,61 @@ async function handleQuota(ctx: RequestContext): Promise<Response> {
       });
     }
 
-    const { data: quotaStatus, error } = await retryOperation(
+    const quotaStatus = await retryOperation(
       async () => {
         // Use service role client for RPC call as well to ensure consistency
         const result = await serviceSupabase.rpc(RPC_GET_STORE_QUOTA_STATUS, {
           [PARAM_STORE_UUID]: storeId,
         });
+        
         if (result.error) {
+          // Log detailed error for debugging
+          logger.error('RPC get_store_quota_status error', {
+            correlationId,
+            storeId,
+            error: result.error,
+            errorMessage: (result.error as { message?: string })?.message || String(result.error),
+            errorCode: (result.error as { code?: string })?.code,
+            errorDetails: (result.error as { details?: string })?.details,
+            errorHint: (result.error as { hint?: string })?.hint,
+          });
           throw new SupabaseClientError('Failed to fetch quota', result.error);
         }
-        return result;
+        
+        // The RPC function returns a TABLE, so result.data is an array
+        // Get the first row (should only be one row per store)
+        const quotaData = Array.isArray(result.data) && result.data.length > 0 
+          ? result.data[0] 
+          : null;
+        
+        if (!quotaData) {
+          // If no data returned, it might be a new store - return default values
+          logger.warn('RPC get_store_quota_status returned no data, using defaults', {
+            correlationId,
+            storeId,
+          });
+          // Return default quota structure
+          return {
+            store_id: storeId,
+            plan_name: 'free_trial',
+            articles_generated_today: 0,
+            articles_published_today: 0,
+            daily_limit: 10,
+            monthly_limit: 100,
+            articles_generated_this_month: 0,
+            articles_published_this_month: 0,
+            remaining_daily: 10,
+            remaining_monthly: 100,
+            trial_ends_at: null,
+            is_trial_active: true,
+          };
+        }
+        
+        return quotaData;
       },
       CONFIG.MAX_RETRIES,
       CONFIG.RETRY_DELAY_MS,
     );
-
-    if (error) {
-      throw new SupabaseClientError('Failed to fetch quota', error);
-    }
 
     return createSuccessResponse(quotaStatus ?? {}, correlationId, {}, { compression: true, request: req });
   } catch (error) {
@@ -2184,10 +2221,36 @@ async function handleDashboardBatch(ctx: RequestContext): Promise<Response> {
           const result = await serviceSupabase.rpc(RPC_GET_STORE_QUOTA_STATUS, {
             [PARAM_STORE_UUID]: storeId!,
           });
+          
           if (result.error) {
+            logger.error('RPC get_store_quota_status error in batch', {
+              correlationId,
+              storeId: storeId!,
+              error: result.error,
+              errorMessage: (result.error as { message?: string })?.message || String(result.error),
+            });
             throw new SupabaseClientError('Failed to fetch quota', result.error);
           }
-          return result.data;
+          
+          // The RPC function returns a TABLE, so result.data is an array
+          const quotaData = Array.isArray(result.data) && result.data.length > 0 
+            ? result.data[0] 
+            : {
+                store_id: storeId!,
+                plan_name: 'free_trial',
+                articles_generated_today: 0,
+                articles_published_today: 0,
+                daily_limit: 10,
+                monthly_limit: 100,
+                articles_generated_this_month: 0,
+                articles_published_this_month: 0,
+                remaining_daily: 10,
+                remaining_monthly: 100,
+                trial_ends_at: null,
+                is_trial_active: true,
+              };
+          
+          return quotaData;
         },
         CONFIG.MAX_RETRIES,
         CONFIG.RETRY_DELAY_MS,
