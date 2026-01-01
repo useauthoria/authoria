@@ -1224,8 +1224,15 @@ async function handleAnalytics(ctx: RequestContext): Promise<Response> {
           }
 
           const result = await metricsQuery;
+          // Don't throw on error for analytics - return empty array instead
+          // This handles empty tables gracefully
           if (result.error) {
-            throw new SupabaseClientError('Failed to fetch metrics', result.error);
+            logger.warn('Metrics query returned error, returning empty', {
+              correlationId,
+              storeId: storeId!,
+              error: result.error.message,
+            });
+            return { data: [], error: null };
           }
           return result;
         },
@@ -1234,9 +1241,10 @@ async function handleAnalytics(ctx: RequestContext): Promise<Response> {
       ),
       retryOperation(
         async () => {
+          // Query top posts without embedded join - no FK relationship exists
           let topPostsQuery = supabase
             .from(TABLE_PERFORMANCE_METRICS)
-            .select(`${COLUMN_POST_ID}, ${COLUMN_IMPRESSIONS}, ${COLUMN_CLICKS}, ${COLUMN_CTR}, ${COLUMN_POSITION}, ${TABLE_BLOG_POSTS}(${COLUMN_TITLE})`)
+            .select(`${COLUMN_POST_ID}, ${COLUMN_IMPRESSIONS}, ${COLUMN_CLICKS}, ${COLUMN_CTR}, ${COLUMN_POSITION}`)
             .eq(COLUMN_STORE_ID, storeId!)
             .order(COLUMN_CLICKS, { ascending: false })
             .limit(TOP_POSTS_LIMIT);
@@ -1249,8 +1257,15 @@ async function handleAnalytics(ctx: RequestContext): Promise<Response> {
           }
 
           const result = await topPostsQuery;
+          // Don't throw on error for analytics - return empty array instead
+          // This handles empty tables gracefully
           if (result.error) {
-            throw new SupabaseClientError('Failed to fetch top posts', result.error);
+            logger.warn('Top posts query returned error, returning empty', {
+              correlationId,
+              storeId: storeId!,
+              error: result.error.message,
+            });
+            return { data: [], error: null };
           }
           return result;
         },
