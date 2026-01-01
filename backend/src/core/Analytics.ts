@@ -148,11 +148,13 @@ export class AnalyticsCollector {
     for (const item of metrics) {
       batch.add({
         type: 'upsert',
-        table: 'performance_metrics',
+        table: 'analytics',
         data: {
           store_id: item.storeId,
           post_id: item.postId,
+          event_type: 'performance_metric',
           metric_date: this.formatDate(item.date || new Date()),
+          timestamp: new Date().toISOString(),
           impressions: item.metrics.impressions,
           clicks: item.metrics.clicks,
           ctr: item.metrics.ctr,
@@ -949,7 +951,7 @@ export class AnalyticsTracker {
       }));
 
       const { error } = await this.supabase
-        .from('analytics_events')
+        .from('analytics')
         .insert(eventsToInsert);
 
       if (error) {

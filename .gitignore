@@ -6,6 +6,7 @@ dist/
 build/
 .next/
 .vercel/
+frontend/dist/
 *.log
 .DS_Store
 .vscode/

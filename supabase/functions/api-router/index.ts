@@ -286,9 +286,11 @@ const STATUS_SCHEDULED = 'scheduled';
 const STATUS_ARCHIVED = 'archived';
 const VALID_STATUSES: ReadonlyArray<string> = [STATUS_PUBLISHED, STATUS_DRAFT, STATUS_SCHEDULED, STATUS_ARCHIVED, 'queued'];
 const RATE_LIMIT_WINDOW_MS = 60000;
-const CACHE_TTL_QUOTA = 30000;
-const CACHE_TTL_POSTS = 60000;
-const CACHE_TTL_ANALYTICS = 300000;
+// Optimized cache TTLs to reduce Edge Function invocations
+// Increased TTLs for data that doesn't change frequently
+const CACHE_TTL_QUOTA = 120000; // 2 minutes (was 30s) - quota updates less frequently
+const CACHE_TTL_POSTS = 120000; // 2 minutes (was 60s) - posts don't change that often
+const CACHE_TTL_ANALYTICS = 600000; // 10 minutes (was 5) - analytics can be cached longer
 const RATE_LIMIT_QUOTA = 100;
 const RATE_LIMIT_POSTS = 200;
 const RATE_LIMIT_ANALYTICS = 100;
@@ -476,6 +478,200 @@ function generateCorrelationId(): string {
   return `${CORRELATION_PREFIX}${Date.now()}-${Math.random().toString(ID_RADIX).substring(2, 2 + ID_LENGTH)}`;
 }
 
+// ============================================================================
+// StoreId Resolution Helpers
+// ============================================================================
+
+// Cache for shopDomain -> storeId lookups (short TTL to reduce DB calls)
+const storeIdCache = new Map<string, { storeId: string; timestamp: number }>();
+const STORE_ID_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+/**
+ * Resolve storeId from shopDomain using cache or database lookup
+ * This is the single source of truth for shopDomain -> storeId resolution
+ */
+async function resolveStoreIdFromShopDomain(
+  shopDomain: string,
+  supabase: Awaited<ReturnType<typeof getSupabaseClient>>,
+  correlationId: string,
+): Promise<string | null> {
+  if (!shopDomain) {
+    return null;
+  }
+
+  // Check cache first
+  const cached = storeIdCache.get(shopDomain);
+  if (cached && Date.now() - cached.timestamp < STORE_ID_CACHE_TTL) {
+    logger.debug('StoreId cache hit', { correlationId, shopDomain, storeId: cached.storeId });
+    return cached.storeId;
+  }
+
+  // Cache miss - look up in database
+  try {
+    // Try service role client first (bypasses RLS)
+    const serviceSupabase = await getSupabaseClient({ clientType: 'service' });
+    const { data: store, error } = await serviceSupabase
+      .from(TABLE_STORES)
+      .select(COLUMN_ID)
+      .eq(COLUMN_SHOP_DOMAIN, shopDomain)
+      .single();
+
+    if (error || !store) {
+      logger.debug('Store not found for shopDomain', { correlationId, shopDomain, error: error?.message });
+      return null;
+    }
+
+    // Cache the result
+    storeIdCache.set(shopDomain, { storeId: store.id, timestamp: Date.now() });
+    logger.debug('StoreId resolved and cached', { correlationId, shopDomain, storeId: store.id });
+    
+    return store.id;
+  } catch (error) {
+    logger.error('Error resolving storeId from shopDomain', {
+      correlationId,
+      shopDomain,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return null;
+  }
+}
+
+/**
+ * Extract shopDomain from URL path (e.g., /store/{shopDomain})
+ */
+function extractShopDomainFromPath(url: URL): string | null {
+  const pathParts = url.pathname.split(PATH_SEPARATOR).filter((p) => p);
+  const storeIndex = pathParts.indexOf('store');
+  
+  if (storeIndex !== -1 && storeIndex < pathParts.length - 1) {
+    return pathParts[storeIndex + 1] || null;
+  }
+  
+  return null;
+}
+
+/**
+ * Comprehensive storeId resolution - tries multiple sources
+ * Priority: 1. Query params, 2. Request body, 3. Context, 4. URL path (shopDomain lookup)
+ */
+async function resolveStoreId(
+  ctx: RequestContext,
+  options: {
+    queryParams?: URLSearchParams;
+    body?: { storeId?: string; shopDomain?: string };
+    shopDomain?: string;
+  } = {},
+): Promise<{ storeId: string | null; shopDomain: string | null; source: string }> {
+  const { correlationId, supabase } = ctx;
+  
+  // 1. Try query params
+  if (options.queryParams) {
+    const storeIdFromParams = options.queryParams.get(PARAM_STORE_ID);
+    if (storeIdFromParams) {
+      return { storeId: storeIdFromParams, shopDomain: options.shopDomain || null, source: 'query_params' };
+    }
+    
+    // Try shopDomain from query params
+    const shopDomainFromParams = options.queryParams.get('shopDomain');
+    if (shopDomainFromParams) {
+      const resolvedId = await resolveStoreIdFromShopDomain(shopDomainFromParams, supabase, correlationId);
+      if (resolvedId) {
+        return { storeId: resolvedId, shopDomain: shopDomainFromParams, source: 'query_params_shopDomain' };
+      }
+    }
+  }
+  
+  // 2. Try request body
+  if (options.body?.storeId) {
+    return { storeId: options.body.storeId, shopDomain: options.body.shopDomain || null, source: 'request_body' };
+  }
+  
+  if (options.body?.shopDomain) {
+    const resolvedId = await resolveStoreIdFromShopDomain(options.body.shopDomain, supabase, correlationId);
+    if (resolvedId) {
+      return { storeId: resolvedId, shopDomain: options.body.shopDomain, source: 'request_body_shopDomain' };
+    }
+  }
+  
+  // 3. Try context storeId
+  if (ctx.storeId) {
+    return { storeId: ctx.storeId, shopDomain: options.shopDomain || null, source: 'context' };
+  }
+  
+  // 4. Try shopDomain from options or URL path
+  const shopDomain = options.shopDomain || extractShopDomainFromPath(new URL(ctx.req.url));
+  if (shopDomain) {
+    const resolvedId = await resolveStoreIdFromShopDomain(shopDomain, supabase, correlationId);
+    if (resolvedId) {
+      return { storeId: resolvedId, shopDomain, source: 'shopDomain_lookup' };
+    }
+  }
+  
+  return { storeId: null, shopDomain: null, source: 'not_found' };
+}
+
+/**
+ * Helper to get storeId with proper error handling
+ * Returns storeId or throws/returns error response
+ */
+async function getStoreIdOrError(
+  ctx: RequestContext,
+  options: {
+    queryParams?: URLSearchParams;
+    body?: { storeId?: string; shopDomain?: string };
+    shopDomain?: string;
+  } = {},
+): Promise<{ storeId: string; shopDomain: string | null } | Response> {
+  const { correlationId } = ctx;
+  const result = await resolveStoreId(ctx, options);
+  
+  if (!result.storeId) {
+    logger.warn('StoreId resolution failed', {
+      correlationId,
+      source: result.source,
+      shopDomain: result.shopDomain,
+      hasQueryParams: !!options.queryParams,
+      hasBody: !!options.body,
+    });
+    
+    return createErrorResponse(
+      'Store not found. Please ensure you are accessing from a valid Shopify store context.',
+      STATUS_BAD_REQUEST,
+      correlationId,
+      { 
+        code: 'STORE_ID_REQUIRED',
+        hint: 'Provide storeId in query params, request body, or ensure shopDomain is valid',
+      },
+      ctx.req,
+    );
+  }
+  
+  // Validate the storeId format
+  const validation = validateStoreId(result.storeId);
+  if (!validation.valid) {
+    return createErrorResponse(
+      validation.error ?? ERROR_INVALID_STORE_ID,
+      STATUS_BAD_REQUEST,
+      correlationId,
+      { code: 'INVALID_STORE_ID' },
+      ctx.req,
+    );
+  }
+  
+  logger.debug('StoreId resolved successfully', {
+    correlationId,
+    storeId: result.storeId,
+    shopDomain: result.shopDomain,
+    source: result.source,
+  });
+  
+  return { storeId: result.storeId, shopDomain: result.shopDomain };
+}
+
+// ============================================================================
+// Request Context
+// ============================================================================
+
 async function createRequestContext(req: Request, requiresAuth: boolean = true): Promise<RequestContext> {
   const correlationId = req.headers.get(HEADER_X_CORRELATION_ID) ?? generateCorrelationId();
   const authHeader = req.headers.get(HEADER_AUTHORIZATION);
@@ -498,8 +694,23 @@ async function createRequestContext(req: Request, requiresAuth: boolean = true):
 
   const supabase = authHeader ? await createAuthenticatedClient(authHeader) : await getSupabaseClient({ clientType: 'anon' });
   
-  // Extract storeId from URL path for /store/{shopDomain} requests
+  // Try to extract storeId from URL path for /store/{shopDomain} requests
+  const url = new URL(req.url);
   let storeId: string | undefined;
+  let shopDomain: string | undefined;
+  
+  // Check for shopDomain in URL path
+  shopDomain = extractShopDomainFromPath(url) || undefined;
+  
+  // Check for storeId in query params
+  const storeIdFromParams = url.searchParams.get(PARAM_STORE_ID);
+  if (storeIdFromParams) {
+    storeId = storeIdFromParams;
+  }
+  
+  // If we have shopDomain but no storeId, try to resolve it (async)
+  // Note: We don't await here to avoid blocking context creation
+  // The actual resolution happens in handlers via resolveStoreId helper
 
   return {
     req: req as APIRequest,
@@ -722,16 +933,15 @@ async function retryOperation<T>(
 }
 
 async function handleQuota(ctx: RequestContext): Promise<Response> {
-  const { supabase, req, correlationId } = ctx;
+  const { req, correlationId } = ctx;
   const url = new URL(req.url);
-  let storeId = url.searchParams.get(PARAM_STORE_ID);
-
-  if (!storeId && req.method === METHOD_POST) {
+  
+  // Parse request body if POST
+  let body: { storeId?: string; shopDomain?: string } = {};
+  if (req.method === METHOD_POST) {
     try {
-      // Clone request to avoid consuming the body stream if it was already read during validation
       const clonedReq = req.clone();
-      const body = await clonedReq.json() as QuotaBody;
-      storeId = body.storeId ?? null;
+      body = await clonedReq.json() as QuotaBody;
     } catch (error) {
       logger.debug('Failed to parse quota request body', {
         correlationId,
@@ -740,20 +950,19 @@ async function handleQuota(ctx: RequestContext): Promise<Response> {
     }
   }
 
-  // Use ctx.storeId if available (from URL path or other source)
-  if (!storeId && ctx.storeId) {
-    storeId = ctx.storeId;
+  // Use comprehensive storeId resolution
+  const storeIdResult = await getStoreIdOrError(ctx, {
+    queryParams: url.searchParams,
+    body,
+    shopDomain: url.searchParams.get('shopDomain') || undefined,
+  });
+  
+  // If it's a Response, it's an error response - return it
+  if (storeIdResult instanceof Response) {
+    return storeIdResult;
   }
-
-  // If still no storeId, return error
-  if (!storeId) {
-    return createErrorResponse(ERROR_STORE_ID_REQUIRED, STATUS_BAD_REQUEST, correlationId, undefined, ctx.req);
-  }
-
-  const storeValidation = validateStoreId(storeId);
-  if (!storeValidation.valid) {
-    return createErrorResponse(storeValidation.error ?? ERROR_STORE_ID_REQUIRED, STATUS_BAD_REQUEST, correlationId, undefined, ctx.req);
-  }
+  
+  const { storeId } = storeIdResult;
 
   try {
     // Use service role client to bypass RLS when fetching store
@@ -864,23 +1073,19 @@ async function handleQuota(ctx: RequestContext): Promise<Response> {
 async function handlePosts(ctx: RequestContext): Promise<Response> {
   const { supabase, req, correlationId } = ctx;
   const url = new URL(req.url);
-  let storeId = url.searchParams.get(PARAM_STORE_ID);
   const status = url.searchParams.get(PARAM_STATUS);
 
-  // Use ctx.storeId if available (from URL path or other source)
-  if (!storeId && ctx.storeId) {
-    storeId = ctx.storeId;
+  // Use comprehensive storeId resolution
+  const storeIdResult = await getStoreIdOrError(ctx, {
+    queryParams: url.searchParams,
+    shopDomain: url.searchParams.get('shopDomain') || undefined,
+  });
+  
+  if (storeIdResult instanceof Response) {
+    return storeIdResult;
   }
-
-  // If still no storeId, return error
-  if (!storeId) {
-    return createErrorResponse(ERROR_STORE_ID_REQUIRED, STATUS_BAD_REQUEST, correlationId, undefined, ctx.req);
-  }
-
-  const storeValidation = validateStoreId(storeId);
-  if (!storeValidation.valid) {
-    return createErrorResponse(storeValidation.error ?? ERROR_STORE_ID_REQUIRED, STATUS_BAD_REQUEST, correlationId, undefined, ctx.req);
-  }
+  
+  const { storeId } = storeIdResult;
 
   const statusValidation = validateStatus(status);
   if (!statusValidation.valid) {
@@ -945,18 +1150,20 @@ async function handlePosts(ctx: RequestContext): Promise<Response> {
 async function handleAnalytics(ctx: RequestContext): Promise<Response> {
   const { supabase, req, correlationId } = ctx;
   const url = new URL(req.url);
-  let storeId = url.searchParams.get(PARAM_STORE_ID);
   const startDate = url.searchParams.get(PARAM_START);
   const endDate = url.searchParams.get(PARAM_END);
 
-  if (!storeId && ctx.storeId) {
-    storeId = ctx.storeId;
+  // Use comprehensive storeId resolution
+  const storeIdResult = await getStoreIdOrError(ctx, {
+    queryParams: url.searchParams,
+    shopDomain: url.searchParams.get('shopDomain') || undefined,
+  });
+  
+  if (storeIdResult instanceof Response) {
+    return storeIdResult;
   }
-
-  const storeValidation = validateStoreId(storeId);
-  if (!storeValidation.valid) {
-    return createErrorResponse(storeValidation.error ?? ERROR_STORE_ID_REQUIRED, STATUS_BAD_REQUEST, correlationId, undefined, ctx.req);
-  }
+  
+  const { storeId } = storeIdResult;
 
   const dateValidation = validateDateRange(startDate, endDate);
   if (!dateValidation.valid) {
@@ -1180,8 +1387,10 @@ async function handleStore(ctx: RequestContext): Promise<Response> {
           .eq(COLUMN_SHOP_DOMAIN, shopDomain)
           .single();
         
-        // If store exists, return it
+        // If store exists, cache and return it
         if (existingStore && !checkError) {
+          // Cache the storeId for future lookups
+          storeIdCache.set(shopDomain, { storeId: existingStore.id, timestamp: Date.now() });
           logger.info('Store found with service role client', { correlationId, shopDomain, storeId: existingStore.id });
           return createSuccessResponse(existingStore, correlationId, {}, { compression: true, request: req });
         }
@@ -1241,6 +1450,8 @@ async function handleStore(ctx: RequestContext): Promise<Response> {
               .single();
             
             if (fetchedStore && !fetchError) {
+              // Cache the storeId
+              storeIdCache.set(shopDomain, { storeId: fetchedStore.id, timestamp: Date.now() });
               logger.info('Fetched existing store after duplicate key error', { correlationId, shopDomain, storeId: fetchedStore.id });
               return createSuccessResponse(fetchedStore, correlationId, {}, { compression: true, request: req });
             }
@@ -1260,6 +1471,8 @@ async function handleStore(ctx: RequestContext): Promise<Response> {
           );
         }
         
+        // Cache the new storeId
+        storeIdCache.set(shopDomain, { storeId: newStore.id, timestamp: Date.now() });
         logger.info('Store auto-created successfully', { correlationId, shopDomain, storeId: newStore.id });
         return createSuccessResponse(newStore, correlationId, {}, { compression: true, request: req });
       } catch (createError) {
@@ -1281,6 +1494,10 @@ async function handleStore(ctx: RequestContext): Promise<Response> {
       }
     }
 
+    // Cache the storeId for future lookups (store found in initial lookup)
+    if (store?.id) {
+      storeIdCache.set(shopDomain, { storeId: store.id, timestamp: Date.now() });
+    }
     return createSuccessResponse(store, correlationId, {}, { compression: true, request: req });
   } catch (error) {
     // Check if it's a "not found" error
@@ -1367,23 +1584,28 @@ async function handleRegenerationLimits(ctx: RequestContext): Promise<Response> 
 }
 
 async function handleQueue(ctx: RequestContext): Promise<Response> {
-  const { supabase, req, correlationId, storeId } = ctx;
+  const { req, correlationId } = ctx;
   const url = new URL(req.url);
   const pathParts = url.pathname.split('/').filter((p) => p);
   
-  // Get storeId from body, query params, or context
-  let targetStoreId = storeId;
-  if (!targetStoreId && req.method === METHOD_POST) {
+  // Parse request body if POST
+  let body: { storeId?: string; shopDomain?: string; articleIds?: string[]; articleId?: string } = {};
+  if (req.method === METHOD_POST) {
     try {
-      const body = await req.clone().json() as { storeId?: string };
-      targetStoreId = body.storeId;
+      body = await req.clone().json() as typeof body;
     } catch {
       // Body might not be JSON or might not have storeId
     }
   }
-  if (!targetStoreId) {
-    targetStoreId = url.searchParams.get('storeId') || undefined;
-  }
+  
+  // Use comprehensive storeId resolution
+  const storeIdResult = await resolveStoreId(ctx, {
+    queryParams: url.searchParams,
+    body,
+    shopDomain: url.searchParams.get('shopDomain') || undefined,
+  });
+  
+  const targetStoreId = storeIdResult.storeId;
   
   // Handle nested routes: /queue/metrics, /queue/reorder, /queue/regenerate-title, /queue/refill
   const lastPart = pathParts[pathParts.length - 1];
@@ -1697,6 +1919,85 @@ async function handleCompleteSetup(ctx: RequestContext): Promise<Response> {
   return createSuccessResponse(updatedStore, correlationId, { cached: false }, { compression: true, request: req });
 }
 
+// Billing check endpoint - returns current billing/plan status for a store
+async function handleBillingCheck(ctx: RequestContext): Promise<Response> {
+  const { req, correlationId } = ctx;
+  const url = new URL(req.url);
+  
+  // Parse request body if POST
+  let body: { storeId?: string; shopDomain?: string } = {};
+  if (req.method === METHOD_POST) {
+    try {
+      const clonedReq = req.clone();
+      body = await clonedReq.json() as typeof body;
+    } catch {
+      // Ignore parse errors
+    }
+  }
+  
+  // Use comprehensive storeId resolution
+  const storeIdResult = await getStoreIdOrError(ctx, {
+    queryParams: url.searchParams,
+    body,
+    shopDomain: url.searchParams.get('shopDomain') || body.shopDomain || undefined,
+  });
+  
+  if (storeIdResult instanceof Response) {
+    return storeIdResult;
+  }
+  
+  const { storeId } = storeIdResult;
+  
+  try {
+    const serviceSupabase = await getSupabaseClient({ clientType: 'service' });
+    
+    // Get store billing info
+    const { data: store, error } = await serviceSupabase
+      .from(TABLE_STORES)
+      .select(`
+        id,
+        plan_id,
+        trial_started_at,
+        trial_ends_at,
+        is_active,
+        is_paused,
+        plan_limits(id, plan_name, daily_article_limit, monthly_article_limit)
+      `)
+      .eq(COLUMN_ID, storeId)
+      .single();
+    
+    if (error || !store) {
+      return createErrorResponse('Store not found', STATUS_NOT_FOUND, correlationId);
+    }
+    
+    const planLimits = store.plan_limits as { plan_name?: string; daily_article_limit?: number; monthly_article_limit?: number } | null;
+    const trialEndsAt = store.trial_ends_at ? new Date(store.trial_ends_at) : null;
+    const isTrialActive = trialEndsAt ? trialEndsAt > new Date() : false;
+    const isTrialExpired = trialEndsAt ? trialEndsAt <= new Date() : false;
+    
+    return createSuccessResponse({
+      storeId: store.id,
+      planId: store.plan_id,
+      planName: planLimits?.plan_name || 'unknown',
+      isActive: store.is_active,
+      isPaused: store.is_paused,
+      trialStartedAt: store.trial_started_at,
+      trialEndsAt: store.trial_ends_at,
+      isTrialActive,
+      isTrialExpired,
+      dailyLimit: planLimits?.daily_article_limit || 0,
+      monthlyLimit: planLimits?.monthly_article_limit || 0,
+    }, correlationId, {}, { compression: true, request: req });
+  } catch (error) {
+    logger.error('Billing check error', {
+      correlationId,
+      error: error instanceof Error ? error.message : String(error),
+      storeId,
+    });
+    throw error;
+  }
+}
+
 function validateTrackingEvent(event: unknown): EventValidationResult {
   if (!event || typeof event !== 'object') {
     return { valid: false, error: ERROR_EVENT_MUST_BE_OBJECT };
@@ -1781,27 +2082,29 @@ async function handleTrack(req: Request, correlationId: string): Promise<Respons
 
     let eventsRecorded = 0;
     try {
-      // Direct insert into analytics_events table (Deno-compatible)
+      // Direct insert into analytics table (Deno-compatible)
       const insertData = eventsToRecord.map((event) => ({
         store_id: event.storeId,
         post_id: event.postId,
         event_type: event.eventType,
-        event_data: event.eventData,
-        metadata: event.metadata,
-        created_at: new Date(event.metadata.timestamp).toISOString(),
+        event_data: event.eventData || {},
+        timestamp: event.metadata?.timestamp ? new Date(event.metadata.timestamp).toISOString() : new Date().toISOString(),
+        user_agent: event.metadata?.userAgent || null,
+        referrer: event.metadata?.referrer || null,
+        ip_address: event.metadata?.ipAddress || null,
       }));
 
       if (CONFIG.ENABLE_RETRY) {
         await retryOperation(async () => {
           const { error: insertError } = await supabase
-            .from('analytics_events')
+            .from('analytics')
             .insert(insertData);
           if (insertError) throw insertError;
           eventsRecorded = events.length;
         }, CONFIG.MAX_RETRIES, CONFIG.RETRY_DELAY_MS);
       } else {
         const { error: insertError } = await supabase
-          .from('analytics_events')
+          .from('analytics')
           .insert(insertData);
         if (insertError) throw insertError;
         eventsRecorded = events.length;
@@ -1835,6 +2138,197 @@ async function handleTrack(req: Request, correlationId: string): Promise<Respons
     logger.error('Track error', {
       correlationId,
       error: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
+  }
+}
+
+// Batch dashboard endpoint - combines store, quota, posts, and analytics in a single call
+// This reduces Edge Function invocations from 4-6 calls to 1 call
+async function handleDashboardBatch(ctx: RequestContext): Promise<Response> {
+  const { req, correlationId } = ctx;
+  const url = new URL(req.url);
+
+  // Parse request body if POST
+  let body: { storeId?: string; shopDomain?: string } = {};
+  if (req.method === METHOD_POST) {
+    try {
+      const clonedReq = req.clone();
+      body = await clonedReq.json() as typeof body;
+    } catch (error) {
+      logger.debug('Failed to parse dashboard batch request body', { correlationId, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+
+  // Use comprehensive storeId resolution
+  const storeIdResult = await getStoreIdOrError(ctx, {
+    queryParams: url.searchParams,
+    body,
+    shopDomain: url.searchParams.get('shopDomain') || body.shopDomain || undefined,
+  });
+  
+  if (storeIdResult instanceof Response) {
+    return storeIdResult;
+  }
+  
+  const { storeId } = storeIdResult;
+
+  try {
+    const serviceSupabase = await getSupabaseClient({ clientType: 'service' });
+
+    // Fetch all data in parallel to minimize execution time
+    const [quotaResult, postsResult, scheduledPostsResult, draftPostsResult, analyticsResult] = await Promise.all([
+      // Quota status
+      retryOperation(
+        async () => {
+          const result = await serviceSupabase.rpc(RPC_GET_STORE_QUOTA_STATUS, {
+            [PARAM_STORE_UUID]: storeId!,
+          });
+          if (result.error) {
+            throw new SupabaseClientError('Failed to fetch quota', result.error);
+          }
+          return result.data;
+        },
+        CONFIG.MAX_RETRIES,
+        CONFIG.RETRY_DELAY_MS,
+      ),
+      // Published posts
+      retryOperation(
+        async () => {
+          const result = await supabase
+            .from(TABLE_BLOG_POSTS)
+            .select('*')
+            .eq(COLUMN_STORE_ID, storeId!)
+            .eq(PARAM_STATUS, STATUS_PUBLISHED)
+            .order(COLUMN_CREATED_AT, { ascending: false })
+            .limit(50);
+          if (result.error) {
+            throw new SupabaseClientError('Failed to fetch published posts', result.error);
+          }
+          return result.data ?? [];
+        },
+        CONFIG.MAX_RETRIES,
+        CONFIG.RETRY_DELAY_MS,
+      ),
+      // Scheduled posts
+      retryOperation(
+        async () => {
+          const result = await supabase
+            .from(TABLE_BLOG_POSTS)
+            .select('*')
+            .eq(COLUMN_STORE_ID, storeId!)
+            .eq(PARAM_STATUS, STATUS_SCHEDULED)
+            .order(COLUMN_CREATED_AT, { ascending: false })
+            .limit(50);
+          if (result.error) {
+            throw new SupabaseClientError('Failed to fetch scheduled posts', result.error);
+          }
+          return result.data ?? [];
+        },
+        CONFIG.MAX_RETRIES,
+        CONFIG.RETRY_DELAY_MS,
+      ),
+      // Draft posts
+      retryOperation(
+        async () => {
+          const result = await supabase
+            .from(TABLE_BLOG_POSTS)
+            .select('*')
+            .eq(COLUMN_STORE_ID, storeId!)
+            .eq(PARAM_STATUS, STATUS_DRAFT)
+            .order(COLUMN_CREATED_AT, { ascending: false })
+            .limit(50);
+          if (result.error) {
+            throw new SupabaseClientError('Failed to fetch draft posts', result.error);
+          }
+          return result.data ?? [];
+        },
+        CONFIG.MAX_RETRIES,
+        CONFIG.RETRY_DELAY_MS,
+      ),
+      // Analytics (last 30 days summary) - Optimized to use SQL aggregation
+      retryOperation(
+        async () => {
+          // Try to use materialized view first (much faster)
+          const summaryResult = await supabase
+            .from('analytics_summary_30d')
+            .select('pageviews, clicks, conversions, total_events')
+            .eq(COLUMN_STORE_ID, storeId!)
+            .order('event_date', { ascending: false })
+            .limit(30); // Last 30 days
+          
+          if (!summaryResult.error && summaryResult.data && summaryResult.data.length > 0) {
+            // Aggregate from materialized view
+            const summary = summaryResult.data.reduce((acc: { pageviews: number; clicks: number; conversions: number; totalEvents: number }, row: { pageviews: number; clicks: number; conversions: number; total_events: number }) => {
+              acc.pageviews += row.pageviews || 0;
+              acc.clicks += row.clicks || 0;
+              acc.conversions += row.conversions || 0;
+              acc.totalEvents += row.total_events || 0;
+              return acc;
+            }, { pageviews: 0, clicks: 0, conversions: 0, totalEvents: 0 });
+            
+            return summary;
+          }
+          
+          // Fallback to direct query with SQL aggregation (faster than JavaScript filtering)
+          const endDate = new Date();
+          const startDate = new Date();
+          startDate.setDate(startDate.getDate() - 30);
+
+          // Use RPC function for aggregation (if available) or aggregate in SQL
+          const result = await supabase.rpc('get_analytics_summary', {
+            store_uuid: storeId!,
+            start_date: startDate.toISOString(),
+            end_date: endDate.toISOString(),
+          });
+          
+          if (!result.error && result.data) {
+            return result.data;
+          }
+          
+          // Final fallback: aggregate in SQL using select with filters
+          const fallbackResult = await supabase
+            .from('analytics')
+            .select('event_type')
+            .eq(COLUMN_STORE_ID, storeId!)
+            .gte('timestamp', startDate.toISOString())
+            .lte('timestamp', endDate.toISOString());
+          
+          if (fallbackResult.error) {
+            throw new SupabaseClientError('Failed to fetch analytics', fallbackResult.error);
+          }
+          
+          // Aggregate in JavaScript as last resort
+          const events = fallbackResult.data ?? [];
+          return {
+            totalEvents: events.length,
+            pageviews: events.filter((e: { event_type: string }) => e.event_type === 'pageview').length,
+            clicks: events.filter((e: { event_type: string }) => e.event_type === 'click').length,
+            conversions: events.filter((e: { event_type: string }) => e.event_type === 'conversion').length,
+          };
+        },
+        CONFIG.MAX_RETRIES,
+        CONFIG.RETRY_DELAY_MS,
+      ),
+    ]);
+
+    return createSuccessResponse(
+      {
+        quota: quotaResult ?? {},
+        posts: postsResult ?? [],
+        scheduledPosts: scheduledPostsResult ?? [],
+        draftPosts: draftPostsResult ?? [],
+        analytics: analyticsResult ?? {},
+      },
+      correlationId,
+      { cached: false },
+      { compression: true, request: req },
+    );
+  } catch (error) {
+    logger.error('Dashboard batch error', {
+      correlationId,
+      error: error instanceof Error ? error.message : String(error),
+      storeId,
     });
     throw error;
   }
@@ -1904,6 +2398,16 @@ async function routeRequest(ctx: RequestContext): Promise<Response> {
       requiresAuth: true,
       compression: true,
       rateLimit: { maxRequests: RATE_LIMIT_QUOTA, windowMs: RATE_LIMIT_WINDOW_MS },
+      cache: { ttl: 60000 }, // Cache for 1 minute
+    });
+  }
+
+  // Check if this is a batch dashboard endpoint (combines store, quota, posts, analytics)
+  if (pathParts.length >= 2 && pathParts[pathParts.length - 2] === 'dashboard' && pathParts[pathParts.length - 1] === 'batch') {
+    return handleRequest(ctx.req, handleDashboardBatch, {
+      requiresAuth: true,
+      compression: true,
+      rateLimit: { maxRequests: RATE_LIMIT_POSTS, windowMs: RATE_LIMIT_WINDOW_MS },
       cache: { ttl: 60000 }, // Cache for 1 minute
     });
   }

@@ -1004,6 +1004,28 @@ export interface QueueMetrics {
   needsRefill: boolean;
 }
 
+export interface DashboardBatchData {
+  quota: QuotaStatus;
+  posts: readonly BlogPost[];
+  scheduledPosts: readonly BlogPost[];
+  draftPosts: readonly BlogPost[];
+  analytics: {
+    totalEvents: number;
+    pageviews: number;
+    clicks: number;
+    conversions: number;
+  };
+}
+
+export const dashboardApi = {
+  getBatch: async (storeId: string, shopDomain?: string): Promise<DashboardBatchData> => {
+    return api.get<DashboardBatchData>(`/api-router/dashboard/batch`, {
+      ...({ params: { storeId, shopDomain } } as RequestConfig),
+      cache: { enabled: true, ttl: 60000 }, // Cache for 1 minute
+    });
+  },
+};
+
 export const queueApi = {
   getQueue: async (storeId: string): Promise<QueuedArticle[]> => {
     return api.get<QueuedArticle[]>(`/api-router/queue`, {

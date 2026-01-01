@@ -676,12 +676,14 @@ function getCacheManager(): EnhancedCacheManager {
   return cacheManager;
 }
 
+// Optimized cache TTLs to reduce Edge Function invocations
+// Increased TTLs for data that doesn't change frequently
 const CACHE_TTL = {
-  STORE: 10 * 60 * 1000,
-  QUOTA: 1 * 60 * 1000,
-  PLANS: 60 * 60 * 1000,
-  POSTS: 30 * 1000,
-  ANALYTICS: 5 * 60 * 1000,
+  STORE: 15 * 60 * 1000, // 15 minutes (was 10) - store data rarely changes
+  QUOTA: 2 * 60 * 1000, // 2 minutes (was 1) - quota updates less frequently
+  PLANS: 60 * 60 * 1000, // 1 hour - plans rarely change
+  POSTS: 2 * 60 * 1000, // 2 minutes (was 30s) - posts don't change that often
+  ANALYTICS: 10 * 60 * 1000, // 10 minutes (was 5) - analytics can be cached longer
 } as const;
 
 export const queryKeys = {
@@ -811,7 +813,7 @@ export function useQuotaStatus(storeId: string) {
     },
     CACHE_TTL.QUOTA,
     {
-      refetchInterval: CACHE_TTL.QUOTA,
+      refetchInterval: CACHE_TTL.QUOTA * 2, // Reduce polling frequency (refetch every 4 minutes instead of 2)
       enabled: !!storeId, // Only fetch if storeId is provided
     },
   );

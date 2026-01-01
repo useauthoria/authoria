@@ -177,9 +177,13 @@ export function usePostsData(options: UsePostsDataOptions = {}): PostsData {
       return;
     }
 
+    // Optimized: Increase default refetch interval to reduce Edge Function invocations
+    // Only refetch if user explicitly enables real-time updates
+    const optimizedInterval = refetchInterval >= 30000 ? refetchInterval : Math.max(refetchInterval, 60000); // Minimum 1 minute
+
     const interval = setInterval(() => {
       refetchPosts();
-    }, refetchInterval);
+    }, optimizedInterval);
 
     return () => clearInterval(interval);
   }, [enableRealTime, refetchInterval, store?.id, refetchPosts]);

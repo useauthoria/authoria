@@ -7,11 +7,7 @@
     "build": "tsc",
     "prepare-functions": "bash ../scripts/prepare-functions.sh",
     "deploy": "npm run prepare-functions && supabase functions deploy",
-    "deploy:all": "npm run prepare-functions && supabase functions deploy --no-verify-jwt",
-    "test": "vitest run",
-    "test:watch": "vitest",
-    "test:ui": "vitest --ui",
-    "test:coverage": "vitest run --coverage"
+    "deploy:all": "npm run prepare-functions && supabase functions deploy --no-verify-jwt"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.38.4",
@@ -21,9 +17,6 @@
   },
   "devDependencies": {
     "@types/node": "^20.10.5",
-    "@vitest/coverage-v8": "^1.6.1",
-    "@vitest/ui": "^1.6.1",
-    "typescript": "^5.2.2",
-    "vitest": "^1.6.1"
+    "typescript": "^5.2.2"
   }
 }

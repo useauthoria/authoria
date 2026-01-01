@@ -2,7 +2,7 @@ import { useMemo, useEffect, useCallback } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { useStore, useQuotaStatus, usePosts, queryKeys } from '../lib/api-cache';
 import { getShopDomain } from '../lib/app-bridge';
-import { analyticsApi } from '../lib/api-client';
+import { analyticsApi, dashboardApi } from '../lib/api-client';
 import type { Store, BlogPost, QuotaStatus } from '../lib/api-client';
 import { useNetworkStatus } from './useNetworkStatus';
 
@@ -48,6 +48,25 @@ export function useDashboardData(options: UseDashboardDataOptions = {}): Dashboa
   const storeId = store?.id ?? '';
   const hasStoreId = !!storeId;
 
+  // Use batch endpoint to reduce Edge Function invocations from 5-6 calls to 1 call
+  const {
+    data: batchData,
+    isLoading: batchLoading,
+    error: batchError,
+    refetch: refetchBatch,
+  } = useQuery({
+    queryKey: ['dashboard-batch', storeId, shopDomain],
+    queryFn: async () => {
+      if (!storeId && !shopDomain) return null;
+      return dashboardApi.getBatch(storeId || '', shopDomain || '');
+    },
+    enabled: (!!storeId || !!shopDomain) && isOnline,
+    staleTime: 60000, // 1 minute
+    gcTime: 5 * 60 * 1000, // 5 minutes
+    refetchInterval: 2 * 60 * 1000, // Refetch every 2 minutes (reduced from individual polling)
+  });
+
+  // Fallback to individual queries if batch fails or storeId not available yet
   const {
     data: quota,
     isLoading: quotaLoading,
@@ -86,28 +105,38 @@ export function useDashboardData(options: UseDashboardDataOptions = {}): Dashboa
       if (!storeId) return null;
       return analyticsApi.getMetrics(storeId);
     },
-    enabled: !!storeId && isOnline,
+    enabled: !!storeId && isOnline && !batchData, // Only fetch if batch didn't provide analytics
     staleTime: 5 * 60 * 1000,
     gcTime: 10 * 60 * 1000,
   });
 
+  // Use batch data if available, otherwise fall back to individual queries
+  const finalQuota = batchData?.quota ?? quota ?? null;
+  const finalPosts = batchData?.posts ?? posts ?? [];
+  const finalScheduledPosts = batchData?.scheduledPosts ?? scheduledPosts ?? [];
+  const finalDraftPosts = batchData?.draftPosts ?? draftPosts ?? [];
+  const finalAnalytics = batchData?.analytics ?? analytics ?? null;
+
   // Only consider loading for queries that are actually enabled
-  // When storeId is empty, React Query disables those queries so they don't contribute to loading
-  // But we need to check if the queries themselves report loading state correctly when disabled
   const isLoading = shopDomain 
-    ? storeLoading || (hasStoreId && (quotaLoading || postsLoading || scheduledPostsLoading || draftPostsLoading))
+    ? storeLoading || (hasStoreId && (batchLoading || (!batchData && (quotaLoading || postsLoading || scheduledPostsLoading || draftPostsLoading))))
     : false;
-  const isError = !!storeError || !!quotaError || !!postsError || !!scheduledPostsError || !!draftPostsError || !!analyticsError;
-  const error = storeError || quotaError || postsError || scheduledPostsError || draftPostsError || analyticsError || null;
+  const isError = !!storeError || !!batchError || (!batchData && (!!quotaError || !!postsError || !!scheduledPostsError || !!draftPostsError || !!analyticsError));
+  const error = storeError || batchError || (!batchData && (quotaError || postsError || scheduledPostsError || draftPostsError || analyticsError)) || null;
 
   const refetch = useCallback(() => {
     refetchStore();
-    refetchQuota();
-    refetchPosts();
-    refetchScheduledPosts();
-    refetchDraftPosts();
-    refetchAnalytics();
-  }, [refetchStore, refetchQuota, refetchPosts, refetchScheduledPosts, refetchDraftPosts, refetchAnalytics]);
+    if (batchData) {
+      refetchBatch(); // Use batch refetch if available
+    } else {
+      // Fallback to individual refetches
+      refetchQuota();
+      refetchPosts();
+      refetchScheduledPosts();
+      refetchDraftPosts();
+      refetchAnalytics();
+    }
+  }, [refetchStore, refetchBatch, refetchQuota, refetchPosts, refetchScheduledPosts, refetchDraftPosts, refetchAnalytics, batchData]);
 
   useEffect(() => {
     if (error && onError) {
@@ -117,11 +146,11 @@ export function useDashboardData(options: UseDashboardDataOptions = {}): Dashboa
 
   return {
     store: store ?? null,
-    quota: quota ?? null,
-    posts: posts ?? [],
-    scheduledPosts: scheduledPosts ?? [],
-    draftPosts: draftPosts ?? [],
-    analytics,
+    quota: finalQuota,
+    posts: finalPosts,
+    scheduledPosts: finalScheduledPosts,
+    draftPosts: finalDraftPosts,
+    analytics: finalAnalytics,
     isLoading,
     isError,
     error,
