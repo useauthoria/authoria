@@ -29,12 +29,6 @@ export const PLAN_FREQUENCY_CONFIG: Readonly<Record<string, PlanFrequencyConfig>
     maxDays: 7,
     displayName: '7 articles per week',
   },
-  authority: {
-    articlesPerWeek: 14,
-    minDays: 7,
-    maxDays: 7,
-    displayName: '14 articles per week (2 per day)',
-  },
 };
 
 /**

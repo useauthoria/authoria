@@ -68,8 +68,6 @@ export class ArticlesQueue {
         return 3;
       case 'publisher':
         return 7;
-      case 'authority':
-        return 14;
       default:
         return 3; // Default to starter
     }

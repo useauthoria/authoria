@@ -1133,6 +1133,42 @@ export default function Setup() {
                           className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-purple-500 focus:border-transparent"
                         />
                       </div>
+
+                      {/* Free Trial Info */}
+                      <div className="mt-6 bg-gradient-to-r from-emerald-50 to-teal-50 border border-emerald-200 rounded-xl p-5">
+                        <div className="flex items-start gap-4">
+                          <div className="flex-shrink-0 w-10 h-10 rounded-full bg-emerald-100 flex items-center justify-center">
+                            <svg className="w-5 h-5 text-emerald-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 8v13m0-13V6a2 2 0 112 2h-2zm0 0V5.5A2.5 2.5 0 109.5 8H12zm-7 4h14M5 12a2 2 0 110-4h14a2 2 0 110 4M5 12v7a2 2 0 002 2h10a2 2 0 002-2v-7" />
+                            </svg>
+                          </div>
+                          <div className="flex-1">
+                            <h4 className="text-base font-semibold text-emerald-900 mb-1">
+                              🎉 Start Your 14-Day Free Trial
+                            </h4>
+                            <p className="text-sm text-emerald-700 mb-3">
+                              Enjoy full access to all features during your trial period. Explore automated content generation, 
+                              scheduling, and analytics — completely free.
+                            </p>
+                            <div className="flex flex-wrap gap-3 text-sm">
+                              <span className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-white/80 border border-emerald-200 rounded-full text-emerald-800 font-medium">
+                                <svg className="w-4 h-4 text-emerald-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M5 13l4 4L19 7" />
+                                </svg>
+                                No credit card required
+                              </span>
+                              {quota && typeof quota === 'object' && 'trial_ends_at' in quota && quota.trial_ends_at && (
+                                <span className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-white/80 border border-emerald-200 rounded-full text-emerald-800 font-medium">
+                                  <svg className="w-4 h-4 text-emerald-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                                  </svg>
+                                  Trial ends {new Date(quota.trial_ends_at as string).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                      </div>
                     </div>
                   </div>
                 )}

@@ -23,7 +23,6 @@ interface Feature {
   description?: string;
   starter: boolean | string;
   publisher: boolean | string;
-  authority: boolean | string;
 }
 
 const FEATURES: Feature[] = [
@@ -32,126 +31,108 @@ const FEATURES: Feature[] = [
     description: 'Maximum articles you can generate each month',
     starter: '12',
     publisher: '30',
-    authority: '60',
   },
   {
     name: 'Auto-Submit Sitemap',
     description: 'Automatically submit sitemap to Google Search Console when articles publish',
     starter: true,
     publisher: true,
-    authority: true,
   },
   {
     name: 'Featured Image Generation',
     description: 'AI-generated featured images for every article',
     starter: true,
     publisher: true,
-    authority: true,
   },
   {
     name: 'SEO Optimization',
     description: 'Structured data, meta descriptions, SEO titles, and health scoring',
     starter: true,
     publisher: true,
-    authority: true,
   },
   {
     name: 'Analytics Dashboard',
     description: 'Track impressions, clicks, CTR, and conversions',
     starter: true,
     publisher: true,
-    authority: true,
   },
   {
     name: 'Google Analytics Integration',
     description: 'Track article performance with Google Analytics 4',
     starter: true,
     publisher: true,
-    authority: true,
   },
   {
     name: 'Google Search Console Integration',
     description: 'Monitor search performance and indexing status',
     starter: true,
     publisher: true,
-    authority: true,
   },
   {
     name: 'Content Quality Validation',
     description: 'AI-powered quality scoring and recommendations',
     starter: true,
     publisher: true,
-    authority: true,
   },
   {
     name: 'Brand Voice Customization',
     description: 'Customize brand DNA, tone matrix, and audience personas',
     starter: true,
     publisher: true,
-    authority: true,
   },
   {
     name: 'Internal Linking',
     description: 'Automatic internal links between related articles',
     starter: true,
     publisher: true,
-    authority: true,
   },
   {
     name: 'Keyword Mining',
     description: 'AI-powered keyword research and clustering',
     starter: true,
     publisher: true,
-    authority: true,
   },
   {
     name: 'Scheduled Publishing',
     description: 'Schedule articles to publish at specific dates and times',
     starter: true,
     publisher: true,
-    authority: true,
   },
   {
     name: 'Approval Workflow',
     description: 'Review and approve articles before publishing',
     starter: true,
     publisher: true,
-    authority: true,
   },
   {
     name: 'Content Strategy',
     description: 'Topic preferences, keyword focus, and content angles',
     starter: true,
     publisher: true,
-    authority: true,
   },
   {
     name: 'Citations & Sources',
     description: 'Automatic fact-checking and citation generation',
     starter: true,
     publisher: true,
-    authority: true,
   },
   {
     name: 'Multiple Content Structures',
     description: 'How-to, listicle, comparison, tutorial, case-study formats',
     starter: true,
     publisher: true,
-    authority: true,
   },
   {
     name: 'Email Notifications',
     description: 'Get notified when articles are published or scheduled',
     starter: true,
     publisher: true,
-    authority: true,
   },
   {
     name: 'Brand Safety Filters',
     description: 'Automatic filtering of disallowed claims and blacklisted words',
     starter: true,
     publisher: true,
-    authority: true,
   },
 ];
 
@@ -259,8 +240,6 @@ export default function PlansModal({ isOpen, onClose, currentPlanName, storeId }
         return feature.starter;
       case 'publisher':
         return feature.publisher;
-      case 'authority':
-        return feature.authority;
       default:
         return false;
     }
@@ -285,7 +264,7 @@ export default function PlansModal({ isOpen, onClose, currentPlanName, storeId }
 
       {/* Modal */}
       <div className="flex min-h-full items-end justify-center p-4 text-center sm:items-center sm:p-0">
-        <div className="relative transform overflow-hidden rounded-2xl bg-white text-left shadow-2xl transition-all sm:my-8 sm:w-full sm:max-w-6xl">
+        <div className="relative transform overflow-hidden rounded-2xl bg-white text-left shadow-2xl transition-all sm:my-8 sm:w-full sm:max-w-5xl">
           {/* Header */}
           <div className="bg-gradient-to-r from-purple-600 to-blue-600 px-6 pt-6 pb-4 sm:px-8 sm:pt-8 sm:pb-6">
             <div className="flex items-center justify-between mb-4">
@@ -357,7 +336,7 @@ export default function PlansModal({ isOpen, onClose, currentPlanName, storeId }
             ) : (
               <>
                 {/* Plan Cards */}
-                <div className="grid grid-cols-1 gap-6 sm:grid-cols-3 mb-8">
+                <div className="grid grid-cols-1 gap-8 sm:grid-cols-2 max-w-4xl mx-auto mb-8">
                   {plans.map((plan) => {
                     const isCurrentPlan = currentPlanName === plan.plan_name;
                     const isPublisher = plan.plan_name === 'publisher';
@@ -376,7 +355,7 @@ export default function PlansModal({ isOpen, onClose, currentPlanName, storeId }
                       <div
                         key={plan.id}
                         className={`relative rounded-xl border-2 transition-all ${isPublisher
-                          ? 'border-purple-600 bg-gradient-to-br from-purple-50 to-blue-50 shadow-xl scale-105 z-10'
+                          ? 'border-purple-600 bg-gradient-to-br from-purple-50 to-blue-50 shadow-xl z-10'
                           : isCurrentPlan
                             ? 'border-purple-400 bg-purple-50 shadow-lg'
                             : 'border-gray-200 bg-white shadow-sm hover:shadow-md'
@@ -398,10 +377,10 @@ export default function PlansModal({ isOpen, onClose, currentPlanName, storeId }
                           </div>
                         )}
 
-                        <div className="p-6">
+                        <div className="p-8">
                           {/* Plan Header */}
                           <div className="text-center mb-6">
-                            <h4 className="text-xl font-bold text-gray-900 mb-3">
+                            <h4 className="text-2xl font-bold text-gray-900 mb-4">
                               {formatPlanName(plan.plan_name)}
                             </h4>
 

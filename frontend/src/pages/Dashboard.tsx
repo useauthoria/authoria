@@ -49,8 +49,21 @@ function formatDate(date: Date | string | null | undefined): string {
   }
 }
 
+// Detect if user's locale uses 12-hour or 24-hour format
+function uses12HourFormat(): boolean {
+  const testDate = new Date(2024, 0, 1, 13, 0); // 1 PM
+  const formatted = testDate.toLocaleTimeString(navigator.language, { hour: 'numeric' });
+  // If it contains 'PM' or 'AM', it's 12-hour format
+  return formatted.includes('PM') || formatted.includes('AM') || formatted.includes('pm') || formatted.includes('am');
+}
+
 function formatTime(date: Date): string {
-  return date.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+  const use12Hour = uses12HourFormat();
+  return date.toLocaleTimeString(navigator.language, { 
+    hour: 'numeric', 
+    minute: '2-digit', 
+    hour12: use12Hour 
+  });
 }
 
 function groupScheduledArticles(posts: readonly BlogPost[]): {
@@ -235,9 +248,9 @@ export default function Dashboard() {
         const [hours, minutes] = settings.preferredTimes![0].split(':').map(Number);
         const date = new Date();
         date.setHours(hours, minutes);
-        return date.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+        return formatTime(date);
       })()
-      : '2:00 PM';
+      : formatTime((() => { const d = new Date(); d.setHours(14, 0); return d; })());
 
     // Get next scheduled post
     const nextPost = scheduledPosts

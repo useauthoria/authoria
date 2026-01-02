@@ -540,9 +540,6 @@ export class ShopifyBilling {
     if (name.includes('publisher') || name.includes('pro')) {
       return 'publisher';
     }
-    if (name.includes('authority') || name.includes('premium')) {
-      return 'authority';
-    }
     if (name.includes('trial') || name.includes('free')) {
       return 'free_trial';
     }

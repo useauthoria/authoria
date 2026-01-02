@@ -679,33 +679,49 @@ async function callOpenAIViaFetch(
   prompt: string,
   openaiApiKey: string,
   model: string = 'gpt-4o-mini',
+  timeoutMs: number = 25000, // 25 second timeout per call
 ): Promise<string> {
-  const response = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${openaiApiKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model,
-      messages: [
-        {
-          role: 'user',
-          content: prompt,
-        },
-      ],
-      response_format: { type: 'json_object' },
-      temperature: 0.7,
-    }),
-  });
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
   
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`OpenAI API error: ${response.status} ${errorText}`);
+  try {
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${openaiApiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model,
+        messages: [
+          {
+            role: 'user',
+            content: prompt,
+          },
+        ],
+        response_format: { type: 'json_object' },
+        temperature: 0.7,
+        max_tokens: 2000, // Limit response size
+      }),
+      signal: controller.signal,
+    });
+    
+    clearTimeout(timeoutId);
+    
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`OpenAI API error: ${response.status} ${errorText}`);
+    }
+    
+    const data = await response.json() as { choices?: ReadonlyArray<{ message?: { content?: string } }> };
+    return data.choices?.[0]?.message?.content || '';
+  } catch (error) {
+    clearTimeout(timeoutId);
+    if (error instanceof Error && error.name === 'AbortError') {
+      throw new Error(`OpenAI API timeout after ${timeoutMs}ms`);
+    }
+    throw error;
   }
-  
-  const data = await response.json() as { choices?: ReadonlyArray<{ message?: { content?: string } }> };
-  return data.choices?.[0]?.message?.content || '';
 }
 
 async function analyzeBrandDNAViaFetch(
@@ -1075,13 +1091,13 @@ async function handleStoreSetup(ctx: RequestContext): Promise<Response> {
       articlesCount: contentData.articleText.length,
     });
 
-    // Analyze brand DNA
-    const brandDNAResult = await analyzeBrandDNAViaFetch(textSamples, CONFIG.OPENAI_API_KEY, shopName);
+    // Run brand DNA and tone analysis in parallel for speed
+    const [brandDNAResult, toneMatrix] = await Promise.all([
+      analyzeBrandDNAViaFetch(textSamples, CONFIG.OPENAI_API_KEY, shopName),
+      analyzeToneViaFetch(textSamples, CONFIG.OPENAI_API_KEY),
+    ]);
 
-    // Analyze tone
-    const toneMatrix = await analyzeToneViaFetch(textSamples, CONFIG.OPENAI_API_KEY);
-
-    // Generate audience personas
+    // Generate personas based on brand DNA (sequential as it depends on brandDNA)
     const personas = await generateAudiencePersonasViaFetch(textSamples, brandDNAResult, CONFIG.OPENAI_API_KEY);
 
     // Create brand DNA object
