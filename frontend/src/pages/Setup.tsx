@@ -544,20 +544,22 @@ export default function Setup() {
   // Show loading while we wait, or allow setup to proceed
   if (hasError && !store && !shopDomain) {
     return (
-      <div className="min-h-0 flex flex-col">
-        <div className="p-4 sm:p-6 lg:p-8">
-          <div className="bg-white rounded-xl border border-gray-200 shadow-sm p-6">
-            <div className="bg-red-50 border border-red-200 rounded-lg p-4">
-              <h3 className="text-sm font-semibold text-red-900 mb-1">Setup Required</h3>
-              <p className="text-sm text-red-700 mb-4">
-                We couldn't determine your shop information. Please refresh the page and try again.
-              </p>
-              <button
-                onClick={() => window.location.reload()}
-                className="px-4 py-2 bg-red-600 text-white text-sm font-medium rounded-md hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-offset-2"
-              >
-                Refresh Page
-              </button>
+      <div className="h-screen flex flex-col">
+        <div className="flex-1 overflow-y-auto p-4 sm:p-6 lg:p-8">
+          <div className="max-w-4xl mx-auto flex items-center justify-center min-h-full">
+            <div className="bg-white rounded-xl border border-gray-200 shadow-sm p-6 w-full">
+              <div className="bg-red-50 border border-red-200 rounded-lg p-4">
+                <h3 className="text-sm font-semibold text-red-900 mb-1">Setup Required</h3>
+                <p className="text-sm text-red-700 mb-4">
+                  We couldn't determine your shop information. Please refresh the page and try again.
+                </p>
+                <button
+                  onClick={() => window.location.reload()}
+                  className="px-4 py-2 bg-red-600 text-white text-sm font-medium rounded-md hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-offset-2"
+                >
+                  Refresh Page
+                </button>
+              </div>
             </div>
           </div>
         </div>
@@ -568,12 +570,14 @@ export default function Setup() {
   // If store is loading (but not errored), show loading
   if (isLoadingState && !store && !hasError) {
     return (
-      <div className="min-h-0 flex flex-col">
-        <div className="p-4 sm:p-6 lg:p-8">
-          <div className="bg-white rounded-xl border border-gray-200 shadow-sm p-6">
-            <div className="flex flex-col items-center gap-4">
-              <LoadingSpinner size="large" label="Initializing..." />
-              <p className="text-sm text-gray-600">Setting up your store...</p>
+      <div className="h-screen flex flex-col">
+        <div className="flex-1 overflow-y-auto p-4 sm:p-6 lg:p-8">
+          <div className="max-w-4xl mx-auto flex items-center justify-center min-h-full">
+            <div className="bg-white rounded-xl border border-gray-200 shadow-sm p-6 w-full">
+              <div className="flex flex-col items-center gap-4">
+                <LoadingSpinner size="large" label="Initializing..." />
+                <p className="text-sm text-gray-600">Setting up your store...</p>
+              </div>
             </div>
           </div>
         </div>
@@ -588,12 +592,12 @@ export default function Setup() {
   return (
     <div className="h-screen flex flex-col bg-gray-50">
       <div className="flex-1 overflow-y-auto p-4 sm:p-6 lg:p-8">
-        <div className="max-w-4xl mx-auto flex flex-col min-h-full">
+        <div className="max-w-4xl mx-auto flex flex-col">
           {/* Removed back button - setup is mandatory */}
           {/* Initial Screen */}
           {currentStep === 0 && (
-            <div className="bg-white rounded-xl border border-gray-200 shadow-sm p-6 sm:p-8 lg:p-10 text-center">
-              <div className="max-w-2xl mx-auto">
+            <div className="bg-white rounded-xl border border-gray-200 shadow-sm p-6 sm:p-8 lg:p-10 text-center flex-1 flex items-center justify-center">
+              <div className="max-w-2xl mx-auto w-full">
                 <div className="w-16 h-16 sm:w-20 sm:h-20 mx-auto mb-6 rounded-full bg-gradient-to-br from-purple-500 to-blue-600 flex items-center justify-center">
                   <svg
                     className="w-8 h-8 sm:w-10 sm:h-10 text-white"
@@ -1184,7 +1188,7 @@ export default function Setup() {
               </div>
 
               {/* Navigation Buttons - Setup is mandatory, no cancel/back buttons */}
-              <div className="mt-6 flex flex-col sm:flex-row items-center justify-end gap-3 sm:gap-4">
+              <div className="mt-6 flex flex-col sm:flex-row items-center justify-end gap-3 sm:gap-4 flex-shrink-0">
                 {/* Only show Continue button on form steps (4-5), not on automatic processing steps (1-3) */}
                 {currentStep >= 4 && currentStep < 6 && (
                   <button
@@ -1211,13 +1215,13 @@ export default function Setup() {
                   </button>
                 )}
               </div>
-            </>
+            </div>
           )}
 
           {/* Completion Screen */}
           {isComplete && (
-            <div className="bg-white rounded-xl border border-gray-200 shadow-sm p-6 sm:p-8 lg:p-10 text-center">
-              <div className="max-w-2xl mx-auto">
+            <div className="bg-white rounded-xl border border-gray-200 shadow-sm p-6 sm:p-8 lg:p-10 text-center flex-1 flex items-center justify-center">
+              <div className="max-w-2xl mx-auto w-full">
                 <div className="w-16 h-16 sm:w-20 sm:h-20 mx-auto mb-6 rounded-full bg-green-100 flex items-center justify-center">
                   <svg
                     className="w-8 h-8 sm:w-10 sm:h-10 text-green-600"
