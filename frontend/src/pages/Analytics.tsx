@@ -1,9 +1,9 @@
-import { useState, useMemo, useCallback } from 'react';
+import { useState, useMemo, useCallback, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import { getShopDomain } from '../lib/app-bridge';
 import { useStore, queryKeys } from '../lib/api-cache';
-import { analyticsApi } from '../lib/api-client';
+import { analyticsApi, supabase } from '../lib/api-client';
 import { formatAPIErrorMessage } from '../utils/error-messages';
 import { HelpIcon } from '../components/Tooltip';
 
@@ -78,6 +78,10 @@ function SkeletonCard() {
 export default function Analytics() {
   const navigate = useNavigate();
   const [dateRange, setDateRange] = useState<DateRange>('30d');
+  const [gscConnected, setGscConnected] = useState(false);
+  const [gaConnected, setGaConnected] = useState(false);
+  const [checkingConnections, setCheckingConnections] = useState(true);
+  
   const shopDomain = useMemo(() => {
     try {
       return getShopDomain();
@@ -95,6 +99,60 @@ export default function Analytics() {
   const storeId = store?.id ?? '';
   const dateRangeParams = useMemo(() => calculateDateRange(dateRange), [dateRange]);
 
+  // Check integration connection status
+  useEffect(() => {
+    if (!storeId) {
+      setCheckingConnections(false);
+      return;
+    }
+
+    const checkIntegrations = async () => {
+      try {
+        const [ga4Result, gscResult] = await Promise.all([
+          supabase
+            .from('analytics_integrations')
+            .select('id')
+            .eq('store_id', storeId)
+            .eq('integration_type', 'google_analytics_4')
+            .eq('is_active', true)
+            .maybeSingle(),
+          supabase
+            .from('analytics_integrations')
+            .select('id')
+            .eq('store_id', storeId)
+            .eq('integration_type', 'google_search_console')
+            .eq('is_active', true)
+            .maybeSingle(),
+        ]);
+
+        setGaConnected(!!ga4Result.data);
+        setGscConnected(!!gscResult.data);
+      } catch (error) {
+        console.error('Error checking integrations:', error);
+        // Don't block UI on connection check errors
+        setGaConnected(false);
+        setGscConnected(false);
+      } finally {
+        setCheckingConnections(false);
+      }
+    };
+
+    checkIntegrations();
+
+    // Refresh connections when page becomes visible (e.g., user returns from Settings)
+    const handleVisibilityChange = () => {
+      if (!document.hidden && storeId) {
+        checkIntegrations();
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, [storeId]);
+
   const {
     data: analyticsData,
     isLoading: analyticsLoading,
@@ -106,7 +164,7 @@ export default function Analytics() {
       const response = await analyticsApi.getMetrics(storeId, dateRangeParams);
       return response as AnalyticsData;
     },
-    enabled: !!storeId,
+    enabled: !!storeId && !checkingConnections,
     staleTime: 60000,
     gcTime: 300000,
   });
@@ -119,8 +177,11 @@ export default function Analytics() {
     navigate('/posts');
   }, [navigate]);
 
-  const isLoading = storeLoading || analyticsLoading;
+  const isLoading = storeLoading || analyticsLoading || checkingConnections;
   const error = storeError || analyticsError;
+  
+  // All metrics shown are from GSC, so lock if GSC is not connected
+  const isLocked = !gscConnected;
 
   if (error && !store) {
     return (
@@ -183,6 +244,37 @@ export default function Analytics() {
       </header>
 
       <div className="flex-1 overflow-y-auto p-4 sm:p-6 lg:p-8">
+        {/* Connection Status Banner */}
+        {!checkingConnections && isLocked && (
+          <div className="mb-6 bg-blue-50 border border-blue-200 rounded-xl p-4 sm:p-5 shadow-sm">
+            <div className="flex items-start gap-3">
+              <div className="flex-shrink-0 mt-0.5">
+                <svg className="w-5 h-5 sm:w-6 sm:h-6 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+              </div>
+              <div className="flex-1 min-w-0">
+                <h3 className="text-sm sm:text-base font-semibold text-blue-900 mb-1">
+                  Connect Google Search Console to View Analytics
+                </h3>
+                <p className="text-xs sm:text-sm text-blue-800 mb-3">
+                  Connect Google Search Console to unlock detailed analytics including impressions, clicks, CTR, and search position for your articles.
+                </p>
+                <button
+                  onClick={() => navigate('/settings')}
+                  className="inline-flex items-center gap-2 px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 focus:ring-offset-blue-50"
+                >
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                  </svg>
+                  Go to Settings
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 sm:gap-5 lg:gap-6 mb-6 sm:mb-8">
           {isLoading ? (
             <>
@@ -193,20 +285,30 @@ export default function Analytics() {
             </>
           ) : (
             <>
-              <div className="bg-white rounded-xl p-4 sm:p-5 lg:p-6 border border-gray-200 shadow-sm">
+              <div className={`bg-white rounded-xl p-4 sm:p-5 lg:p-6 border shadow-sm relative ${isLocked ? 'border-gray-200 opacity-60' : 'border-gray-200'}`}>
+                {isLocked && (
+                  <div className="absolute inset-0 bg-gray-50/80 rounded-xl flex items-center justify-center z-10">
+                    <div className="text-center px-4">
+                      <svg className="w-6 h-6 sm:w-8 sm:h-8 text-gray-400 mx-auto mb-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+                      </svg>
+                      <p className="text-xs text-gray-500">Connect GSC</p>
+                    </div>
+                  </div>
+                )}
                 <div className="flex items-center justify-between">
                   <div className="flex-1">
                     <div className="flex items-center gap-1.5 mb-1">
                       <p className="text-xs sm:text-sm text-gray-500">Total Impressions</p>
                       <HelpIcon content="Total number of times your articles appeared in Google search results during the selected time period." />
                     </div>
-                    <p className="text-2xl sm:text-3xl lg:text-4xl font-bold text-gray-900">
-                      {formatNumber(totalImpressions)}
+                    <p className={`text-2xl sm:text-3xl lg:text-4xl font-bold ${isLocked ? 'text-gray-400' : 'text-gray-900'}`}>
+                      {isLocked ? '—' : formatNumber(totalImpressions)}
                     </p>
                   </div>
-                  <div className="w-10 h-10 sm:w-12 sm:h-12 rounded-lg bg-blue-100 flex items-center justify-center flex-shrink-0">
+                  <div className={`w-10 h-10 sm:w-12 sm:h-12 rounded-lg flex items-center justify-center flex-shrink-0 ${isLocked ? 'bg-gray-100' : 'bg-blue-100'}`}>
                     <svg
-                      className="w-5 h-5 sm:w-6 sm:h-6 text-blue-600"
+                      className={`w-5 h-5 sm:w-6 sm:h-6 ${isLocked ? 'text-gray-400' : 'text-blue-600'}`}
                       fill="none"
                       stroke="currentColor"
                       viewBox="0 0 24 24"
@@ -229,20 +331,30 @@ export default function Analytics() {
                 </div>
               </div>
 
-              <div className="bg-white rounded-xl p-4 sm:p-5 lg:p-6 border border-gray-200 shadow-sm">
+              <div className={`bg-white rounded-xl p-4 sm:p-5 lg:p-6 border shadow-sm relative ${isLocked ? 'border-gray-200 opacity-60' : 'border-gray-200'}`}>
+                {isLocked && (
+                  <div className="absolute inset-0 bg-gray-50/80 rounded-xl flex items-center justify-center z-10">
+                    <div className="text-center px-4">
+                      <svg className="w-6 h-6 sm:w-8 sm:h-8 text-gray-400 mx-auto mb-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+                      </svg>
+                      <p className="text-xs text-gray-500">Connect GSC</p>
+                    </div>
+                  </div>
+                )}
                 <div className="flex items-center justify-between">
                   <div className="flex-1">
                     <div className="flex items-center gap-1.5 mb-1">
                       <p className="text-xs sm:text-sm text-gray-500">Total Clicks</p>
                       <HelpIcon content="Total number of clicks your articles received from Google search results. This shows how many people visited your articles from search." />
                     </div>
-                    <p className="text-2xl sm:text-3xl lg:text-4xl font-bold text-gray-900">
-                      {formatNumber(totalClicks)}
+                    <p className={`text-2xl sm:text-3xl lg:text-4xl font-bold ${isLocked ? 'text-gray-400' : 'text-gray-900'}`}>
+                      {isLocked ? '—' : formatNumber(totalClicks)}
                     </p>
                   </div>
-                  <div className="w-10 h-10 sm:w-12 sm:h-12 rounded-lg bg-green-100 flex items-center justify-center flex-shrink-0">
+                  <div className={`w-10 h-10 sm:w-12 sm:h-12 rounded-lg flex items-center justify-center flex-shrink-0 ${isLocked ? 'bg-gray-100' : 'bg-green-100'}`}>
                     <svg
-                      className="w-5 h-5 sm:w-6 sm:h-6 text-green-600"
+                      className={`w-5 h-5 sm:w-6 sm:h-6 ${isLocked ? 'text-gray-400' : 'text-green-600'}`}
                       fill="none"
                       stroke="currentColor"
                       viewBox="0 0 24 24"
@@ -259,20 +371,30 @@ export default function Analytics() {
                 </div>
               </div>
 
-              <div className="bg-white rounded-xl p-4 sm:p-5 lg:p-6 border border-gray-200 shadow-sm">
+              <div className={`bg-white rounded-xl p-4 sm:p-5 lg:p-6 border shadow-sm relative ${isLocked ? 'border-gray-200 opacity-60' : 'border-gray-200'}`}>
+                {isLocked && (
+                  <div className="absolute inset-0 bg-gray-50/80 rounded-xl flex items-center justify-center z-10">
+                    <div className="text-center px-4">
+                      <svg className="w-6 h-6 sm:w-8 sm:h-8 text-gray-400 mx-auto mb-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+                      </svg>
+                      <p className="text-xs text-gray-500">Connect GSC</p>
+                    </div>
+                  </div>
+                )}
                 <div className="flex items-center justify-between">
                   <div className="flex-1">
                     <div className="flex items-center gap-1.5 mb-1">
                       <p className="text-xs sm:text-sm text-gray-500">Average CTR</p>
                       <HelpIcon content="Click-Through Rate: The percentage of people who clicked on your articles after seeing them in search results. Higher CTR means your titles and descriptions are compelling." />
                     </div>
-                    <p className="text-2xl sm:text-3xl lg:text-4xl font-bold text-gray-900">
-                      {formatPercentage(avgCTR)}
+                    <p className={`text-2xl sm:text-3xl lg:text-4xl font-bold ${isLocked ? 'text-gray-400' : 'text-gray-900'}`}>
+                      {isLocked ? '—' : formatPercentage(avgCTR)}
                     </p>
                   </div>
-                  <div className="w-10 h-10 sm:w-12 sm:h-12 rounded-lg bg-purple-100 flex items-center justify-center flex-shrink-0">
+                  <div className={`w-10 h-10 sm:w-12 sm:h-12 rounded-lg flex items-center justify-center flex-shrink-0 ${isLocked ? 'bg-gray-100' : 'bg-purple-100'}`}>
                     <svg
-                      className="w-5 h-5 sm:w-6 sm:h-6 text-purple-600"
+                      className={`w-5 h-5 sm:w-6 sm:h-6 ${isLocked ? 'text-gray-400' : 'text-purple-600'}`}
                       fill="none"
                       stroke="currentColor"
                       viewBox="0 0 24 24"
@@ -289,20 +411,30 @@ export default function Analytics() {
                 </div>
               </div>
 
-              <div className="bg-white rounded-xl p-4 sm:p-5 lg:p-6 border border-gray-200 shadow-sm">
+              <div className={`bg-white rounded-xl p-4 sm:p-5 lg:p-6 border shadow-sm relative ${isLocked ? 'border-gray-200 opacity-60' : 'border-gray-200'}`}>
+                {isLocked && (
+                  <div className="absolute inset-0 bg-gray-50/80 rounded-xl flex items-center justify-center z-10">
+                    <div className="text-center px-4">
+                      <svg className="w-6 h-6 sm:w-8 sm:h-8 text-gray-400 mx-auto mb-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+                      </svg>
+                      <p className="text-xs text-gray-500">Connect GSC</p>
+                    </div>
+                  </div>
+                )}
                 <div className="flex items-center justify-between">
                   <div className="flex-1">
                     <div className="flex items-center gap-1.5 mb-1">
                       <p className="text-xs sm:text-sm text-gray-500">Average Position</p>
                       <HelpIcon content="Average ranking position of your articles in Google search results. Lower numbers are better (position 1 is the top result)." />
                     </div>
-                    <p className="text-2xl sm:text-3xl lg:text-4xl font-bold text-gray-900">
-                      {avgPosition > 0 && avgPosition < 100 ? avgPosition.toFixed(1) : '—'}
+                    <p className={`text-2xl sm:text-3xl lg:text-4xl font-bold ${isLocked ? 'text-gray-400' : 'text-gray-900'}`}>
+                      {isLocked ? '—' : (avgPosition > 0 && avgPosition < 100 ? avgPosition.toFixed(1) : '—')}
                     </p>
                   </div>
-                  <div className="w-10 h-10 sm:w-12 sm:h-12 rounded-lg bg-orange-100 flex items-center justify-center flex-shrink-0">
+                  <div className={`w-10 h-10 sm:w-12 sm:h-12 rounded-lg flex items-center justify-center flex-shrink-0 ${isLocked ? 'bg-gray-100' : 'bg-orange-100'}`}>
                     <svg
-                      className="w-5 h-5 sm:w-6 sm:h-6 text-orange-600"
+                      className={`w-5 h-5 sm:w-6 sm:h-6 ${isLocked ? 'text-gray-400' : 'text-orange-600'}`}
                       fill="none"
                       stroke="currentColor"
                       viewBox="0 0 24 24"
@@ -323,7 +455,17 @@ export default function Analytics() {
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-1 gap-4 sm:gap-5 lg:gap-6">
-          <div className="bg-white rounded-xl border border-gray-200 shadow-sm">
+          <div className={`bg-white rounded-xl border shadow-sm relative ${isLocked ? 'border-gray-200 opacity-60' : 'border-gray-200'}`}>
+            {isLocked && (
+              <div className="absolute inset-0 bg-gray-50/80 rounded-xl flex items-center justify-center z-10">
+                <div className="text-center px-4">
+                  <svg className="w-8 h-8 sm:w-10 sm:h-10 text-gray-400 mx-auto mb-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+                  </svg>
+                  <p className="text-sm text-gray-500">Connect GSC to view top articles</p>
+                </div>
+              </div>
+            )}
             <div className="p-4 sm:p-5 lg:p-6 border-b border-gray-200">
               <h2 className="text-base sm:text-lg font-semibold text-gray-900">Top Articles</h2>
             </div>
@@ -339,6 +481,10 @@ export default function Analytics() {
                       <div className="h-4 bg-gray-200 rounded w-12"></div>
                     </div>
                   ))}
+                </div>
+              ) : isLocked ? (
+                <div className="text-center py-8">
+                  <p className="text-xs sm:text-sm text-gray-400">Connect Google Search Console to view top performing articles</p>
                 </div>
               ) : topPosts.length > 0 ? (
                 <div className="space-y-3 sm:space-y-4">

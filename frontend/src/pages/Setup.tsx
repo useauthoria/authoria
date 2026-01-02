@@ -143,6 +143,7 @@ export default function Setup() {
   const [currentStep, setCurrentStep] = useState<SetupStep>(0);
   const [progress, setProgress] = useState(0);
   const [isLoading, setIsLoading] = useState(false);
+  const [isCompleting, setIsCompleting] = useState(false);
   const [error, setError] = useState<Error | null>(null);
   const [isComplete, setIsComplete] = useState(false);
   const [selectedDays, setSelectedDays] = useState<Set<number>>(new Set([0, 2, 4])); // Monday, Wednesday, Friday
@@ -289,6 +290,9 @@ export default function Setup() {
   }, [store, shopDomain, startStepProgression, queryClient]);
 
   const handleComplete = useCallback(async () => {
+    setIsCompleting(true);
+    setError(null);
+    
     // If store doesn't exist, try to create it first
     let currentStore = store;
     if (!currentStore?.id && shopDomain) {
@@ -299,6 +303,7 @@ export default function Setup() {
         // Invalidate cache to refresh
         queryClient.invalidateQueries({ queryKey: queryKeys.store(shopDomain) });
       } catch (err) {
+        setIsCompleting(false);
         const errorMessage = err instanceof Error ? err.message : String(err);
         if (errorMessage.includes('404') || errorMessage.includes('not found')) {
           const friendlyError = 'We couldn\'t set up your store. This usually means the database needs to be configured. Please contact support for assistance.';
@@ -314,6 +319,7 @@ export default function Setup() {
     }
 
     if (!currentStore?.id) {
+      setIsCompleting(false);
       const friendlyError = "We couldn't find your store information. Please refresh the page and try again.";
       setError(new Error(friendlyError));
       showToast(friendlyError, { isError: true });
@@ -323,6 +329,7 @@ export default function Setup() {
     // Validate days before saving - must select at least the minimum required for the plan
     const validation = validateSelectedDays(selectedDays, planName);
     if (!validation.valid) {
+      setIsCompleting(false);
       const friendlyError = validation.error 
         ? validation.error.replace(/plan limits/i, 'your plan\'s limits')
         : 'Please select at least the minimum number of days required for your plan.';
@@ -403,11 +410,13 @@ export default function Setup() {
       setIsComplete(true);
       setProgress(100);
       setDayValidationError(null);
+      setIsCompleting(false);
       showToast('Setup completed successfully! Redirecting to dashboard...', { isError: false });
       
       // Navigate after ensuring cache is updated
       navigate('/dashboard', { replace: true });
     } catch (err) {
+      setIsCompleting(false);
       const statusCode = (err as { statusCode?: number })?.statusCode;
       let friendly: string;
       if (statusCode === 404) {
@@ -577,9 +586,9 @@ export default function Setup() {
   // For 404 errors, treat it as if store doesn't exist yet (expected for new installations)
 
   return (
-    <div className="min-h-0 flex flex-col bg-gray-50">
+    <div className="h-screen flex flex-col bg-gray-50">
       <div className="flex-1 overflow-y-auto p-4 sm:p-6 lg:p-8">
-        <div className="max-w-4xl mx-auto">
+        <div className="max-w-4xl mx-auto flex flex-col min-h-full">
           {/* Removed back button - setup is mandatory */}
           {/* Initial Screen */}
           {currentStep === 0 && (
@@ -621,9 +630,9 @@ export default function Setup() {
 
           {/* Setup Wizard */}
           {currentStep > 0 && !isComplete && (
-            <>
+            <div className="flex flex-col flex-1 min-h-0">
               {/* Progress Bar */}
-              <div className="bg-white rounded-xl border border-gray-200 shadow-sm p-4 sm:p-6 mb-6">
+              <div className="bg-white rounded-xl border border-gray-200 shadow-sm p-4 sm:p-6 mb-6 flex-shrink-0">
                 <div className="flex items-center justify-between mb-2">
                   <span className="text-xs sm:text-sm font-medium text-gray-700">Setup Progress</span>
                   <span className="text-xs sm:text-sm font-semibold text-purple-600">{Math.round(progress)}%</span>
@@ -638,21 +647,21 @@ export default function Setup() {
 
               {/* Error Message - Only show if it's a blocking error */}
               {error && error.message.includes('Store not loaded') && (
-                <div className="bg-red-50 border border-red-200 rounded-lg p-4 mb-6">
+                <div className="bg-red-50 border border-red-200 rounded-lg p-4 mb-6 flex-shrink-0">
                   <p className="text-sm text-red-800">{error.message}</p>
                 </div>
               )}
               {/* Warning Message - Non-blocking */}
               {error && error.message.includes('Store analysis may be incomplete') && (
-                <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-4 mb-6">
+                <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-4 mb-6 flex-shrink-0">
                   <p className="text-sm text-yellow-800">
                     <strong>Note:</strong> {error.message} The setup will continue normally.
                   </p>
                 </div>
               )}
 
-              {/* Step Content */}
-              <div className="bg-white rounded-xl border border-gray-200 shadow-sm p-6 sm:p-8 lg:p-10">
+              {/* Step Content - Scrollable */}
+              <div className="bg-white rounded-xl border border-gray-200 shadow-sm p-6 sm:p-8 lg:p-10 flex-1 overflow-y-auto min-h-0">
                 {/* Step 1: Scanning store assets */}
                 {currentStep === 1 && (
                   <div>
@@ -1188,10 +1197,17 @@ export default function Setup() {
                 {currentStep === 6 && (
                   <button
                     onClick={handleComplete}
-                    disabled={selectedDays.size < planFrequencyConfig.minDays}
-                    className="w-full sm:w-auto px-6 sm:px-8 py-3 sm:py-3.5 bg-purple-600 text-white rounded-lg text-base sm:text-lg font-medium hover:bg-purple-700 transition-colors touch-manipulation focus:outline-none focus:ring-2 focus:ring-purple-500 focus:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed shadow-lg shadow-purple-500/50"
+                    disabled={selectedDays.size < planFrequencyConfig.minDays || isCompleting}
+                    className="w-full sm:w-auto px-6 sm:px-8 py-3 sm:py-3.5 bg-purple-600 text-white rounded-lg text-base sm:text-lg font-medium hover:bg-purple-700 transition-colors touch-manipulation focus:outline-none focus:ring-2 focus:ring-purple-500 focus:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed shadow-lg shadow-purple-500/50 flex items-center justify-center gap-2"
                   >
-                    Complete Setup
+                    {isCompleting ? (
+                      <>
+                        <LoadingSpinner size="small" />
+                        <span>Saving...</span>
+                      </>
+                    ) : (
+                      'Complete Setup'
+                    )}
                   </button>
                 )}
               </div>
