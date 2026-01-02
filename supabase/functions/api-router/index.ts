@@ -2273,7 +2273,7 @@ async function handleDashboardBatch(ctx: RequestContext): Promise<Response> {
       // Published posts
       retryOperation(
         async () => {
-          const result = await supabase
+          const result = await serviceSupabase
             .from(TABLE_BLOG_POSTS)
             .select('*')
             .eq(COLUMN_STORE_ID, storeId!)
@@ -2291,7 +2291,7 @@ async function handleDashboardBatch(ctx: RequestContext): Promise<Response> {
       // Scheduled posts
       retryOperation(
         async () => {
-          const result = await supabase
+          const result = await serviceSupabase
             .from(TABLE_BLOG_POSTS)
             .select('*')
             .eq(COLUMN_STORE_ID, storeId!)
@@ -2309,7 +2309,7 @@ async function handleDashboardBatch(ctx: RequestContext): Promise<Response> {
       // Draft posts
       retryOperation(
         async () => {
-          const result = await supabase
+          const result = await serviceSupabase
             .from(TABLE_BLOG_POSTS)
             .select('*')
             .eq(COLUMN_STORE_ID, storeId!)
@@ -2328,7 +2328,7 @@ async function handleDashboardBatch(ctx: RequestContext): Promise<Response> {
       retryOperation(
         async () => {
           // Try to use materialized view first (much faster)
-          const summaryResult = await supabase
+          const summaryResult = await serviceSupabase
             .from('analytics_summary_30d')
             .select('pageviews, clicks, conversions, total_events')
             .eq(COLUMN_STORE_ID, storeId!)
@@ -2354,7 +2354,7 @@ async function handleDashboardBatch(ctx: RequestContext): Promise<Response> {
           startDate.setDate(startDate.getDate() - 30);
 
           // Use RPC function for aggregation (if available) or aggregate in SQL
-          const result = await supabase.rpc('get_analytics_summary', {
+          const result = await serviceSupabase.rpc('get_analytics_summary', {
             store_uuid: storeId!,
             start_date: startDate.toISOString(),
             end_date: endDate.toISOString(),
@@ -2365,7 +2365,7 @@ async function handleDashboardBatch(ctx: RequestContext): Promise<Response> {
           }
           
           // Final fallback: aggregate in SQL using select with filters
-          const fallbackResult = await supabase
+          const fallbackResult = await serviceSupabase
             .from('analytics')
             .select('event_type')
             .eq(COLUMN_STORE_ID, storeId!)
