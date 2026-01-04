@@ -1,6 +1,6 @@
-import { useState, useMemo, useCallback, useEffect } from 'react';
+import { useState, useMemo, useCallback, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { getShopDomain } from '../lib/app-bridge';
 import { useStore, queryKeys } from '../lib/api-cache';
 import { analyticsApi, supabase } from '../lib/api-client';
@@ -77,10 +77,13 @@ function SkeletonCard() {
 
 export default function Analytics() {
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const [dateRange, setDateRange] = useState<DateRange>('30d');
   const [gscConnected, setGscConnected] = useState(false);
-  const [gaConnected, setGaConnected] = useState(false);
   const [checkingConnections, setCheckingConnections] = useState(true);
+  const [integrationCheckError, setIntegrationCheckError] = useState<string | null>(null);
+  const lastCheckTimeRef = useRef<number>(0);
+  const abortControllerRef = useRef<AbortController | null>(null);
   
   const shopDomain = useMemo(() => {
     try {
@@ -108,29 +111,21 @@ export default function Analytics() {
 
     const checkIntegrations = async () => {
       try {
-        const [ga4Result, gscResult] = await Promise.all([
-          supabase
-            .from('analytics_integrations')
-            .select('id')
-            .eq('store_id', storeId)
-            .eq('integration_type', 'google_analytics_4')
-            .eq('is_active', true)
-            .maybeSingle(),
-          supabase
-            .from('analytics_integrations')
-            .select('id')
-            .eq('store_id', storeId)
-            .eq('integration_type', 'google_search_console')
-            .eq('is_active', true)
-            .maybeSingle(),
-        ]);
+        const gscResult = await supabase
+          .from('analytics_integrations')
+          .select('id')
+          .eq('store_id', storeId)
+          .eq('integration_type', 'google_search_console')
+          .eq('is_active', true)
+          .maybeSingle();
 
-        setGaConnected(!!ga4Result.data);
         setGscConnected(!!gscResult.data);
+        
+        // Invalidate analytics query if connection status changed
+        queryClient.invalidateQueries({ queryKey: queryKeys.analytics(storeId) });
       } catch (error) {
         console.error('Error checking integrations:', error);
-        // Don't block UI on connection check errors
-        setGaConnected(false);
+        setIntegrationCheckError('Failed to check integration status. Please refresh the page.');
         setGscConnected(false);
       } finally {
         setCheckingConnections(false);
@@ -150,8 +145,11 @@ export default function Analytics() {
 
     return () => {
       document.removeEventListener('visibilitychange', handleVisibilityChange);
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+      }
     };
-  }, [storeId]);
+  }, [storeId, queryClient]);
 
   const {
     data: analyticsData,
@@ -207,8 +205,19 @@ export default function Analytics() {
   const totalImpressions = analyticsData?.totalImpressions ?? 0;
   const totalClicks = analyticsData?.totalClicks ?? 0;
   const avgCTR = analyticsData?.avgCTR ?? 0;
-  const avgPosition = analyticsData?.avgPosition ?? 100;
+  // Handle avgPosition: null/undefined means no data, 0 or negative is invalid, use null as sentinel
+  const avgPositionRaw = analyticsData?.avgPosition;
+  const avgPosition = avgPositionRaw != null && avgPositionRaw > 0 && avgPositionRaw < 100 ? avgPositionRaw : null;
   const topPosts = analyticsData?.topPosts ?? [];
+  
+  // Check if we have any real data (not just zeros)
+  const hasAnalyticsData = analyticsData && (
+    totalImpressions > 0 || 
+    totalClicks > 0 || 
+    avgCTR > 0 || 
+    (avgPosition != null) ||
+    topPosts.length > 0
+  );
 
   return (
     <div className="min-h-0 flex flex-col">
@@ -244,6 +253,68 @@ export default function Analytics() {
       </header>
 
       <div className="flex-1 overflow-y-auto p-4 sm:p-6 lg:p-8">
+        {/* Integration Check Error Banner */}
+        {integrationCheckError && (
+          <div className="mb-6 bg-yellow-50 border border-yellow-200 rounded-xl p-4 sm:p-5 shadow-sm">
+            <div className="flex items-start gap-3">
+              <div className="flex-shrink-0 mt-0.5">
+                <svg className="w-5 h-5 sm:w-6 sm:h-6 text-yellow-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                </svg>
+              </div>
+              <div className="flex-1 min-w-0">
+                <h3 className="text-sm sm:text-base font-semibold text-yellow-900 mb-1">
+                  Connection Status Check Failed
+                </h3>
+                <p className="text-xs sm:text-sm text-yellow-800 mb-3">
+                  {integrationCheckError}
+                </p>
+                <button
+                  onClick={() => window.location.reload()}
+                  className="inline-flex items-center gap-2 px-4 py-2 bg-yellow-600 text-white text-sm font-medium rounded-lg hover:bg-yellow-700 transition-colors focus:outline-none focus:ring-2 focus:ring-yellow-500 focus:ring-offset-2"
+                >
+                  Refresh Page
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Analytics Error Banner */}
+        {analyticsError && store && (
+          <div className="mb-6 bg-red-50 border border-red-200 rounded-xl p-4 sm:p-5 shadow-sm">
+            <div className="flex items-start gap-3">
+              <div className="flex-shrink-0 mt-0.5">
+                <svg className="w-5 h-5 sm:w-6 sm:h-6 text-red-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+              </div>
+              <div className="flex-1 min-w-0">
+                <h3 className="text-sm sm:text-base font-semibold text-red-900 mb-1">
+                  Failed to Load Analytics Data
+                </h3>
+                <p className="text-xs sm:text-sm text-red-800 mb-3">
+                  {formatAPIErrorMessage(analyticsError, { action: 'load analytics', resource: 'analytics' })}
+                </p>
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => queryClient.invalidateQueries({ queryKey: queryKeys.analytics(storeId, dateRangeParams) })}
+                    className="inline-flex items-center gap-2 px-4 py-2 bg-red-600 text-white text-sm font-medium rounded-lg hover:bg-red-700 transition-colors focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-offset-2"
+                  >
+                    Retry
+                  </button>
+                  <button
+                    onClick={() => window.location.reload()}
+                    className="inline-flex items-center gap-2 px-4 py-2 border border-red-300 text-red-700 text-sm font-medium rounded-lg hover:bg-red-50 transition-colors focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-offset-2"
+                  >
+                    Refresh Page
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* Connection Status Banner */}
         {!checkingConnections && isLocked && (
           <div className="mb-6 bg-blue-50 border border-blue-200 rounded-xl p-4 sm:p-5 shadow-sm">
@@ -485,6 +556,26 @@ export default function Analytics() {
               ) : isLocked ? (
                 <div className="text-center py-8">
                   <p className="text-xs sm:text-sm text-gray-400">Connect Google Search Console to view top performing articles</p>
+                </div>
+              ) : !hasAnalyticsData && !analyticsLoading ? (
+                <div className="text-center py-8">
+                  <svg
+                    className="w-12 h-12 sm:w-16 sm:h-16 text-gray-400 mx-auto mb-4"
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth="2"
+                      d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"
+                    />
+                  </svg>
+                  <p className="text-xs sm:text-sm text-gray-500 mb-2">No analytics data available</p>
+                  <p className="text-xs text-gray-400">
+                    Analytics data will appear here once your articles start receiving traffic from Google search.
+                  </p>
                 </div>
               ) : topPosts.length > 0 ? (
                 <div className="space-y-3 sm:space-y-4">

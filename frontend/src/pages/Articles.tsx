@@ -1,7 +1,7 @@
 import { useState, useCallback, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { usePostsData, type PostsFilters } from '../hooks/usePostsData';
-import { postsApi } from '../lib/api-client';
+import { postsApi, type QueuedArticle } from '../lib/api-client';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import type { BlogPost } from '../lib/api-client';
 import { useAppBridgeToast } from '../hooks/useAppBridge';
@@ -30,6 +30,8 @@ function getStatusBadge(status: string): { label: string; className: string } {
       return { label: 'Draft', className: 'px-2 py-1 text-xs font-medium rounded-full bg-orange-100 text-orange-800' };
     case 'archived':
       return { label: 'Archived', className: 'px-2 py-1 text-xs font-medium rounded-full bg-gray-100 text-gray-800' };
+    case 'queued':
+      return { label: 'Queued', className: 'px-2 py-1 text-xs font-medium rounded-full bg-purple-100 text-purple-800' };
     default:
       return { label: status, className: 'px-2 py-1 text-xs font-medium rounded-full bg-gray-100 text-gray-800' };
   }
@@ -71,11 +73,11 @@ export default function Articles() {
   const [selectedPosts, setSelectedPosts] = useState<Set<string>>(new Set());
   const [showPreviewModal, setShowPreviewModal] = useState<string | null>(null);
   const [previewPost, setPreviewPost] = useState<BlogPost | null>(null);
+  const [previewQueueArticle, setPreviewQueueArticle] = useState<QueuedArticle | null>(null);
   const [editingPostId, setEditingPostId] = useState<string | null>(null);
   const [editingPost, setEditingPost] = useState<BlogPost | null>(null);
   const [showReviewModal, setShowReviewModal] = useState<string | null>(null);
   const [reviewFeedback, setReviewFeedback] = useState<Record<string, boolean>>({});
-  const [selectedPostId, setSelectedPostId] = useState<string | null>(null);
 
   const queryClient = useQueryClient();
   const { showToast } = useAppBridgeToast();
@@ -238,6 +240,7 @@ export default function Articles() {
     try {
       const post = await postsApi.get(postId);
       setPreviewPost(post);
+      setPreviewQueueArticle(null);
       setShowPreviewModal(postId);
     } catch (error) {
       console.error('Failed to load post:', error);
@@ -246,12 +249,17 @@ export default function Articles() {
     }
   }, [showToast]);
 
+  const handleQueueArticleClick = useCallback((article: QueuedArticle) => {
+    setPreviewQueueArticle(article);
+    setPreviewPost(null);
+    setShowPreviewModal(article.id);
+  }, []);
+
   const schedulePostMutation = useMutation({
     mutationFn: ({ postId, scheduledAt }: { postId: string; scheduledAt: string }) =>
       postsApi.schedule(postId, scheduledAt),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['posts'] });
-      setSelectedPostId(null);
       showToast('Article scheduled successfully', { isError: false });
     },
     onError: (error) => {
@@ -260,10 +268,6 @@ export default function Articles() {
       showToast(errorMessage, { isError: true });
     },
   });
-
-  const handleSchedule = useCallback((postId: string, dateTime: string) => {
-    schedulePostMutation.mutate({ postId, scheduledAt: dateTime });
-  }, [schedulePostMutation]);
 
   const handleStatusFilterChange = useCallback((e: React.ChangeEvent<HTMLSelectElement>) => {
     setStatusFilter(e.target.value);
@@ -412,7 +416,7 @@ export default function Articles() {
           {store && typeof store === 'object' && 'id' in store && (store as any).id && (
             <div className="bg-white rounded-xl border border-gray-200 shadow-sm mb-6 sm:mb-8">
               <div className="p-4 sm:p-5 lg:p-6">
-                <ArticlesQueue storeId={(store as any).id} />
+                <ArticlesQueue storeId={(store as any).id} onArticleClick={handleQueueArticleClick} />
               </div>
             </div>
           )}
@@ -744,7 +748,7 @@ export default function Articles() {
         </div>
 
         {/* Preview Modal */}
-        {showPreviewModal && previewPost && (
+        {showPreviewModal && (previewPost || previewQueueArticle) && (
           <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-2 sm:p-4">
             <div className="bg-white rounded-xl shadow-xl max-w-4xl w-full max-h-[95vh] sm:max-h-[90vh] overflow-hidden flex flex-col m-2 sm:m-0">
               <div className="p-4 sm:p-6 border-b border-gray-200 flex items-center justify-between flex-shrink-0">
@@ -753,6 +757,7 @@ export default function Articles() {
                   onClick={() => {
                     setShowPreviewModal(null);
                     setPreviewPost(null);
+                    setPreviewQueueArticle(null);
                   }}
                   className="text-gray-400 hover:text-gray-600 transition-colors flex-shrink-0 touch-manipulation p-1"
                   aria-label="Close preview"
@@ -763,74 +768,108 @@ export default function Articles() {
                 </button>
               </div>
               <div className="flex-1 overflow-y-auto p-4 sm:p-6">
-                {/* AI Decision Explanations */}
-                {previewPost.ai_metadata && (
-                  <div className="mb-6 bg-blue-50 border border-blue-200 rounded-lg p-4">
-                    <h3 className="text-sm font-semibold text-blue-900 mb-3">Why This Article Was Created</h3>
-                    <div className="space-y-2 text-sm text-blue-800">
-                      {previewPost.ai_metadata.topic_reason && (
-                        <p><strong>Topic:</strong> {previewPost.ai_metadata.topic_reason}</p>
-                      )}
-                      {previewPost.ai_metadata.seo_goals && (
-                        <p><strong>SEO Goal:</strong> {previewPost.ai_metadata.seo_goals}</p>
-                      )}
-                      {previewPost.ai_metadata.keyword_opportunity && (
-                        <p><strong>Keyword Opportunity:</strong> {previewPost.ai_metadata.keyword_opportunity}</p>
-                      )}
+                {previewQueueArticle ? (
+                  /* Queue Article Preview */
+                  <>
+                    <div className="mb-4 bg-purple-50 border border-purple-200 rounded-lg p-4">
+                      <p className="text-sm text-purple-800">
+                        <strong>Queue Article:</strong> This article is in the publishing queue and will be automatically published according to your schedule.
+                      </p>
                     </div>
-                  </div>
-                )}
-                
-                {/* Article Preview */}
-                <div className="prose max-w-none">
-                  <div className="mb-4 space-y-2">
-                    <h1 className="text-3xl font-bold">{previewPost.title}</h1>
-                    {(previewPost as any).seo_title && (previewPost as any).seo_title !== previewPost.title && (
-                      <p className="text-sm text-gray-500">SEO Title: {(previewPost as any).seo_title}</p>
-                    )}
-                    {(previewPost as any).seo_description && (
-                      <p className="text-sm text-gray-600">{(previewPost as any).seo_description}</p>
-                    )}
-                  </div>
-                  {(previewPost as any).excerpt && (
-                    <p className="text-lg text-gray-600 mb-6">{(previewPost as any).excerpt}</p>
-                  )}
-                  {(previewPost as any).featured_image_url && (
-                    <img
-                      src={(previewPost as any).featured_image_url}
-                      alt={previewPost.title}
-                      className="w-full h-auto rounded-lg mb-6"
-                    />
-                  )}
-                  <div
-                    className="article-content"
-                    dangerouslySetInnerHTML={{ __html: previewPost.content || '' }}
-                  />
-                  {(previewPost as any).keywords && (previewPost as any).keywords.length > 0 && (
-                    <div className="mt-6 pt-6 border-t border-gray-200">
-                      <p className="text-sm font-medium text-gray-700 mb-2">Keywords:</p>
-                      <div className="flex flex-wrap gap-2">
-                        {((previewPost as any).keywords || []).map((keyword: string, idx: number) => (
-                          <span key={idx} className="px-2 py-1 bg-gray-100 text-gray-700 rounded text-xs">
-                            {keyword}
-                          </span>
-                        ))}
+                    <div className="prose max-w-none">
+                      <div className="mb-4 space-y-2">
+                        <h1 className="text-3xl font-bold">{previewQueueArticle.title}</h1>
+                        {previewQueueArticle.scheduled_publish_at && (
+                          <p className="text-sm text-gray-500">
+                            Scheduled: {formatDate(previewQueueArticle.scheduled_publish_at)}
+                          </p>
+                        )}
                       </div>
+                      {previewQueueArticle.content && (
+                        <div
+                          className="article-content"
+                          dangerouslySetInnerHTML={{ __html: previewQueueArticle.content }}
+                        />
+                      )}
+                      {!previewQueueArticle.content && (
+                        <p className="text-gray-500 italic">Content not available for preview.</p>
+                      )}
                     </div>
-                  )}
-                </div>
+                  </>
+                ) : previewPost ? (
+                  /* Blog Post Preview */
+                  <>
+                    {/* AI Decision Explanations */}
+                    {previewPost.ai_metadata && (
+                      <div className="mb-6 bg-blue-50 border border-blue-200 rounded-lg p-4">
+                        <h3 className="text-sm font-semibold text-blue-900 mb-3">Why This Article Was Created</h3>
+                        <div className="space-y-2 text-sm text-blue-800">
+                          {previewPost.ai_metadata.topic_reason && (
+                            <p><strong>Topic:</strong> {previewPost.ai_metadata.topic_reason}</p>
+                          )}
+                          {previewPost.ai_metadata.seo_goals && (
+                            <p><strong>SEO Goal:</strong> {previewPost.ai_metadata.seo_goals}</p>
+                          )}
+                          {previewPost.ai_metadata.keyword_opportunity && (
+                            <p><strong>Keyword Opportunity:</strong> {previewPost.ai_metadata.keyword_opportunity}</p>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                    
+                    {/* Article Preview */}
+                    <div className="prose max-w-none">
+                      <div className="mb-4 space-y-2">
+                        <h1 className="text-3xl font-bold">{previewPost.title}</h1>
+                        {(previewPost as any).seo_title && (previewPost as any).seo_title !== previewPost.title && (
+                          <p className="text-sm text-gray-500">SEO Title: {(previewPost as any).seo_title}</p>
+                        )}
+                        {(previewPost as any).seo_description && (
+                          <p className="text-sm text-gray-600">{(previewPost as any).seo_description}</p>
+                        )}
+                      </div>
+                      {(previewPost as any).excerpt && (
+                        <p className="text-lg text-gray-600 mb-6">{(previewPost as any).excerpt}</p>
+                      )}
+                      {(previewPost as any).featured_image_url && (
+                        <img
+                          src={(previewPost as any).featured_image_url}
+                          alt={previewPost.title}
+                          className="w-full h-auto rounded-lg mb-6"
+                        />
+                      )}
+                      <div
+                        className="article-content"
+                        dangerouslySetInnerHTML={{ __html: previewPost.content || '' }}
+                      />
+                      {(previewPost as any).keywords && (previewPost as any).keywords.length > 0 && (
+                        <div className="mt-6 pt-6 border-t border-gray-200">
+                          <p className="text-sm font-medium text-gray-700 mb-2">Keywords:</p>
+                          <div className="flex flex-wrap gap-2">
+                            {((previewPost as any).keywords || []).map((keyword: string, idx: number) => (
+                              <span key={idx} className="px-2 py-1 bg-gray-100 text-gray-700 rounded text-xs">
+                                {keyword}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </>
+                ) : null}
               </div>
               <div className="p-4 sm:p-6 border-t border-gray-200 flex items-center justify-end gap-2 sm:gap-3 flex-wrap flex-shrink-0">
                 <button
                   onClick={() => {
                     setShowPreviewModal(null);
                     setPreviewPost(null);
+                    setPreviewQueueArticle(null);
                   }}
                   className="px-3 sm:px-4 py-2 border border-gray-300 text-gray-700 rounded-lg text-sm font-medium hover:bg-gray-50 transition-colors touch-manipulation"
                 >
                   Close
                 </button>
-                {previewPost.status === 'draft' && previewPost.review_status === 'pending' && (
+                {previewPost && previewPost.status === 'draft' && previewPost.review_status === 'pending' && (
                   <button
                     onClick={async () => {
                       try {
@@ -850,16 +889,18 @@ export default function Articles() {
                     Approve
                   </button>
                 )}
-                <button
-                  onClick={() => {
-                    setShowPreviewModal(null);
-                    setPreviewPost(null);
-                    handlePostClick(previewPost.id);
-                  }}
-                  className="px-4 py-2 bg-purple-600 text-white rounded-lg text-sm font-medium hover:bg-purple-700 transition-colors"
-                >
-                  {previewPost.status === 'draft' ? 'Edit Article' : 'View Article'}
-                </button>
+                {previewPost && (
+                  <button
+                    onClick={() => {
+                      setShowPreviewModal(null);
+                      setPreviewPost(null);
+                      handlePostClick(previewPost.id);
+                    }}
+                    className="px-4 py-2 bg-purple-600 text-white rounded-lg text-sm font-medium hover:bg-purple-700 transition-colors"
+                  >
+                    {previewPost.status === 'draft' ? 'Edit Article' : 'View Article'}
+                  </button>
+                )}
               </div>
             </div>
           </div>

@@ -246,8 +246,14 @@ export default function ArticlesQueue({ storeId, onArticleClick, showTitle = tru
 
   const handleRegenerateTitle = useCallback((e: React.MouseEvent, articleId: string) => {
     e.stopPropagation();
+    e.preventDefault();
     regenerateTitleMutation.mutate(articleId);
   }, [regenerateTitleMutation]);
+  
+  const handleRegenerateMouseDown = useCallback((e: React.MouseEvent) => {
+    e.stopPropagation();
+    e.preventDefault();
+  }, []);
 
   const handleArticleClick = useCallback((article: QueuedArticle) => {
     // Don't trigger click if we were just dragging
@@ -319,15 +325,16 @@ export default function ArticlesQueue({ storeId, onArticleClick, showTitle = tru
                 onDragEnd={handleDragEnd}
                 onClick={() => handleArticleClick(article)}
                 className={`
-                  p-3 bg-white border-2 rounded-lg cursor-move transition-all
-                  ${draggedIndex === index ? 'opacity-50 border-purple-500' : 'border-gray-200 hover:border-purple-300'}
+                  p-3 bg-white border-2 rounded-lg transition-all
+                  ${draggedIndex === index ? 'opacity-50 border-purple-500 cursor-grabbing' : 'border-gray-200 hover:border-purple-300 cursor-grab'}
                   ${dragOverIndex === index ? 'border-purple-500 bg-purple-50' : ''}
-                  ${onArticleClick ? 'cursor-pointer' : ''}
+                  ${onArticleClick && draggedIndex === null ? 'cursor-pointer' : ''}
                 `}
               >
                 <div className="flex items-start gap-2">
                   <button
                     onClick={(e) => handleRegenerateTitle(e, article.id)}
+                    onMouseDown={handleRegenerateMouseDown}
                     onDragStart={(e) => e.stopPropagation()}
                     disabled={regenerateTitleMutation.isPending}
                     className="flex-shrink-0 p-1 text-gray-400 hover:text-purple-600 transition-colors disabled:opacity-50"

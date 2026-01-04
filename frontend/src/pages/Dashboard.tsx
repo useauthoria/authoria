@@ -2,8 +2,9 @@ import { useCallback, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useDashboardData } from '../hooks/useDashboardData';
 import { getShopDomain } from '../lib/app-bridge';
-import type { BlogPost } from '../lib/api-client';
+import { queueApi, type BlogPost, type QueuedArticle } from '../lib/api-client';
 import { getPlanFrequencyConfig } from '../utils/plan-frequency';
+import { useQuery } from '@tanstack/react-query';
 import TrialExpirationBanner from '../components/TrialExpirationBanner';
 import PlansModal from '../components/PlansModal';
 import { formatAPIErrorMessage } from '../utils/error-messages';
@@ -23,7 +24,7 @@ interface ScheduledArticle {
   id: string;
   title: string;
   scheduledAt: Date;
-  status: 'scheduled' | 'published';
+  status: 'scheduled' | 'published' | 'queued';
 }
 
 
@@ -66,7 +67,7 @@ function formatTime(date: Date): string {
   });
 }
 
-function groupScheduledArticles(posts: readonly BlogPost[]): {
+function groupScheduledArticles(posts: readonly (BlogPost | (BlogPost & { _isQueueItem?: boolean }))[]): {
   upcoming: ScheduledArticle[];
   thisWeek: ScheduledArticle[];
   later: ScheduledArticle[];
@@ -84,13 +85,38 @@ function groupScheduledArticles(posts: readonly BlogPost[]): {
   endOfWeek.setHours(23, 59, 59, 999);
 
   const scheduled: ScheduledArticle[] = posts
-    .filter((p) => p.status === 'scheduled' && p.scheduled_publish_at)
-    .map((p) => ({
-      id: p.id,
-      title: p.title,
-      scheduledAt: new Date(p.scheduled_publish_at!),
-      status: 'scheduled' as const,
-    }))
+    .filter((p) => {
+      const postDate = p.published_at || p.scheduled_publish_at;
+      if (!postDate) return false;
+      // Include scheduled posts and queue items with scheduled_publish_at
+      return (p.status === 'scheduled' || (p.status === 'queued' && p.scheduled_publish_at));
+    })
+    .map((p) => {
+      const postWithMarker = p as BlogPost & { _isQueueItem?: boolean };
+      const postDate = p.published_at || p.scheduled_publish_at!;
+      if (postWithMarker._isQueueItem) {
+        return {
+          id: p.id,
+          title: p.title,
+          scheduledAt: new Date(postDate),
+          status: 'queued' as const,
+        };
+      } else if (p.status === 'scheduled') {
+        return {
+          id: p.id,
+          title: p.title,
+          scheduledAt: new Date(postDate),
+          status: 'scheduled' as const,
+        };
+      } else {
+        return {
+          id: p.id,
+          title: p.title,
+          scheduledAt: new Date(postDate),
+          status: 'published' as const,
+        };
+      }
+    })
     .sort((a, b) => a.scheduledAt.getTime() - b.scheduledAt.getTime());
 
   // Upcoming: today or tomorrow (within next ~48 hours)
@@ -159,13 +185,7 @@ export default function Dashboard() {
   }, [posts, scheduledPosts, draftPosts]);
 
   const publishedCount = useMemo(() => posts?.length || 0, [posts]);
-  const scheduledCount = useMemo(() => scheduledPosts?.length || 0, [scheduledPosts]);
   const draftsCount = useMemo(() => draftPosts?.length || 0, [draftPosts]);
-
-  const { upcoming, thisWeek, later } = useMemo(() => {
-    const allScheduled = [...(scheduledPosts || [])];
-    return groupScheduledArticles(allScheduled);
-  }, [scheduledPosts]);
 
   const planName = useMemo(() => {
     if (!quota || typeof quota !== 'object' || 'error' in quota) return null;
@@ -206,6 +226,118 @@ export default function Dashboard() {
   }, [quota, isLoading, formattedPlanName]);
 
   const planFrequencyConfig = useMemo(() => getPlanFrequencyConfig(planName), [planName]);
+
+  const storeId = store?.id ?? '';
+
+  // Fetch queue articles
+  const {
+    data: queue = [],
+  } = useQuery({
+    queryKey: ['queue', storeId],
+    queryFn: () => queueApi.getQueue(storeId),
+    enabled: !!storeId,
+    refetchInterval: 30000,
+  });
+
+  // Get schedule settings from store
+  const scheduleSettings = useMemo(() => {
+    if (!store) return { selectedDays: new Set<number>(), publishTime: '14:00' };
+    
+    const settings = (store as { frequency_settings?: unknown }).frequency_settings as {
+      preferredDays?: number[];
+      preferredTimes?: string[];
+    } | null | undefined;
+    
+    // Convert JS day format (Sun=0, Mon=1, ..., Sat=6) to our index format (Mon=0, ..., Sun=6)
+    const jsDayToIndex = (jsDay: number): number => jsDay === 0 ? 6 : jsDay - 1;
+    
+    const selectedDays = new Set<number>();
+    if (settings?.preferredDays) {
+      settings.preferredDays.forEach((jsDay) => {
+        const index = jsDayToIndex(jsDay);
+        if (index >= 0 && index < 7) {
+          selectedDays.add(index);
+        }
+      });
+    }
+    
+    const publishTime = settings?.preferredTimes?.[0] || '14:00';
+    const [hours, minutes] = publishTime.split(':').map(Number);
+    const formattedTime = `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`;
+    
+    return { selectedDays, publishTime: formattedTime };
+  }, [store]);
+
+  // Convert queue items to BlogPost-like format with calculated scheduled dates
+  const queuePostsAsBlogPosts = useMemo(() => {
+    if (!scheduleSettings.selectedDays || scheduleSettings.selectedDays.size === 0 || queue.length === 0) return [];
+    
+    // Convert our day index (Mon=0, ..., Sun=6) to JS Date.getDay() format (Sun=0, Mon=1, ..., Sat=6)
+    const dayIndexToJsDay = (index: number): number => index === 6 ? 0 : index + 1;
+    
+    // Get existing scheduled/published dates to avoid conflicts
+    const existingDates = new Set(
+      [...(scheduledPosts || []), ...(posts || [])]
+        .map((p) => {
+          const date = p.published_at || p.scheduled_publish_at;
+          if (!date) return null;
+          const d = new Date(date);
+          return d.toISOString();
+        })
+        .filter((d): d is string => d !== null)
+    );
+    
+    // Calculate scheduled dates for queue items, avoiding conflicts
+    const dates: Date[] = [];
+    const now = new Date();
+    const [hours, minutes] = scheduleSettings.publishTime.split(':').map(Number);
+    const jsDays = Array.from(scheduleSettings.selectedDays).map(dayIndexToJsDay).sort((a, b) => a - b);
+    
+    let currentDate = new Date(now);
+    currentDate.setHours(hours, minutes, 0, 0);
+    
+    if (currentDate <= now) {
+      currentDate.setDate(currentDate.getDate() + 1);
+    }
+    
+    let attempts = 0;
+    const maxAttempts = 200;
+    
+    while (dates.length < queue.length && attempts < maxAttempts) {
+      const currentDay = currentDate.getDay();
+      if (jsDays.includes(currentDay)) {
+        const dateStr = currentDate.toISOString();
+        if (!existingDates.has(dateStr)) {
+          dates.push(new Date(currentDate));
+        }
+      }
+      currentDate.setDate(currentDate.getDate() + 1);
+      attempts++;
+    }
+    
+    // Convert queue items to BlogPost format with a special marker
+    return queue.slice(0, dates.length).map((article, index): BlogPost & { _isQueueItem?: boolean } => ({
+      id: article.id,
+      store_id: article.store_id,
+      title: article.title,
+      content: article.content || '',
+      status: 'queued' as const,
+      published_at: null,
+      scheduled_publish_at: dates[index].toISOString(),
+      seo_health_score: 0,
+      created_at: article.created_at,
+      _isQueueItem: true,
+    }));
+  }, [queue, scheduleSettings.selectedDays, scheduleSettings.publishTime, scheduledPosts, posts]);
+
+  const scheduledCount = useMemo(() => {
+    return (scheduledPosts?.length || 0) + queuePostsAsBlogPosts.length;
+  }, [scheduledPosts, queuePostsAsBlogPosts]);
+
+  const { upcoming, thisWeek, later } = useMemo(() => {
+    const allScheduled = [...(scheduledPosts || []), ...queuePostsAsBlogPosts];
+    return groupScheduledArticles(allScheduled);
+  }, [scheduledPosts, queuePostsAsBlogPosts]);
 
   const schedule = useMemo(() => {
     // Get plan-based frequency configuration (must match Schedule page)
@@ -252,9 +384,12 @@ export default function Dashboard() {
       })()
       : formatTime((() => { const d = new Date(); d.setHours(14, 0); return d; })());
 
-    // Get next scheduled post
-    const nextPost = scheduledPosts
-      ?.filter((p) => p.status === 'scheduled' && p.scheduled_publish_at)
+    // Get next scheduled post (including queue articles)
+    const allScheduledWithDates = [
+      ...(scheduledPosts || []).filter((p) => p.status === 'scheduled' && p.scheduled_publish_at),
+      ...queuePostsAsBlogPosts.filter((p) => p.scheduled_publish_at),
+    ];
+    const nextPost = allScheduledWithDates
       .sort((a, b) => new Date(a.scheduled_publish_at!).getTime() - new Date(b.scheduled_publish_at!).getTime())[0];
 
     return {
@@ -264,7 +399,7 @@ export default function Dashboard() {
       nextPublish: nextPost?.scheduled_publish_at ? new Date(nextPost.scheduled_publish_at) : null,
       nextArticleTitle: nextPost?.title || null,
     };
-  }, [store, scheduledPosts, planFrequencyConfig]);
+  }, [store, scheduledPosts, queuePostsAsBlogPosts, planFrequencyConfig]);
 
   // Articles generated (from article_usage table)
   const quotaUsed = useMemo(() => {
@@ -600,7 +735,11 @@ export default function Dashboard() {
                       {upcoming.map((article) => (
                         <article
                           key={article.id}
-                          className="flex items-start gap-2 sm:gap-3 p-3 sm:p-4 bg-blue-50 rounded-lg border border-blue-100 cursor-pointer hover:bg-blue-100 transition-colors"
+                          className={`flex items-start gap-2 sm:gap-3 p-3 sm:p-4 rounded-lg border cursor-pointer transition-colors ${
+                            article.status === 'queued'
+                              ? 'bg-blue-50 border-blue-100 border-dashed hover:bg-blue-100'
+                              : 'bg-blue-50 border-blue-100 hover:bg-blue-100'
+                          }`}
                           onClick={handlePostClick}
                         >
                           <input
@@ -648,7 +787,11 @@ export default function Dashboard() {
                         {thisWeek.map((article) => (
                           <article
                             key={article.id}
-                            className="flex items-start gap-2 sm:gap-3 p-3 sm:p-4 bg-gray-50 rounded-lg border border-gray-100 cursor-pointer hover:bg-gray-100 transition-colors"
+                            className={`flex items-start gap-2 sm:gap-3 p-3 sm:p-4 rounded-lg border cursor-pointer transition-colors ${
+                              article.status === 'queued'
+                                ? 'bg-blue-50 border-blue-100 border-dashed hover:bg-blue-100'
+                                : 'bg-gray-50 border-gray-100 hover:bg-gray-100'
+                            }`}
                             onClick={handlePostClick}
                           >
                             <input
@@ -665,7 +808,13 @@ export default function Dashboard() {
                                   </svg>
                                   {formatDate(article.scheduledAt)}
                                 </span>
-                                <span className="px-2 py-0.5 bg-green-100 text-green-700 rounded text-xs font-medium w-fit">Auto-publish</span>
+                                <span className={`px-2 py-0.5 rounded text-xs font-medium w-fit ${
+                                  article.status === 'queued'
+                                    ? 'bg-blue-100 text-blue-700'
+                                    : 'bg-green-100 text-green-700'
+                                }`}>
+                                  {article.status === 'queued' ? 'Queued' : 'Auto-publish'}
+                                </span>
                               </div>
                             </div>
                           </article>
@@ -697,7 +846,11 @@ export default function Dashboard() {
                         {later.map((article) => (
                           <article
                             key={article.id}
-                            className="flex items-start gap-2 sm:gap-3 p-3 sm:p-4 bg-gray-50 rounded-lg border border-gray-100 cursor-pointer hover:bg-gray-100 transition-colors"
+                            className={`flex items-start gap-2 sm:gap-3 p-3 sm:p-4 rounded-lg border cursor-pointer transition-colors ${
+                              article.status === 'queued'
+                                ? 'bg-blue-50 border-blue-100 border-dashed hover:bg-blue-100'
+                                : 'bg-gray-50 border-gray-100 hover:bg-gray-100'
+                            }`}
                             onClick={handlePostClick}
                           >
                             <input
@@ -714,7 +867,13 @@ export default function Dashboard() {
                                   </svg>
                                   {formatDate(article.scheduledAt)}
                                 </span>
-                                <span className="px-2 py-0.5 bg-green-100 text-green-700 rounded text-xs font-medium w-fit">Auto-publish</span>
+                                <span className={`px-2 py-0.5 rounded text-xs font-medium w-fit ${
+                                  article.status === 'queued'
+                                    ? 'bg-blue-100 text-blue-700'
+                                    : 'bg-green-100 text-green-700'
+                                }`}>
+                                  {article.status === 'queued' ? 'Queued' : 'Auto-publish'}
+                                </span>
                               </div>
                             </div>
                           </article>

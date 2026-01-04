@@ -23,7 +23,7 @@ interface CalendarDay {
     id: string;
     title: string;
     scheduledAt: Date;
-    status: 'published' | 'scheduled';
+    status: 'published' | 'scheduled' | 'queued';
   }>;
 }
 
@@ -35,7 +35,7 @@ interface WeekDay {
     id: string;
     title: string;
     scheduledAt: Date;
-    status: 'published' | 'scheduled';
+    status: 'published' | 'scheduled' | 'queued';
   }>;
 }
 
@@ -148,11 +148,11 @@ function generateMonthCalendar(
   return days;
 }
 
-function getPostsForDate(date: Date, posts: readonly BlogPost[]): Array<{
+function getPostsForDate(date: Date, posts: readonly (BlogPost | (BlogPost & { _isQueueItem?: boolean }))[]): Array<{
   id: string;
   title: string;
   scheduledAt: Date;
-  status: 'published' | 'scheduled';
+  status: 'published' | 'scheduled' | 'queued';
 }> {
   const startOfDay = new Date(date);
   startOfDay.setHours(0, 0, 0, 0);
@@ -166,12 +166,31 @@ function getPostsForDate(date: Date, posts: readonly BlogPost[]): Array<{
       const d = new Date(postDate);
       return d >= startOfDay && d <= endOfDay;
     })
-    .map((post) => ({
-      id: post.id,
-      title: post.title,
-      scheduledAt: new Date(post.published_at || post.scheduled_publish_at!),
-      status: (post.status === 'published' ? 'published' : 'scheduled') as 'scheduled' | 'published',
-    }))
+    .map((post) => {
+      const postWithMarker = post as BlogPost & { _isQueueItem?: boolean };
+      if (post.status === 'published') {
+        return {
+          id: post.id,
+          title: post.title,
+          scheduledAt: new Date(post.published_at!),
+          status: 'published' as const,
+        };
+      } else if (postWithMarker._isQueueItem) {
+        return {
+          id: post.id,
+          title: post.title,
+          scheduledAt: new Date(post.scheduled_publish_at!),
+          status: 'queued' as const,
+        };
+      } else {
+        return {
+          id: post.id,
+          title: post.title,
+          scheduledAt: new Date(post.scheduled_publish_at!),
+          status: 'scheduled' as const,
+        };
+      }
+    })
     .sort((a, b) => a.scheduledAt.getTime() - b.scheduledAt.getTime());
 }
 
@@ -217,12 +236,13 @@ export default function Schedule() {
   const [currentMonth, setCurrentMonth] = useState(new Date().getMonth());
   const [currentYear, setCurrentYear] = useState(new Date().getFullYear());
   const [weekStart, setWeekStart] = useState(() => getWeekStart(new Date()));
-  const [selectedDays, setSelectedDays] = useState<Set<number>>(new Set([1, 3, 5])); // Mon, Wed, Fri
+  const [selectedDays, setSelectedDays] = useState<Set<number>>(new Set([0, 2, 4])); // Mon=0, Wed=2, Fri=4
   const [publishTime, setPublishTime] = useState('14:00');
   const [isSaving, setIsSaving] = useState(false);
   const [selectedDate, setSelectedDate] = useState<Date | null>(null);
   const [showScheduleModal, setShowScheduleModal] = useState(false);
   const [selectedPostForSchedule, setSelectedPostForSchedule] = useState<BlogPost | null>(null);
+  const [modalPublishTime, setModalPublishTime] = useState('14:00');
   const [conflicts, setConflicts] = useState<Map<string, Array<{ type: string; severity: string; message: string }>>>(new Map());
   const [checkingConflicts, setCheckingConflicts] = useState(false);
   const [dayValidationError, setDayValidationError] = useState<string | null>(null);
@@ -242,6 +262,7 @@ export default function Schedule() {
       setShowScheduleModal(false);
       setSelectedPostForSchedule(null);
       setSelectedDate(null);
+      setModalPublishTime(publishTime); // Reset to default
       showToast('Article scheduled successfully', { isError: false });
     },
     onError: (error) => {
@@ -336,7 +357,19 @@ export default function Schedule() {
     // Convert our day index (Mon=0, ..., Sun=6) to JS Date.getDay() format (Sun=0, Mon=1, ..., Sat=6)
     const dayIndexToJsDay = (index: number): number => index === 6 ? 0 : index + 1;
     
-    // Calculate scheduled dates for queue items
+    // Get existing scheduled/published dates to avoid conflicts
+    const existingDates = new Set(
+      [...scheduledPosts, ...publishedPosts]
+        .map((p) => {
+          const date = p.published_at || p.scheduled_publish_at;
+          if (!date) return null;
+          const d = new Date(date);
+          return d.toISOString();
+        })
+        .filter((d): d is string => d !== null)
+    );
+    
+    // Calculate scheduled dates for queue items, avoiding conflicts
     const dates: Date[] = [];
     const now = new Date();
     const [hours, minutes] = publishTime.split(':').map(Number);
@@ -350,19 +383,23 @@ export default function Schedule() {
     }
     
     let attempts = 0;
-    const maxAttempts = 100;
+    const maxAttempts = 200; // Increased to allow skipping conflicts
     
     while (dates.length < queue.length && attempts < maxAttempts) {
       const currentDay = currentDate.getDay();
       if (jsDays.includes(currentDay)) {
-        dates.push(new Date(currentDate));
+        const dateStr = currentDate.toISOString();
+        // Skip if this time slot is already taken
+        if (!existingDates.has(dateStr)) {
+          dates.push(new Date(currentDate));
+        }
       }
       currentDate.setDate(currentDate.getDate() + 1);
       attempts++;
     }
     
-    // Convert queue items to BlogPost format
-    return queue.slice(0, dates.length).map((article, index): BlogPost => ({
+    // Convert queue items to BlogPost format with a special marker
+    return queue.slice(0, dates.length).map((article, index): BlogPost & { _isQueueItem?: boolean } => ({
       id: article.id,
       store_id: article.store_id,
       title: article.title,
@@ -372,8 +409,9 @@ export default function Schedule() {
       scheduled_publish_at: dates[index].toISOString(),
       seo_health_score: 0,
       created_at: article.created_at,
+      _isQueueItem: true,
     }));
-  }, [queue, selectedDays, publishTime]);
+  }, [queue, selectedDays, publishTime, scheduledPosts, publishedPosts]);
 
   const allRelevantPosts = useMemo(() => {
     return [...scheduledPosts, ...publishedPosts, ...queuePostsAsBlogPosts];
@@ -466,7 +504,7 @@ export default function Schedule() {
     const checkConflicts = async () => {
       setCheckingConflicts(true);
       try {
-        const [hours, minutes] = publishTime.split(':').map(Number);
+        const [hours, minutes] = modalPublishTime.split(':').map(Number);
         const scheduledDateTime = new Date(selectedDate);
         scheduledDateTime.setHours(hours, minutes, 0, 0);
         
@@ -506,7 +544,7 @@ export default function Schedule() {
     };
     
     checkConflicts();
-  }, [selectedDate, publishTime, storeId, selectedPostForSchedule]);
+  }, [selectedDate, modalPublishTime, storeId, selectedPostForSchedule]);
 
   const handlePreviousMonth = useCallback(() => {
     setCurrentMonth((prev) => {
@@ -569,7 +607,10 @@ export default function Schedule() {
     setWeekStart((prev) => {
       const newDate = new Date(prev);
       newDate.setDate(newDate.getDate() + 7);
-      // Check if new date is after max date
+      // Check if new date is before min date or after max date
+      if (minDate && newDate < minDate) {
+        return prev; // Don't allow going before install date
+      }
       if (maxDate) {
         const weekEnd = new Date(newDate);
         weekEnd.setDate(weekEnd.getDate() + 6);
@@ -579,7 +620,7 @@ export default function Schedule() {
       }
       return newDate;
     });
-  }, [maxDate]);
+  }, [maxDate, minDate]);
 
   const handleDayToggle = useCallback((dayIndex: number) => {
     setSelectedDays((prev) => {
@@ -662,6 +703,7 @@ export default function Schedule() {
 
   const handleDayClick = useCallback((date: Date) => {
     setSelectedDate(date);
+    setModalPublishTime(publishTime); // Initialize modal time with current publishTime
     // Find draft posts that can be scheduled
     const draftPosts = allPosts.filter((p) => p.status === 'draft');
     if (draftPosts.length > 0) {
@@ -671,12 +713,12 @@ export default function Schedule() {
       // Show message that no draft posts are available
       showToast('No articles are available to schedule right now. Articles are automatically generated based on your publishing schedule.', { isError: false });
     }
-  }, [allPosts, showToast]);
+  }, [allPosts, showToast, publishTime]);
 
   const handleSchedulePost = useCallback(async () => {
     if (!selectedPostForSchedule || !selectedDate) return;
 
-    const [hours, minutes] = publishTime.split(':').map(Number);
+    const [hours, minutes] = modalPublishTime.split(':').map(Number);
     const scheduledDateTime = new Date(selectedDate);
     scheduledDateTime.setHours(hours, minutes, 0, 0);
 
@@ -696,7 +738,7 @@ export default function Schedule() {
       postId: selectedPostForSchedule.id,
       scheduledAt: scheduledDateTime.toISOString(),
     });
-  }, [selectedPostForSchedule, selectedDate, publishTime, schedulePostMutation, conflicts]);
+  }, [selectedPostForSchedule, selectedDate, modalPublishTime, schedulePostMutation, conflicts]);
 
   const monthName = useMemo(() => {
     return new Date(currentYear, currentMonth).toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
@@ -887,6 +929,10 @@ export default function Schedule() {
                         <div className="w-3 h-3 rounded bg-purple-500 border-2 border-purple-600"></div>
                         <span className="text-gray-600">Scheduled</span>
                       </div>
+                      <div className="flex items-center gap-2">
+                        <div className="w-3 h-3 rounded bg-blue-500 border-2 border-blue-600 border-dashed"></div>
+                        <span className="text-gray-600">Queued</span>
+                      </div>
                     </div>
 
                     {/* Day Headers */}
@@ -903,17 +949,23 @@ export default function Schedule() {
                       {monthCalendar.map((day, index) => {
                         const hasPublished = day.posts.some((p) => p.status === 'published');
                         const hasScheduled = day.posts.some((p) => p.status === 'scheduled');
+                        const hasQueued = day.posts.some((p) => p.status === 'queued');
                         const borderColor = hasPublished
                           ? 'border-green-500 bg-green-50'
                           : hasScheduled
                           ? 'border-purple-500 bg-purple-50'
+                          : hasQueued
+                          ? 'border-blue-500 bg-blue-50'
                           : day.isToday
                           ? 'border-orange-500 bg-orange-50'
                           : 'border-gray-200';
+                        const borderStyle = hasQueued ? 'border-dashed' : '';
                         const textColor = hasPublished
                           ? 'text-green-900'
                           : hasScheduled
                           ? 'text-purple-900'
+                          : hasQueued
+                          ? 'text-blue-900'
                           : day.isToday
                           ? 'text-orange-900'
                           : 'text-gray-900';
@@ -931,7 +983,7 @@ export default function Schedule() {
                         return (
                           <div
                             key={index}
-                            className={`aspect-square p-1.5 sm:p-2 border-2 ${borderColor} ${conflictBorder} rounded-lg cursor-pointer hover:opacity-80 transition-all touch-manipulation relative group shadow-sm ${
+                            className={`aspect-square p-1.5 sm:p-2 border-2 ${borderColor} ${borderStyle} ${conflictBorder} rounded-lg cursor-pointer hover:opacity-80 transition-all touch-manipulation relative group shadow-sm ${
                               !day.isCurrentMonth ? 'opacity-50' : ''
                             }`}
                             onClick={() => {
@@ -951,6 +1003,8 @@ export default function Schedule() {
                                       ? 'bg-green-600 text-white'
                                       : hasScheduled
                                       ? 'bg-purple-600 text-white'
+                                      : hasQueued
+                                      ? 'bg-blue-600 text-white'
                                       : 'bg-gray-600 text-white'
                                   }`}
                                 >
@@ -960,12 +1014,14 @@ export default function Schedule() {
                             </div>
                             {day.posts.length > 0 && (
                               <div className="mt-0.5 sm:mt-1">
-                                <div className={`text-[9px] sm:text-[10px] font-medium ${hasPublished ? 'text-green-700' : 'text-purple-700'}`}>
+                                <div className={`text-[9px] sm:text-[10px] font-medium ${
+                                  hasPublished ? 'text-green-700' : hasScheduled ? 'text-purple-700' : 'text-blue-700'
+                                }`}>
                                   {formatTime(day.posts[0].scheduledAt)}
                                 </div>
                                 <div
                                   className={`text-[9px] sm:text-[10px] truncate hidden sm:block ${
-                                    hasPublished ? 'text-green-600' : 'text-purple-600'
+                                    hasPublished ? 'text-green-600' : hasScheduled ? 'text-purple-600' : 'text-blue-600'
                                   }`}
                                 >
                                   {day.posts[0].title.length > 20 ? `${day.posts[0].title.substring(0, 20)}...` : day.posts[0].title}
@@ -985,7 +1041,7 @@ export default function Schedule() {
                               <div className="absolute z-10 hidden group-hover:block bottom-full left-1/2 transform -translate-x-1/2 mb-2 w-40 sm:w-48 p-2 bg-gray-900 text-white text-[10px] sm:text-xs rounded-lg shadow-xl">
                                 <p className="font-semibold">{day.posts[0].title}</p>
                                 <p className="text-gray-300 mt-1">
-                                  {day.posts[0].status === 'published' ? 'Published' : 'Scheduled'} for {formatTime(day.posts[0].scheduledAt)}
+                                  {day.posts[0].status === 'published' ? 'Published' : day.posts[0].status === 'queued' ? 'Queued' : 'Scheduled'} for {formatTime(day.posts[0].scheduledAt)}
                                 </p>
                                 <div className="absolute bottom-0 left-1/2 transform -translate-x-1/2 translate-y-full w-0 h-0 border-l-4 border-r-4 border-t-4 border-transparent border-t-gray-900"></div>
                               </div>
@@ -1054,8 +1110,12 @@ export default function Schedule() {
                         day.posts.map((post) => (
                           <div
                             key={post.id}
-                            className={`p-3 ${
-                              post.status === 'published' ? 'bg-green-50 border-l-4 border-green-500' : 'bg-purple-50 border-l-4 border-purple-500'
+                            className={`p-3 border-l-4 ${
+                              post.status === 'published' 
+                                ? 'bg-green-50 border-green-500' 
+                                : post.status === 'queued'
+                                ? 'bg-blue-50 border-blue-500 border-dashed'
+                                : 'bg-purple-50 border-purple-500'
                             } rounded-lg cursor-pointer hover:opacity-80 transition-opacity`}
                             onClick={handlePostClick}
                           >
@@ -1069,10 +1129,12 @@ export default function Schedule() {
                                 className={`px-2 py-1 text-xs font-medium rounded-full ${
                                   post.status === 'published'
                                     ? 'bg-green-100 text-green-800'
+                                    : post.status === 'queued'
+                                    ? 'bg-blue-100 text-blue-800'
                                     : 'bg-purple-100 text-purple-800'
                                 }`}
                               >
-                                {post.status === 'published' ? 'Published' : 'Scheduled'}
+                                {post.status === 'published' ? 'Published' : post.status === 'queued' ? 'Queued' : 'Scheduled'}
                               </span>
                             </div>
                           </div>
@@ -1097,11 +1159,17 @@ export default function Schedule() {
                         listPosts.map((post) => {
                           const postDate = new Date(post.published_at || post.scheduled_publish_at!);
                           const isPublished = post.status === 'published';
+                          const postWithMarker = post as BlogPost & { _isQueueItem?: boolean };
+                          const isQueued = postWithMarker._isQueueItem;
                           return (
                             <div
                               key={post.id}
-                              className={`p-3 ${
-                                isPublished ? 'bg-green-50 border-l-4 border-green-500' : 'bg-purple-50 border-l-4 border-purple-500'
+                              className={`p-3 border-l-4 ${
+                                isPublished 
+                                  ? 'bg-green-50 border-green-500' 
+                                  : isQueued
+                                  ? 'bg-blue-50 border-blue-500 border-dashed'
+                                  : 'bg-purple-50 border-purple-500'
                               } rounded-lg cursor-pointer hover:opacity-80 transition-opacity`}
                               onClick={handlePostClick}
                             >
@@ -1110,15 +1178,19 @@ export default function Schedule() {
                                   <p className="text-xs text-gray-500">{formatDate(postDate)}</p>
                                   <p className="text-sm font-semibold text-gray-900 mt-1">{post.title}</p>
                                   <p className="text-xs text-gray-600 mt-1">
-                                    {isPublished ? 'Published' : 'Scheduled'} at {formatTime(postDate)}
+                                    {isPublished ? 'Published' : isQueued ? 'Queued' : 'Scheduled'} at {formatTime(postDate)}
                                   </p>
                                 </div>
                                 <span
                                   className={`px-2 py-1 text-xs font-medium rounded-full ${
-                                    isPublished ? 'bg-green-100 text-green-800' : 'bg-purple-100 text-purple-800'
+                                    isPublished 
+                                      ? 'bg-green-100 text-green-800' 
+                                      : isQueued
+                                      ? 'bg-blue-100 text-blue-800'
+                                      : 'bg-purple-100 text-purple-800'
                                   }`}
                                 >
-                                  {isPublished ? 'Published' : 'Scheduled'}
+                                  {isPublished ? 'Published' : isQueued ? 'Queued' : 'Scheduled'}
                                 </span>
                               </div>
                             </div>
@@ -1259,8 +1331,8 @@ export default function Schedule() {
                   <input
                     id="schedule-time"
                     type="time"
-                    value={publishTime}
-                    onChange={(e) => setPublishTime(e.target.value)}
+                    value={modalPublishTime}
+                    onChange={(e) => setModalPublishTime(e.target.value)}
                     className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-purple-500 focus:border-purple-500 outline-none"
                   />
                 </div>
@@ -1287,6 +1359,7 @@ export default function Schedule() {
                       setShowScheduleModal(false);
                       setSelectedPostForSchedule(null);
                       setSelectedDate(null);
+                      setModalPublishTime(publishTime); // Reset to default
                     }}
                     className="flex-1 px-3 sm:px-4 py-2 border border-gray-300 text-gray-700 rounded-lg text-sm font-medium hover:bg-gray-50 transition-colors touch-manipulation"
                   >

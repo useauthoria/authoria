@@ -1,4 +1,4 @@
-import { useState, useCallback, useMemo, useEffect } from 'react';
+import { useState, useCallback, useMemo, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
 import { getShopDomain } from '../lib/app-bridge';
@@ -122,6 +122,7 @@ export default function Settings() {
   const [googleSearchConsoleSiteUrl, setGoogleSearchConsoleSiteUrl] = useState('');
   const [googleSearchConsoleConnected, setGoogleSearchConsoleConnected] = useState(false);
   const [isConnectingGoogle, setIsConnectingGoogle] = useState<string | null>(null);
+  const [integrationCheckError, setIntegrationCheckError] = useState<string | null>(null);
   const [topicPreferences, setTopicPreferences] = useState<string[]>([]);
   const [keywordFocus, setKeywordFocus] = useState<string[]>([]);
   const [contentAngles, setContentAngles] = useState<string[]>([]);
@@ -129,13 +130,40 @@ export default function Settings() {
   const [newKeyword, setNewKeyword] = useState('');
   const [newAngle, setNewAngle] = useState('');
   const [isPlansModalOpen, setIsPlansModalOpen] = useState(false);
+  const [integrationCheckTrigger, setIntegrationCheckTrigger] = useState(0);
+  const lastIntegrationCheckRef = useRef<number>(0);
+  const integrationCheckAbortRef = useRef<AbortController | null>(null);
 
   // Check if integrations are connected
   useEffect(() => {
-    if (!storeId) return;
+    if (!storeId) {
+      setIntegrationCheckError(null);
+      setGoogleAnalyticsConnected(false);
+      setGoogleSearchConsoleConnected(false);
+      setGoogleAnalyticsPropertyId('');
+      setGoogleSearchConsoleSiteUrl('');
+      return;
+    }
+
+    // Abort any in-flight checks
+    if (integrationCheckAbortRef.current) {
+      integrationCheckAbortRef.current.abort();
+    }
 
     const checkIntegrations = async () => {
+      // Throttle: only check if at least 1 second has passed since last check
+      const now = Date.now();
+      if (now - lastIntegrationCheckRef.current < 1000) {
+        return;
+      }
+      lastIntegrationCheckRef.current = now;
+
+      // Create new abort controller for this check
+      const abortController = new AbortController();
+      integrationCheckAbortRef.current = abortController;
+
       try {
+        setIntegrationCheckError(null);
         const { data: ga4Integration, error: ga4Error } = await supabase
           .from('analytics_integrations')
           .select('id, is_active, credentials')
@@ -152,37 +180,62 @@ export default function Settings() {
           .eq('is_active', true)
           .maybeSingle();
 
+        // Check if request was aborted
+        if (abortController.signal.aborted) {
+          return;
+        }
+
         if (ga4Error) {
           console.error('Error checking Google Analytics integration:', ga4Error);
+          setIntegrationCheckError('Failed to check integration status. Please refresh the page.');
         } else {
-          setGoogleAnalyticsConnected(!!ga4Integration);
-          if (ga4Integration?.credentials && typeof ga4Integration.credentials === 'object') {
+          const isConnected = !!ga4Integration;
+          setGoogleAnalyticsConnected(isConnected);
+          if (isConnected && ga4Integration?.credentials && typeof ga4Integration.credentials === 'object') {
             const credentials = ga4Integration.credentials as { property_id?: string };
             if (credentials.property_id) {
               setGoogleAnalyticsPropertyId(credentials.property_id);
+            } else {
+              setGoogleAnalyticsPropertyId('');
             }
+          } else {
+            setGoogleAnalyticsPropertyId('');
           }
         }
 
         if (gscError) {
           console.error('Error checking Google Search Console integration:', gscError);
+          setIntegrationCheckError('Failed to check integration status. Please refresh the page.');
         } else {
-          setGoogleSearchConsoleConnected(!!gscIntegration);
-          if (gscIntegration?.credentials && typeof gscIntegration.credentials === 'object') {
+          const isConnected = !!gscIntegration;
+          setGoogleSearchConsoleConnected(isConnected);
+          if (isConnected && gscIntegration?.credentials && typeof gscIntegration.credentials === 'object') {
             const credentials = gscIntegration.credentials as { site_url?: string };
             if (credentials.site_url) {
               setGoogleSearchConsoleSiteUrl(credentials.site_url);
+            } else {
+              setGoogleSearchConsoleSiteUrl('');
             }
+          } else {
+            setGoogleSearchConsoleSiteUrl('');
           }
         }
       } catch (error) {
-        console.error('Error checking integrations:', error);
-        // Don't show toast for integration check errors as they're not critical
+        if (!abortController.signal.aborted) {
+          console.error('Error checking integrations:', error);
+          setIntegrationCheckError('Failed to check integration status. Please refresh the page.');
+        }
       }
     };
 
     checkIntegrations();
-  }, [storeId]);
+
+    return () => {
+      if (integrationCheckAbortRef.current) {
+        integrationCheckAbortRef.current.abort();
+      }
+    };
+  }, [storeId, integrationCheckTrigger]);
 
   // Handle OAuth callback redirect
   useEffect(() => {
@@ -267,15 +320,17 @@ export default function Settings() {
     }
   }, [settings, store, isInitialized]);
 
-  // Initialize integration states after checking connections
+  // Initialize integration enabled states after checking connections (only once on mount or when connection changes)
   useEffect(() => {
-    if (googleAnalyticsConnected) {
+    // Only auto-enable if connected, but don't disable if user has manually disabled
+    // This prevents the effect from overriding user preferences
+    if (googleAnalyticsConnected && !googleAnalyticsEnabled) {
       setGoogleAnalyticsEnabled(true);
     }
-    if (googleSearchConsoleConnected) {
+    if (googleSearchConsoleConnected && !googleSearchConsoleEnabled) {
       setGoogleSearchConsoleEnabled(true);
     }
-  }, [googleAnalyticsConnected, googleSearchConsoleConnected]);
+  }, [googleAnalyticsConnected, googleSearchConsoleConnected]); // Removed enabled states from dependencies to prevent loops
 
 
   const handleSave = useCallback(async () => {
@@ -454,6 +509,7 @@ export default function Settings() {
           require_approval: false,
           review_window_hours: 24,
           content_preferences: {
+            default_author: '',
             topic_preferences: [],
             keyword_focus: [],
             content_angles: [],
@@ -465,6 +521,15 @@ export default function Settings() {
       if (error) {
         throw new Error(error.message);
       }
+
+      // Reset integration states
+      setGoogleAnalyticsConnected(false);
+      setGoogleAnalyticsEnabled(false);
+      setGoogleAnalyticsPropertyId('');
+      setGoogleSearchConsoleConnected(false);
+      setGoogleSearchConsoleEnabled(false);
+      setGoogleSearchConsoleSiteUrl('');
+      setIntegrationCheckError(null);
 
       resetSettings();
       showToast('Settings reset successfully. Reloading page...', { isError: false });
@@ -645,6 +710,23 @@ export default function Settings() {
         </div>
       )}
 
+      {integrationCheckError && (
+        <div className="bg-yellow-50 border-b border-yellow-200 px-4 sm:px-6 lg:px-8 py-3 flex-shrink-0">
+          <div className="flex items-center justify-between">
+            <p className="text-sm text-yellow-800">{integrationCheckError}</p>
+            <button
+              onClick={() => {
+                setIntegrationCheckError(null);
+                setIntegrationCheckTrigger(prev => prev + 1);
+              }}
+              className="text-sm text-yellow-900 hover:text-yellow-950 underline"
+            >
+              Dismiss
+            </button>
+          </div>
+        </div>
+      )}
+
       <div className="flex-1 overflow-y-auto p-4 sm:p-6 lg:p-8">
         {isLoading ? (
           <div className="max-w-4xl mx-auto space-y-4 sm:space-y-5 lg:space-y-6">
@@ -735,18 +817,27 @@ export default function Settings() {
 
                             // Listen for message from popup
                             const messageHandler = (event: MessageEvent) => {
-                              // Security: Only accept messages from same origin or trusted sources
-                              if (event.origin !== window.location.origin && !event.origin.includes('supabase.co')) {
+                              // Security: Only accept messages from same origin or exact Supabase domains
+                              const allowedOrigins = [
+                                window.location.origin,
+                                'https://supabase.co',
+                                'https://app.supabase.com',
+                              ];
+                              if (!allowedOrigins.includes(event.origin)) {
                                 return;
                               }
 
                               if (event.data.type === 'oauth-success') {
                                 window.removeEventListener('message', messageHandler);
                                 popup.close();
+                                setGoogleAnalyticsConnected(true);
+                                setGoogleAnalyticsEnabled(true);
                                 showToast('Google Analytics connected successfully!', { isError: false });
                                 if (shopDomain) {
                                   queryClient.invalidateQueries({ queryKey: queryKeys.store(shopDomain) });
                                 }
+                                // Refresh integration check to get updated credentials
+                                setIntegrationCheckTrigger(prev => prev + 1);
                                 setIsConnectingGoogle(null);
                               } else if (event.data.type === 'oauth-error') {
                                 window.removeEventListener('message', messageHandler);
@@ -764,6 +855,11 @@ export default function Settings() {
                               if (popup.closed) {
                                 clearInterval(checkClosed);
                                 window.removeEventListener('message', messageHandler);
+                                if (isConnectingGoogle === 'ga4') {
+                                  showToast('Connection cancelled. Please try again if you want to connect Google Analytics.', { isError: false, duration: 3000 });
+                                } else if (isConnectingGoogle === 'gsc') {
+                                  showToast('Connection cancelled. Please try again if you want to connect Google Search Console.', { isError: false, duration: 3000 });
+                                }
                                 setIsConnectingGoogle(null);
                               }
                             }, 1000);
@@ -849,18 +945,27 @@ export default function Settings() {
 
                             // Listen for message from popup
                             const messageHandler = (event: MessageEvent) => {
-                              // Security: Only accept messages from same origin or trusted sources
-                              if (event.origin !== window.location.origin && !event.origin.includes('supabase.co')) {
+                              // Security: Only accept messages from same origin or exact Supabase domains
+                              const allowedOrigins = [
+                                window.location.origin,
+                                'https://supabase.co',
+                                'https://app.supabase.com',
+                              ];
+                              if (!allowedOrigins.includes(event.origin)) {
                                 return;
                               }
 
                               if (event.data.type === 'oauth-success') {
                                 window.removeEventListener('message', messageHandler);
                                 popup.close();
+                                setGoogleSearchConsoleConnected(true);
+                                setGoogleSearchConsoleEnabled(true);
                                 showToast('Google Search Console connected successfully!', { isError: false });
                                 if (shopDomain) {
                                   queryClient.invalidateQueries({ queryKey: queryKeys.store(shopDomain) });
                                 }
+                                // Refresh integration check to get updated credentials
+                                setIntegrationCheckTrigger(prev => prev + 1);
                                 setIsConnectingGoogle(null);
                               } else if (event.data.type === 'oauth-error') {
                                 window.removeEventListener('message', messageHandler);
@@ -878,11 +983,16 @@ export default function Settings() {
                               if (popup.closed) {
                                 clearInterval(checkClosed);
                                 window.removeEventListener('message', messageHandler);
+                                if (isConnectingGoogle === 'ga4') {
+                                  showToast('Connection cancelled. Please try again if you want to connect Google Analytics.', { isError: false, duration: 3000 });
+                                } else if (isConnectingGoogle === 'gsc') {
+                                  showToast('Connection cancelled. Please try again if you want to connect Google Search Console.', { isError: false, duration: 3000 });
+                                }
                                 setIsConnectingGoogle(null);
                               }
                             }, 1000);
                           } catch (error) {
-                            const errorMessage = formatAPIErrorMessage(error, { action: 'connect Google Analytics', resource: 'integration' });
+                            const errorMessage = formatAPIErrorMessage(error, { action: 'connect Google Search Console', resource: 'integration' });
                             showToast(errorMessage, { isError: true });
                             setIsConnectingGoogle(null);
                           }
