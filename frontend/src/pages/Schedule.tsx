@@ -348,21 +348,6 @@ export default function Schedule() {
       });
   }, [allRelevantPosts]);
 
-  const upcomingPosts = useMemo(() => {
-    const now = new Date();
-    return allRelevantPosts
-      .filter((p) => {
-        const postDate = p.published_at || p.scheduled_publish_at;
-        if (!postDate) return false;
-        return new Date(postDate) >= now;
-      })
-      .sort((a, b) => {
-        const dateA = new Date(a.published_at || a.scheduled_publish_at!);
-        const dateB = new Date(b.published_at || b.scheduled_publish_at!);
-        return dateA.getTime() - dateB.getTime();
-      })
-      .slice(0, 3);
-  }, [allRelevantPosts]);
 
   // Initialize calendar to install date if current date is before it
   useEffect(() => {
@@ -1096,7 +1081,12 @@ export default function Schedule() {
               {storeId && (
                 <div className="bg-white rounded-xl border border-gray-200 shadow-sm">
                   <div className="p-3 sm:p-4 md:p-5 lg:p-6">
-                    <ArticlesQueue storeId={storeId} showTitle={true} />
+                    <ArticlesQueue 
+                      storeId={storeId} 
+                      showTitle={true} 
+                      selectedDays={selectedDays}
+                      publishTime={publishTime}
+                    />
                   </div>
                 </div>
               )}
@@ -1186,57 +1176,6 @@ export default function Schedule() {
                 </div>
               </div>
 
-              {/* Content Calendar */}
-              <div className="bg-white rounded-xl border border-gray-200 shadow-sm">
-                <div className="p-3 sm:p-4 md:p-5 lg:p-6 border-b border-gray-200">
-                  <h2 className="text-sm sm:text-base md:text-lg font-semibold text-gray-900">Content Calendar</h2>
-                  <p className="text-xs text-gray-500 mt-1">Upcoming articles and their publish dates</p>
-                </div>
-                <div className="p-3 sm:p-4 md:p-5 lg:p-6">
-                  <div className="space-y-2 sm:space-y-3 md:space-y-4">
-                    {upcomingPosts.length === 0 ? (
-                      <p className="text-xs sm:text-sm text-gray-500 text-center py-4">
-                        No upcoming articles. Articles are automatically generated based on your schedule.
-                      </p>
-                    ) : (
-                      upcomingPosts.map((post) => {
-                        const postDate = new Date(post.published_at || post.scheduled_publish_at!);
-                        const isPendingReview = post.status === 'draft' && post.review_status === 'pending';
-                        const autoPublishAt = post.auto_publish_at ? new Date(post.auto_publish_at) : null;
-                        return (
-                          <div
-                            key={post.id}
-                            className={`p-3 rounded-lg border cursor-pointer hover:opacity-80 transition-opacity ${
-                              isPendingReview
-                                ? 'bg-yellow-50 border-yellow-200'
-                                : 'bg-purple-50 border-purple-100'
-                            }`}
-                            onClick={handlePostClick}
-                          >
-                            <div className="flex items-start justify-between gap-2">
-                              <div className="flex-1 min-w-0">
-                                <p className="text-xs text-gray-500">{formatDate(postDate)}</p>
-                                <p className="text-sm font-semibold text-gray-900 mt-1">{post.title}</p>
-                                <p className="text-xs text-gray-600 mt-1">{formatTime(postDate)}</p>
-                                {isPendingReview && autoPublishAt && (
-                                  <p className="text-xs text-yellow-700 mt-1">
-                                    Auto-publishes {autoPublishAt.toLocaleDateString()} if not reviewed
-                                  </p>
-                                )}
-                              </div>
-                              {isPendingReview && (
-                                <span className="px-2 py-1 text-xs font-medium bg-yellow-100 text-yellow-800 rounded-full flex-shrink-0">
-                                  Pending Review
-                                </span>
-                              )}
-                            </div>
-                          </div>
-                        );
-                      })
-                    )}
-                  </div>
-                </div>
-              </div>
             </div>
           </div>
         </div>
