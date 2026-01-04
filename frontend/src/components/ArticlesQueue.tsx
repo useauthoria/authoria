@@ -109,14 +109,42 @@ export default function ArticlesQueue({ storeId, onArticleClick, showTitle = tru
 
   const reorderMutation = useMutation({
     mutationFn: (articleIds: string[]) => queueApi.reorder(storeId, articleIds),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['queue', storeId] });
-      showToast('Queue order updated', { isError: false });
+    onMutate: async (newArticleIds) => {
+      // Cancel any outgoing refetches
+      await queryClient.cancelQueries({ queryKey: ['queue', storeId] });
+
+      // Snapshot the previous value
+      const previousQueue = queryClient.getQueryData<QueuedArticle[]>(['queue', storeId]);
+
+      // Optimistically update to the new value
+      if (previousQueue) {
+        // Reorder based on new IDs
+        const articleMap = new Map(previousQueue.map((article) => [article.id, article]));
+        const reorderedQueue = newArticleIds
+          .map((id) => articleMap.get(id))
+          .filter((article): article is QueuedArticle => article !== undefined);
+        
+        queryClient.setQueryData<QueuedArticle[]>(['queue', storeId], reorderedQueue);
+      }
+
+      // Return context with the previous value
+      return { previousQueue };
     },
-    onError: (error) => {
+    onError: (error, newArticleIds, context) => {
+      // Rollback to previous value on error
+      if (context?.previousQueue) {
+        queryClient.setQueryData(['queue', storeId], context.previousQueue);
+      }
       console.error('Failed to reorder queue:', error);
       const errorMessage = formatAPIErrorMessage(error, { action: 'reorder queue', resource: 'queue' });
       showToast(errorMessage, { isError: true });
+    },
+    onSettled: () => {
+      // Always refetch after error or success to ensure consistency
+      queryClient.invalidateQueries({ queryKey: ['queue', storeId] });
+    },
+    onSuccess: () => {
+      showToast('Queue order updated', { isError: false });
     },
   });
 
@@ -180,14 +208,25 @@ export default function ArticlesQueue({ storeId, onArticleClick, showTitle = tru
 
   const handleDrop = useCallback((e: React.DragEvent, dropIndex: number) => {
     e.preventDefault();
+    e.stopPropagation();
     
-    if (draggedIndex === null || draggedIndex === dropIndex) {
+    if (draggedIndex === null) {
       setDraggedIndex(null);
       setDragOverIndex(null);
       return;
     }
 
-    const newOrder = [...queue];
+    // Use displayedQueue for the calculation since that's what we're displaying
+    const currentQueue = displayedQueue;
+    
+    if (draggedIndex === dropIndex || draggedIndex < 0 || dropIndex < 0 || draggedIndex >= currentQueue.length || dropIndex >= currentQueue.length) {
+      setDraggedIndex(null);
+      setDragOverIndex(null);
+      return;
+    }
+
+    // Create new order by reordering items
+    const newOrder = [...currentQueue];
     const [draggedItem] = newOrder.splice(draggedIndex, 1);
     newOrder.splice(dropIndex, 0, draggedItem);
 
@@ -196,7 +235,7 @@ export default function ArticlesQueue({ storeId, onArticleClick, showTitle = tru
 
     setDraggedIndex(null);
     setDragOverIndex(null);
-  }, [draggedIndex, queue, reorderMutation]);
+  }, [draggedIndex, displayedQueue, reorderMutation]);
 
   const handleDragEnd = useCallback(() => {
     setDraggedIndex(null);

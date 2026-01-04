@@ -2,9 +2,8 @@ import { useState, useCallback, useMemo, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useStore, usePosts, useQuotaStatus, queryKeys } from '../lib/api-cache';
 import { getShopDomain } from '../lib/app-bridge';
-import { supabase, postsApi } from '../lib/api-client';
-import { useMutation, useQueryClient } from '@tanstack/react-query';
-import type { BlogPost } from '../lib/api-client';
+import { supabase, postsApi, queueApi, type BlogPost, type QueuedArticle } from '../lib/api-client';
+import { useMutation, useQueryClient, useQuery } from '@tanstack/react-query';
 import { getPlanFrequencyConfig, validateSelectedDays, getFrequencySettings } from '../utils/plan-frequency';
 import { useAppBridgeToast } from '../hooks/useAppBridge';
 import ArticlesQueue from '../components/ArticlesQueue';
@@ -311,6 +310,17 @@ export default function Schedule() {
     refetch: refetchPosts,
   } = usePosts(storeId);
 
+  // Fetch queue articles
+  const {
+    data: queue = [],
+    isLoading: queueLoading,
+  } = useQuery({
+    queryKey: ['queue', storeId],
+    queryFn: () => queueApi.getQueue(storeId),
+    enabled: !!storeId,
+    refetchInterval: 30000,
+  });
+
   const scheduledPosts = useMemo(() => {
     return allPosts.filter((p) => p.status === 'scheduled' && p.scheduled_publish_at);
   }, [allPosts]);
@@ -319,11 +329,57 @@ export default function Schedule() {
     return allPosts.filter((p) => p.status === 'published' && p.published_at);
   }, [allPosts]);
 
-  const allRelevantPosts = useMemo(() => {
-    return [...scheduledPosts, ...publishedPosts];
-  }, [scheduledPosts, publishedPosts]);
+  // Convert queue items to BlogPost-like format with calculated scheduled dates
+  const queuePostsAsBlogPosts = useMemo(() => {
+    if (!selectedDays || selectedDays.size === 0 || queue.length === 0) return [];
+    
+    // Convert our day index (Mon=0, ..., Sun=6) to JS Date.getDay() format (Sun=0, Mon=1, ..., Sat=6)
+    const dayIndexToJsDay = (index: number): number => index === 6 ? 0 : index + 1;
+    
+    // Calculate scheduled dates for queue items
+    const dates: Date[] = [];
+    const now = new Date();
+    const [hours, minutes] = publishTime.split(':').map(Number);
+    const jsDays = Array.from(selectedDays).map(dayIndexToJsDay).sort((a, b) => a - b);
+    
+    let currentDate = new Date(now);
+    currentDate.setHours(hours, minutes, 0, 0);
+    
+    if (currentDate <= now) {
+      currentDate.setDate(currentDate.getDate() + 1);
+    }
+    
+    let attempts = 0;
+    const maxAttempts = 100;
+    
+    while (dates.length < queue.length && attempts < maxAttempts) {
+      const currentDay = currentDate.getDay();
+      if (jsDays.includes(currentDay)) {
+        dates.push(new Date(currentDate));
+      }
+      currentDate.setDate(currentDate.getDate() + 1);
+      attempts++;
+    }
+    
+    // Convert queue items to BlogPost format
+    return queue.slice(0, dates.length).map((article, index): BlogPost => ({
+      id: article.id,
+      store_id: article.store_id,
+      title: article.title,
+      content: article.content || '',
+      status: 'queued' as const,
+      published_at: null,
+      scheduled_publish_at: dates[index].toISOString(),
+      seo_health_score: 0,
+      created_at: article.created_at,
+    }));
+  }, [queue, selectedDays, publishTime]);
 
-  const isLoading = storeLoading || postsLoading || quotaLoading;
+  const allRelevantPosts = useMemo(() => {
+    return [...scheduledPosts, ...publishedPosts, ...queuePostsAsBlogPosts];
+  }, [scheduledPosts, publishedPosts, queuePostsAsBlogPosts]);
+
+  const isLoading = storeLoading || postsLoading || quotaLoading || queueLoading;
   const isError = !!storeError || !!postsError;
   const error = storeError || postsError;
 
