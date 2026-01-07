@@ -1,5 +1,5 @@
 import { useQuery, useMutation, useQueryClient, type UseQueryResult, type UseMutationResult } from '@tanstack/react-query';
-import { storeApi, postsApi, type BlogPost } from './api-client';
+import { storeApi, postsApi, type BlogPost, type Store, type QuotaStatus } from './api-client';
 
 type CacheStrategy = 'ttl' | 'lru' | 'lfu' | 'fifo' | 'custom';
 
@@ -1147,7 +1147,7 @@ const isWrappedResponse = (result: unknown): result is { data: unknown } => {
   );
 };
 
-export function useStore(shopDomain: string): UseQueryResult<unknown, Error> {
+export function useStore(shopDomain: string): UseQueryResult<Store | null, Error> {
   const validatedShopDomain = validateShopDomain(shopDomain);
   const hasShopDomain = !!validatedShopDomain;
 
@@ -1161,10 +1161,10 @@ export function useStore(shopDomain: string): UseQueryResult<unknown, Error> {
         const result = await storeApi.getStore(validatedShopDomain!);
 
         if (isWrappedResponse(result)) {
-          return result.data;
+          return result.data as Store;
         }
 
-        return result;
+        return result as Store;
       } catch (error) {
         throw error;
       }
@@ -1175,7 +1175,7 @@ export function useStore(shopDomain: string): UseQueryResult<unknown, Error> {
   });
 }
 
-export function useQuotaStatus(storeId: string): UseQueryResult<unknown, Error> {
+export function useQuotaStatus(storeId: string): UseQueryResult<QuotaStatus | null, Error> {
   const validatedStoreId = validateStoreId(storeId);
   const hasStoreId = !!validatedStoreId;
 

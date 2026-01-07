@@ -1250,7 +1250,7 @@ export const storeApi = {
         .single();
 
       if (error) {
-        throw new APIError(`Failed to update store: ${error.message}`, 'server', error.code);
+        throw new APIError(`Failed to update store: ${error.message}`, 'server', undefined, error);
       }
 
       if (!data) {
@@ -1500,7 +1500,7 @@ export const postsApi = {
     postId: string,
     scheduledAt: string,
   ): Promise<{
-    readonly conflicts: readonly Array<{
+    readonly conflicts: ReadonlyArray<{
       readonly conflictType: string;
       readonly severity: string;
       readonly scheduledAt: string;
@@ -1519,7 +1519,7 @@ export const postsApi = {
       throw new APIError('Invalid scheduled time', 'validation');
     }
     return api.post<{
-      readonly conflicts: readonly Array<{
+      readonly conflicts: ReadonlyArray<{
         readonly conflictType: string;
         readonly severity: string;
         readonly scheduledAt: string;

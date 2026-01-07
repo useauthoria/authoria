@@ -17,6 +17,8 @@ export interface SettingsData {
   };
 }
 
+type Mutable<T> = { -readonly [K in keyof T]: T[K] };
+
 export interface UseSettingsDataOptions {
   readonly enableRealTime?: boolean;
   readonly refetchInterval?: number;
@@ -123,7 +125,7 @@ const validatePartialSettings = (updates: Partial<SettingsData> | null | undefin
   if (!updates || typeof updates !== 'object') {
     return {};
   }
-  const validated: Partial<SettingsData> = {};
+  const validated: Mutable<Partial<SettingsData>> = {};
   if ('brand_safety_enabled' in updates && typeof updates.brand_safety_enabled === 'boolean') {
     validated.brand_safety_enabled = updates.brand_safety_enabled;
   }
@@ -131,7 +133,12 @@ const validatePartialSettings = (updates: Partial<SettingsData> | null | undefin
     const notifications = updates.notifications;
     const email = notifications.email;
     if (email !== null && typeof email === 'object') {
-      const validatedEmail: SettingsData['notifications']['email'] = {};
+      type MutableEmail = {
+        enabled?: boolean;
+        article_published?: boolean;
+        article_scheduled?: boolean;
+      };
+      const validatedEmail: MutableEmail = {};
       if (typeof email.enabled === 'boolean') {
         validatedEmail.enabled = email.enabled;
       }

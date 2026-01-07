@@ -193,17 +193,17 @@ export default function Articles(): JSX.Element {
   }, [dateRangeFilter]);
 
   const filters: PostsFilters = useMemo(() => {
-    const f: PostsFilters = {};
-    if (statusFilter) {
-      f.status = statusFilter;
-    }
-    if (dateRange && dateRange.start && dateRange.end) {
-      f.dateRange = {
-        start: dateRange.start.toISOString(),
-        end: dateRange.end.toISOString(),
-      };
-    }
-    return f;
+    const byStatus = statusFilter ? { status: statusFilter } : {};
+    const byDate =
+      dateRange && dateRange.start && dateRange.end
+        ? {
+            dateRange: {
+              start: dateRange.start.toISOString(),
+              end: dateRange.end.toISOString(),
+            },
+          }
+        : {};
+    return { ...byStatus, ...byDate };
   }, [statusFilter, dateRange]);
 
   const {
@@ -487,7 +487,7 @@ export default function Articles(): JSX.Element {
         return;
       }
       try {
-        await postsApi.reject(postId, feedback);
+        await postsApi.reject(postId, feedback as Readonly<Record<string, unknown>>);
         if (isMountedRef.current) {
           queryClient.invalidateQueries({ queryKey: ['posts'] });
           setShowReviewModal(null);
@@ -523,7 +523,7 @@ export default function Articles(): JSX.Element {
           return;
         }
 
-        await postsApi.regenerate(postId, feedback, storeIdValue);
+        await postsApi.regenerate(postId, feedback as Readonly<Record<string, unknown>>, storeIdValue);
         if (isMountedRef.current) {
           queryClient.invalidateQueries({ queryKey: ['posts'] });
           setShowReviewModal(null);

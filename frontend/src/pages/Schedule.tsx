@@ -60,7 +60,7 @@ interface ConflictInfo {
 }
 
 interface ConflictResponse {
-  readonly conflicts: readonly Array<{
+  readonly conflicts: ReadonlyArray<{
     readonly conflictType: string;
     readonly severity: string;
     readonly scheduledAt: string;
@@ -433,7 +433,7 @@ const buildQueuePostsAsBlogPosts = (
   );
 };
 
-const buildConflictMap = (conflicts: readonly ConflictResponse['conflicts'], dateKey: string): Map<string, readonly ConflictInfo[]> => {
+const buildConflictMap = (conflicts: ConflictResponse['conflicts'], dateKey: string): Map<string, readonly ConflictInfo[]> => {
   if (conflicts.length === 0) {
     return new Map();
   }
