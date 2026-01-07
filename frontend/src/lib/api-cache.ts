@@ -1,5 +1,5 @@
-import { useQuery, useMutation, useQueryClient, QueryClient, QueryCache, MutationCache } from '@tanstack/react-query';
-import { storeApi, postsApi, analyticsApi, type BlogPost } from './api-client';
+import { useQuery, useMutation, useQueryClient, type UseQueryResult, type UseMutationResult } from '@tanstack/react-query';
+import { storeApi, postsApi, type BlogPost } from './api-client';
 
 type CacheStrategy = 'ttl' | 'lru' | 'lfu' | 'fifo' | 'custom';
 
@@ -115,6 +115,93 @@ interface BroadcastMessage {
   readonly entry?: MutableCacheEntry;
 }
 
+interface QueryState {
+  readonly status: 'pending' | 'error' | 'success';
+  readonly isFetching?: boolean;
+}
+
+interface QueryWithState {
+  readonly state: QueryState;
+  readonly queryKey: readonly unknown[];
+  readonly isEnabled?: boolean;
+}
+
+const MAX_KEY_LENGTH = 1000;
+const MAX_CACHE_SIZE = 100 * 1024 * 1024;
+const MAX_SHOP_DOMAIN_LENGTH = 200;
+const MAX_STORE_ID_LENGTH = 200;
+const MAX_POST_ID_LENGTH = 200;
+
+const validateKey = (key: string): string | null => {
+  if (!key || typeof key !== 'string') {
+    return null;
+  }
+  const trimmed = key.trim();
+  if (trimmed.length === 0 || trimmed.length > MAX_KEY_LENGTH) {
+    return null;
+  }
+  return trimmed;
+};
+
+const validateShopDomain = (shopDomain: string): string | null => {
+  if (!shopDomain || typeof shopDomain !== 'string') {
+    return null;
+  }
+  const trimmed = shopDomain.trim();
+  if (trimmed.length === 0 || trimmed.length > MAX_SHOP_DOMAIN_LENGTH) {
+    return null;
+  }
+  return trimmed;
+};
+
+const validateStoreId = (storeId: string): string | null => {
+  if (!storeId || typeof storeId !== 'string') {
+    return null;
+  }
+  const trimmed = storeId.trim();
+  if (trimmed.length === 0 || trimmed.length > MAX_STORE_ID_LENGTH) {
+    return null;
+  }
+  return trimmed;
+};
+
+const validatePostId = (postId: string): string | null => {
+  if (!postId || typeof postId !== 'string') {
+    return null;
+  }
+  const trimmed = postId.trim();
+  if (trimmed.length === 0 || trimmed.length > MAX_POST_ID_LENGTH) {
+    return null;
+  }
+  return trimmed;
+};
+
+const hasWindow = (): boolean => {
+  return typeof window !== 'undefined';
+};
+
+const hasIndexedDB = (): boolean => {
+  return hasWindow() && 'indexedDB' in window;
+};
+
+const hasLocalStorage = (): boolean => {
+  if (!hasWindow()) {
+    return false;
+  }
+  try {
+    const test = '__localStorage_test__';
+    localStorage.setItem(test, test);
+    localStorage.removeItem(test);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+const hasBroadcastChannel = (): boolean => {
+  return typeof BroadcastChannel !== 'undefined';
+};
+
 class PersistentCacheStorage {
   private static readonly DB_NAME = 'api-cache';
   private static readonly STORE_NAME = 'cache';
@@ -129,120 +216,257 @@ class PersistentCacheStorage {
   private db: IDBDatabase | null = null;
 
   async init(): Promise<void> {
-    if (!('indexedDB' in window)) {
+    if (!hasIndexedDB()) {
       return;
     }
 
     return new Promise<void>((resolve, reject) => {
-      const request = indexedDB.open(this.dbName, this.version);
+      try {
+        const request = indexedDB.open(this.dbName, this.version);
 
-      request.onerror = () => reject(request.error);
-      request.onsuccess = () => {
-        this.db = request.result;
-        resolve();
-      };
+        request.onerror = () => {
+          reject(request.error || new Error('Failed to open IndexedDB'));
+        };
 
-      request.onupgradeneeded = (event) => {
-        const db = (event.target as IDBOpenDBRequest).result;
-        if (!db.objectStoreNames.contains(this.storeName)) {
-          const store = db.createObjectStore(this.storeName, { keyPath: 'key' });
-          store.createIndex(PersistentCacheStorage.EXPIRES_AT_INDEX, PersistentCacheStorage.EXPIRES_AT_INDEX, { unique: false });
-          store.createIndex(PersistentCacheStorage.LAST_ACCESSED_INDEX, PersistentCacheStorage.LAST_ACCESSED_INDEX, { unique: false });
-        }
-      };
+        request.onsuccess = () => {
+          try {
+            this.db = request.result;
+            resolve();
+          } catch {
+            reject(new Error('Failed to initialize database'));
+          }
+        };
+
+        request.onupgradeneeded = (event) => {
+          try {
+            const db = (event.target as IDBOpenDBRequest).result;
+            if (!db.objectStoreNames.contains(this.storeName)) {
+              const store = db.createObjectStore(this.storeName, { keyPath: 'key' });
+              store.createIndex(
+                PersistentCacheStorage.EXPIRES_AT_INDEX,
+                PersistentCacheStorage.EXPIRES_AT_INDEX,
+                { unique: false },
+              );
+              store.createIndex(
+                PersistentCacheStorage.LAST_ACCESSED_INDEX,
+                PersistentCacheStorage.LAST_ACCESSED_INDEX,
+                { unique: false },
+              );
+            }
+          } catch {
+            reject(new Error('Failed to upgrade database'));
+          }
+        };
+      } catch {
+        reject(new Error('Failed to open IndexedDB'));
+      }
     });
   }
 
   async get<T>(key: string): Promise<MutableCacheEntry<T> | null> {
+    const validatedKey = validateKey(key);
+    if (!validatedKey) {
+      return null;
+    }
+
     if (!this.db) {
-      const item = localStorage.getItem(`${PersistentCacheStorage.KEY_PREFIX}${key}`);
-      return item ? (JSON.parse(item) as MutableCacheEntry<T>) : null;
+      if (!hasLocalStorage()) {
+        return null;
+      }
+      try {
+        const item = localStorage.getItem(`${PersistentCacheStorage.KEY_PREFIX}${validatedKey}`);
+        if (!item) {
+          return null;
+        }
+        const parsed = JSON.parse(item) as MutableCacheEntry<T>;
+        return parsed;
+      } catch {
+        return null;
+      }
     }
 
     return new Promise<MutableCacheEntry<T> | null>((resolve, reject) => {
-      const transaction = this.db!.transaction([this.storeName], 'readonly');
-      const store = transaction.objectStore(this.storeName);
-      const request = store.get(key);
+      try {
+        const transaction = this.db!.transaction([this.storeName], 'readonly');
+        const store = transaction.objectStore(this.storeName);
+        const request = store.get(validatedKey);
 
-      request.onerror = () => reject(request.error);
-      request.onsuccess = () => resolve((request.result?.value ?? null) as MutableCacheEntry<T> | null);
+        request.onerror = () => {
+          reject(request.error || new Error('Failed to get from IndexedDB'));
+        };
+
+        request.onsuccess = () => {
+          try {
+            const result = request.result?.value;
+            if (!result) {
+              resolve(null);
+              return;
+            }
+            resolve(result as MutableCacheEntry<T>);
+          } catch {
+            resolve(null);
+          }
+        };
+      } catch {
+        resolve(null);
+      }
     });
   }
 
   async set<T>(key: string, entry: MutableCacheEntry<T>): Promise<void> {
+    const validatedKey = validateKey(key);
+    if (!validatedKey) {
+      return;
+    }
+
     if (!this.db) {
-      localStorage.setItem(`${PersistentCacheStorage.KEY_PREFIX}${key}`, JSON.stringify(entry));
+      if (!hasLocalStorage()) {
+        return;
+      }
+      try {
+        localStorage.setItem(`${PersistentCacheStorage.KEY_PREFIX}${validatedKey}`, JSON.stringify(entry));
+      } catch {
+      }
       return;
     }
 
     return new Promise<void>((resolve, reject) => {
-      const transaction = this.db!.transaction([this.storeName], 'readwrite');
-      const store = transaction.objectStore(this.storeName);
-      const request = store.put({ key, value: entry });
+      try {
+        const transaction = this.db!.transaction([this.storeName], 'readwrite');
+        const store = transaction.objectStore(this.storeName);
+        const request = store.put({ key: validatedKey, value: entry });
 
-      request.onerror = () => reject(request.error);
-      request.onsuccess = () => resolve();
+        request.onerror = () => {
+          reject(request.error || new Error('Failed to set in IndexedDB'));
+        };
+
+        request.onsuccess = () => {
+          resolve();
+        };
+      } catch {
+        reject(new Error('Failed to set in IndexedDB'));
+      }
     });
   }
 
   async delete(key: string): Promise<void> {
+    const validatedKey = validateKey(key);
+    if (!validatedKey) {
+      return;
+    }
+
     if (!this.db) {
-      localStorage.removeItem(`${PersistentCacheStorage.KEY_PREFIX}${key}`);
+      if (hasLocalStorage()) {
+        try {
+          localStorage.removeItem(`${PersistentCacheStorage.KEY_PREFIX}${validatedKey}`);
+        } catch {
+        }
+      }
       return;
     }
 
     return new Promise<void>((resolve, reject) => {
-      const transaction = this.db!.transaction([this.storeName], 'readwrite');
-      const store = transaction.objectStore(this.storeName);
-      const request = store.delete(key);
+      try {
+        const transaction = this.db!.transaction([this.storeName], 'readwrite');
+        const store = transaction.objectStore(this.storeName);
+        const request = store.delete(validatedKey);
 
-      request.onerror = () => reject(request.error);
-      request.onsuccess = () => resolve();
+        request.onerror = () => {
+          reject(request.error || new Error('Failed to delete from IndexedDB'));
+        };
+
+        request.onsuccess = () => {
+          resolve();
+        };
+      } catch {
+        resolve();
+      }
     });
   }
 
   async clear(): Promise<void> {
     if (!this.db) {
-      const keys: string[] = [];
-      for (let i = 0; i < localStorage.length; i++) {
-        const key = localStorage.key(i);
-        if (key?.startsWith(PersistentCacheStorage.KEY_PREFIX)) {
-          keys.push(key);
-        }
+      if (!hasLocalStorage()) {
+        return;
       }
-      keys.forEach((key) => localStorage.removeItem(key));
+      try {
+        const keys: string[] = [];
+        for (let i = 0; i < localStorage.length; i++) {
+          const key = localStorage.key(i);
+          if (key?.startsWith(PersistentCacheStorage.KEY_PREFIX)) {
+            keys.push(key);
+          }
+        }
+        for (const key of keys) {
+          try {
+            localStorage.removeItem(key);
+          } catch {
+          }
+        }
+      } catch {
+      }
       return;
     }
 
     return new Promise<void>((resolve, reject) => {
-      const transaction = this.db!.transaction([this.storeName], 'readwrite');
-      const store = transaction.objectStore(this.storeName);
-      const request = store.clear();
+      try {
+        const transaction = this.db!.transaction([this.storeName], 'readwrite');
+        const store = transaction.objectStore(this.storeName);
+        const request = store.clear();
 
-      request.onerror = () => reject(request.error);
-      request.onsuccess = () => resolve();
+        request.onerror = () => {
+          reject(request.error || new Error('Failed to clear IndexedDB'));
+        };
+
+        request.onsuccess = () => {
+          resolve();
+        };
+      } catch {
+        resolve();
+      }
     });
   }
 
   async getAllKeys(): Promise<string[]> {
     if (!this.db) {
-      const keys: string[] = [];
-      for (let i = 0; i < localStorage.length; i++) {
-        const key = localStorage.key(i);
-        if (key?.startsWith(PersistentCacheStorage.KEY_PREFIX)) {
-          keys.push(key.replace(PersistentCacheStorage.KEY_PREFIX, ''));
-        }
+      if (!hasLocalStorage()) {
+        return [];
       }
-      return keys;
+      try {
+        const keys: string[] = [];
+        for (let i = 0; i < localStorage.length; i++) {
+          const key = localStorage.key(i);
+          if (key?.startsWith(PersistentCacheStorage.KEY_PREFIX)) {
+            keys.push(key.replace(PersistentCacheStorage.KEY_PREFIX, ''));
+          }
+        }
+        return keys;
+      } catch {
+        return [];
+      }
     }
 
     return new Promise<string[]>((resolve, reject) => {
-      const transaction = this.db!.transaction([this.storeName], 'readonly');
-      const store = transaction.objectStore(this.storeName);
-      const request = store.getAllKeys();
+      try {
+        const transaction = this.db!.transaction([this.storeName], 'readonly');
+        const store = transaction.objectStore(this.storeName);
+        const request = store.getAllKeys();
 
-      request.onerror = () => reject(request.error);
-      request.onsuccess = () => resolve(request.result as string[]);
+        request.onerror = () => {
+          reject(request.error || new Error('Failed to get all keys from IndexedDB'));
+        };
+
+        request.onsuccess = () => {
+          try {
+            const result = request.result as string[];
+            resolve(Array.isArray(result) ? result : []);
+          } catch {
+            resolve([]);
+          }
+        };
+      } catch {
+        resolve([]);
+      }
     });
   }
 }
@@ -277,6 +501,7 @@ class EnhancedCacheManager {
   private readonly accessOrder: string[] = [];
   private readonly accessCounts: Map<string, number> = new Map();
   private broadcastChannel: BroadcastChannel | null = null;
+  private cleanupTimerId: ReturnType<typeof setInterval> | null = null;
 
   constructor(config: CacheConfig = {}) {
     this.config = {
@@ -324,34 +549,71 @@ class EnhancedCacheManager {
       patterns: [],
     } as PrefetchConfig;
 
-    if (this.config.enableCrossTab && typeof BroadcastChannel !== 'undefined') {
-      this.broadcastChannel = new BroadcastChannel(EnhancedCacheManager.BROADCAST_CHANNEL_NAME);
-      this.broadcastChannel.onmessage = (event) => {
-        const message = event.data as BroadcastMessage;
-        if (message.type === EnhancedCacheManager.INVALIDATE_MESSAGE_TYPE) {
-          this.invalidate(message.key);
-        } else if (message.type === EnhancedCacheManager.UPDATE_MESSAGE_TYPE && message.entry) {
-          this.set(message.key, message.entry.data, 0, message.entry.dependencies);
-        }
-      };
+    if (this.config.enableCrossTab && hasBroadcastChannel()) {
+      try {
+        this.broadcastChannel = new BroadcastChannel(EnhancedCacheManager.BROADCAST_CHANNEL_NAME);
+        this.broadcastChannel.onmessage = (event) => {
+          try {
+            const message = event.data as BroadcastMessage;
+            if (message.type === EnhancedCacheManager.INVALIDATE_MESSAGE_TYPE) {
+              this.invalidate(message.key).catch(() => {
+              });
+            } else if (
+              message.type === EnhancedCacheManager.UPDATE_MESSAGE_TYPE &&
+              message.entry
+            ) {
+              this.set(message.key, message.entry.data, 0, message.entry.dependencies).catch(() => {
+              });
+            }
+          } catch {
+          }
+        };
+      } catch {
+      }
     }
 
-    this.init();
+    this.init().catch(() => {
+    });
   }
 
   private async init(): Promise<void> {
     if (this.config.enablePersistence) {
-      await this.storage.init();
-      const keys = await this.storage.getAllKeys();
-      for (const key of keys) {
-        const entry = await this.storage.get(key);
-        if (entry && entry.expiresAt > Date.now()) {
-          this.cache.set(key, entry);
+      try {
+        await this.storage.init();
+        const keys = await this.storage.getAllKeys();
+        for (const key of keys) {
+          try {
+            const entry = await this.storage.get(key);
+            if (entry && entry.expiresAt > Date.now()) {
+              this.cache.set(key, entry);
+            }
+          } catch {
+          }
         }
+      } catch {
       }
     }
 
-    setInterval(() => this.cleanup(), EnhancedCacheManager.CLEANUP_INTERVAL);
+    if (hasWindow() && typeof setInterval === 'function') {
+      this.cleanupTimerId = setInterval(() => {
+        this.cleanup().catch(() => {
+        });
+      }, EnhancedCacheManager.CLEANUP_INTERVAL);
+    }
+  }
+
+  destroy(): void {
+    if (this.cleanupTimerId !== null) {
+      clearInterval(this.cleanupTimerId);
+      this.cleanupTimerId = null;
+    }
+    if (this.broadcastChannel) {
+      try {
+        this.broadcastChannel.close();
+      } catch {
+      }
+      this.broadcastChannel = null;
+    }
   }
 
   private generateKey(baseKey: string): string {
@@ -372,16 +634,26 @@ class EnhancedCacheManager {
   }
 
   async get<T>(key: string): Promise<T | null> {
+    const validatedKey = validateKey(key);
+    if (!validatedKey) {
+      this.metrics.misses++;
+      this.updateMetrics();
+      return null;
+    }
+
     const startTime = Date.now();
-    const fullKey = this.generateKey(key);
+    const fullKey = this.generateKey(validatedKey);
 
     let entry = this.cache.get(fullKey);
 
     if (!entry && this.config.enablePersistence) {
-      const persistedEntry = await this.storage.get(fullKey);
-      if (persistedEntry) {
-        entry = persistedEntry;
-        this.cache.set(fullKey, entry);
+      try {
+        const persistedEntry = await this.storage.get(fullKey);
+        if (persistedEntry) {
+          entry = persistedEntry;
+          this.cache.set(fullKey, entry);
+        }
+      } catch {
       }
     }
 
@@ -394,7 +666,10 @@ class EnhancedCacheManager {
     if (entry.expiresAt <= Date.now()) {
       this.cache.delete(fullKey);
       if (this.config.enablePersistence) {
-        await this.storage.delete(fullKey);
+        try {
+          await this.storage.delete(fullKey);
+        } catch {
+        }
       }
       this.metrics.misses++;
       this.updateMetrics();
@@ -402,7 +677,10 @@ class EnhancedCacheManager {
     }
 
     if (this.config.enableVersioning && entry.version !== this.config.version) {
-      this.invalidate(fullKey);
+      try {
+        await this.invalidate(fullKey);
+      } catch {
+      }
       this.metrics.misses++;
       this.updateMetrics();
       return null;
@@ -424,14 +702,32 @@ class EnhancedCacheManager {
     this.metrics.hits++;
     const accessTime = Date.now() - startTime;
     this.metrics.performance.averageAccessTime =
-      (this.metrics.performance.averageAccessTime * (this.metrics.hits - 1) + accessTime) / this.metrics.hits;
+      (this.metrics.performance.averageAccessTime * (this.metrics.hits - 1) + accessTime) /
+      this.metrics.hits;
     this.updateMetrics();
 
     return data as T;
   }
 
-  async set<T>(key: string, data: T, ttl: number = 0, dependencies?: readonly string[]): Promise<void> {
-    const fullKey = this.generateKey(key);
+  async set<T>(
+    key: string,
+    data: T,
+    ttl: number = 0,
+    dependencies?: readonly string[],
+  ): Promise<void> {
+    const validatedKey = validateKey(key);
+    if (!validatedKey) {
+      return;
+    }
+
+    const fullKey = this.generateKey(validatedKey);
+
+    let serializedSize = 0;
+    try {
+      serializedSize = JSON.stringify(data).length;
+    } catch {
+      serializedSize = 0;
+    }
 
     const entry: MutableCacheEntry<T> = {
       data: data as T,
@@ -439,7 +735,7 @@ class EnhancedCacheManager {
       expiresAt: ttl > 0 ? Date.now() + ttl : Date.now() + EnhancedCacheManager.DEFAULT_TTL,
       accessCount: 0,
       lastAccessed: Date.now(),
-      size: JSON.stringify(data).length,
+      size: serializedSize,
       version: this.config.version,
       compressed: false,
       encrypted: false,
@@ -448,20 +744,29 @@ class EnhancedCacheManager {
       metadata: {},
     };
 
-    await this.evictIfNeeded(entry.size);
+    try {
+      await this.evictIfNeeded(entry.size);
+    } catch {
+    }
 
     this.cache.set(fullKey, entry);
 
     if (this.config.enablePersistence) {
-      await this.storage.set(fullKey, entry);
+      try {
+        await this.storage.set(fullKey, entry);
+      } catch {
+      }
     }
 
     if (this.broadcastChannel) {
-      this.broadcastChannel.postMessage({
-        type: EnhancedCacheManager.UPDATE_MESSAGE_TYPE,
-        key: fullKey,
-        entry,
-      } as BroadcastMessage);
+      try {
+        this.broadcastChannel.postMessage({
+          type: EnhancedCacheManager.UPDATE_MESSAGE_TYPE,
+          key: fullKey,
+          entry,
+        } as BroadcastMessage);
+      } catch {
+      }
     }
 
     this.metrics.totalSize += entry.size;
@@ -470,13 +775,21 @@ class EnhancedCacheManager {
   }
 
   async invalidate(key: string): Promise<void> {
-    const fullKey = this.generateKey(key);
+    const validatedKey = validateKey(key);
+    if (!validatedKey) {
+      return;
+    }
+
+    const fullKey = this.generateKey(validatedKey);
 
     if (this.config.enableMiddleware) {
       for (const mw of this.middleware) {
         if (mw.beforeInvalidate) {
-          if (!mw.beforeInvalidate(fullKey)) {
-            return;
+          try {
+            if (!mw.beforeInvalidate(fullKey)) {
+              return;
+            }
+          } catch {
           }
         }
       }
@@ -489,20 +802,29 @@ class EnhancedCacheManager {
     }
 
     if (this.config.enablePersistence) {
-      await this.storage.delete(fullKey);
+      try {
+        await this.storage.delete(fullKey);
+      } catch {
+      }
     }
 
     if (entry?.dependencies) {
       for (const dep of entry.dependencies) {
-        await this.invalidate(dep);
+        try {
+          await this.invalidate(dep);
+        } catch {
+        }
       }
     }
 
     if (this.broadcastChannel) {
-      this.broadcastChannel.postMessage({
-        type: EnhancedCacheManager.INVALIDATE_MESSAGE_TYPE,
-        key: fullKey,
-      } as BroadcastMessage);
+      try {
+        this.broadcastChannel.postMessage({
+          type: EnhancedCacheManager.INVALIDATE_MESSAGE_TYPE,
+          key: fullKey,
+        } as BroadcastMessage);
+      } catch {
+      }
     }
 
     this.metrics.invalidations++;
@@ -511,7 +833,10 @@ class EnhancedCacheManager {
     if (this.config.enableMiddleware) {
       for (const mw of this.middleware) {
         if (mw.afterInvalidate) {
-          mw.afterInvalidate(fullKey);
+          try {
+            mw.afterInvalidate(fullKey);
+          } catch {
+          }
         }
       }
     }
@@ -548,7 +873,9 @@ class EnhancedCacheManager {
       case 'lfu': {
         const sorted = Array.from(this.accessCounts.entries()).sort((a, b) => a[1] - b[1]);
         for (const [key] of sorted) {
-          if (remainingSize <= this.config.maxCacheSize) break;
+          if (remainingSize <= this.config.maxCacheSize) {
+            break;
+          }
           toEvict.push(key);
           const entry = this.cache.get(key);
           if (entry) {
@@ -558,9 +885,13 @@ class EnhancedCacheManager {
         break;
       }
       case 'fifo': {
-        const entries = Array.from(this.cache.entries()).sort((a, b) => a[1].timestamp - b[1].timestamp);
+        const entries = Array.from(this.cache.entries()).sort(
+          (a, b) => a[1].timestamp - b[1].timestamp,
+        );
         for (const [key] of entries) {
-          if (remainingSize <= this.config.maxCacheSize) break;
+          if (remainingSize <= this.config.maxCacheSize) {
+            break;
+          }
           toEvict.push(key);
           const entry = this.cache.get(key);
           if (entry) {
@@ -584,9 +915,14 @@ class EnhancedCacheManager {
           const sorted = Array.from(this.cache.entries())
             .sort((a, b) => a[1].timestamp - b[1].timestamp)
             .map(([k]) => k);
-          const needed = Math.ceil((remainingSize - this.config.maxCacheSize) / EnhancedCacheManager.MILLISECONDS_PER_SECOND);
+          const needed = Math.ceil(
+            (remainingSize - this.config.maxCacheSize) /
+              EnhancedCacheManager.MILLISECONDS_PER_SECOND,
+          );
           for (const key of sorted.slice(0, needed)) {
-            if (remainingSize <= this.config.maxCacheSize) break;
+            if (remainingSize <= this.config.maxCacheSize) {
+              break;
+            }
             toEvict.push(key);
             const entry = this.cache.get(key);
             if (entry) {
@@ -603,13 +939,15 @@ class EnhancedCacheManager {
       if (entry) {
         this.cache.delete(key);
         if (this.config.enablePersistence) {
-          await this.storage.delete(key);
+          try {
+            await this.storage.delete(key);
+          } catch {
+          }
         }
         this.metrics.evictions++;
       }
     }
   }
-
 
   private async cleanup(): Promise<void> {
     const now = Date.now();
@@ -622,7 +960,10 @@ class EnhancedCacheManager {
     }
 
     for (const key of toDelete) {
-      await this.invalidate(key);
+      try {
+        await this.invalidate(key);
+      } catch {
+      }
     }
   }
 
@@ -631,11 +972,14 @@ class EnhancedCacheManager {
     this.metrics.hitRate = total > 0 ? this.metrics.hits / total : 0;
   }
 
-
   private generateSessionId(): string {
-    return `${EnhancedCacheManager.SESSION_ID_PREFIX}${Date.now()}${EnhancedCacheManager.KEY_SEPARATOR}${Math.random().toString(EnhancedCacheManager.ID_RADIX).substring(EnhancedCacheManager.ID_SUBSTRING_START, EnhancedCacheManager.ID_SUBSTRING_START + EnhancedCacheManager.ID_SUBSTRING_LENGTH)}`;
+    return `${EnhancedCacheManager.SESSION_ID_PREFIX}${Date.now()}${EnhancedCacheManager.KEY_SEPARATOR}${Math.random()
+      .toString(EnhancedCacheManager.ID_RADIX)
+      .substring(
+        EnhancedCacheManager.ID_SUBSTRING_START,
+        EnhancedCacheManager.ID_SUBSTRING_START + EnhancedCacheManager.ID_SUBSTRING_LENGTH,
+      )}`;
   }
-
 
   getCacheConfig(): Readonly<Required<CacheConfig>> {
     return this.config;
@@ -644,7 +988,10 @@ class EnhancedCacheManager {
   async clear(): Promise<void> {
     this.cache.clear();
     if (this.config.enablePersistence) {
-      await this.storage.clear();
+      try {
+        await this.storage.clear();
+      } catch {
+      }
     }
     this.metrics.hits = 0;
     this.metrics.misses = 0;
@@ -676,14 +1023,12 @@ function getCacheManager(): EnhancedCacheManager {
   return cacheManager;
 }
 
-// Optimized cache TTLs to reduce Edge Function invocations
-// Increased TTLs for data that doesn't change frequently
 const CACHE_TTL = {
-  STORE: 15 * 60 * 1000, // 15 minutes (was 10) - store data rarely changes
-  QUOTA: 2 * 60 * 1000, // 2 minutes (was 1) - quota updates less frequently
-  PLANS: 60 * 60 * 1000, // 1 hour - plans rarely change
-  POSTS: 2 * 60 * 1000, // 2 minutes (was 30s) - posts don't change that often
-  ANALYTICS: 10 * 60 * 1000, // 10 minutes (was 5) - analytics can be cached longer
+  STORE: 15 * 60 * 1000,
+  QUOTA: 2 * 60 * 1000,
+  PLANS: 60 * 60 * 1000,
+  POSTS: 2 * 60 * 1000,
+  ANALYTICS: 10 * 60 * 1000,
 } as const;
 
 export const queryKeys = {
@@ -698,7 +1043,14 @@ export const queryKeys = {
 };
 
 function buildCacheKey(keys: readonly unknown[]): string {
-  return keys.join(':');
+  if (!Array.isArray(keys) || keys.length === 0) {
+    return '';
+  }
+  try {
+    return keys.map((k) => String(k)).join(':');
+  } catch {
+    return '';
+  }
 }
 
 async function getCachedData<T>(
@@ -708,34 +1060,63 @@ async function getCachedData<T>(
   ttl: number,
   enableSWR: boolean,
 ): Promise<T> {
-  const cached = await cacheManager.get<T>(key);
-  if (cached) {
-    if (enableSWR) {
-      fetcher()
-        .then((data) => {
-          cacheManager.set(key, data, ttl);
-        })
-        .catch(() => {
-        });
-    }
-    return cached;
+  const validatedKey = validateKey(key);
+  if (!validatedKey) {
+    return await fetcher();
   }
-  const data = await fetcher();
-  await cacheManager.set(key, data, ttl);
-  return data;
+
+  try {
+    const cached = await cacheManager.get<T>(validatedKey);
+    if (cached !== null) {
+      if (enableSWR) {
+        fetcher()
+          .then((data) => {
+            cacheManager.set(validatedKey, data, ttl).catch(() => {
+            });
+          })
+          .catch(() => {
+          });
+      }
+      return cached;
+    }
+  } catch {
+  }
+
+  try {
+    const data = await fetcher();
+    await cacheManager.set(validatedKey, data, ttl);
+    return data;
+  } catch (error) {
+    throw error;
+  }
+}
+
+interface CachedQueryOptions {
+  readonly refetchInterval?: number;
+  readonly enabled?: boolean;
 }
 
 function createCachedQuery<T>(
   queryKey: readonly unknown[],
   fetcher: () => Promise<T>,
   ttl: number,
-  options?: { readonly refetchInterval?: number; readonly enabled?: boolean },
-) {
+  options?: CachedQueryOptions,
+): UseQueryResult<T, Error> {
   const cacheManager = getCacheManager();
   const config = cacheManager.getCacheConfig();
 
-  // Extract enabled from options to ensure it's properly set
   const enabled = options?.enabled ?? true;
+
+  const isQueryEnabled = (query: QueryWithState): boolean => {
+    if (!enabled || query.state.status === 'error') {
+      return false;
+    }
+    const identifier = query.queryKey[1];
+    if (typeof identifier === 'string' && identifier.length === 0) {
+      return false;
+    }
+    return true;
+  };
 
   return useQuery({
     queryKey,
@@ -745,22 +1126,9 @@ function createCachedQuery<T>(
     staleTime: ttl,
     gcTime: ttl * 2,
     enabled,
-    // Make refetchInterval a function that respects the enabled state dynamically
-    // React Query will call this function and check if the query is enabled before refetching
-    // The query object passed to this function has the current query state
     refetchInterval: options?.refetchInterval
-      ? (query) => {
-          // Only refetch if the query is currently enabled
-          // Check query.isEnabled which reflects the current enabled state (not the closure variable)
-          // Also skip if query is in error state or currently fetching
-          if (query.state.status === 'error' || (query as any).isFetching) {
-            return false;
-          }
-          // Additional safety: check if queryKey contains an empty string (for storeId/shopDomain-based queries)
-          // The queryKey structure is: ['quota', storeId], ['posts', storeId, ...], ['analytics', storeId, ...], or ['store', shopDomain]
-          // The identifier is always at index 1
-          const identifier = query.queryKey[1];
-          if (typeof identifier === 'string' && identifier === '') {
+      ? (query: QueryWithState) => {
+          if (!isQueryEnabled(query)) {
             return false;
           }
           return options.refetchInterval!;
@@ -769,86 +1137,113 @@ function createCachedQuery<T>(
   });
 }
 
-export function useStore(shopDomain: string) {
-  // NOTE: Store data drives routing guards (SetupGuard) so it must respect React Query invalidation/refetch.
-  // We intentionally do NOT use the persistent EnhancedCacheManager layer for this query.
+const isWrappedResponse = (result: unknown): result is { data: unknown } => {
+  return (
+    result !== null &&
+    typeof result === 'object' &&
+    'data' in result &&
+    !('id' in result) &&
+    !('shop_domain' in result)
+  );
+};
+
+export function useStore(shopDomain: string): UseQueryResult<unknown, Error> {
+  const validatedShopDomain = validateShopDomain(shopDomain);
+  const hasShopDomain = !!validatedShopDomain;
+
   return useQuery({
     queryKey: queryKeys.store(shopDomain),
     queryFn: async () => {
-      if (!shopDomain) {
-        console.warn('[useStore] No shopDomain provided');
+      if (!hasShopDomain) {
         return null;
       }
       try {
-        const result = await storeApi.getStore(shopDomain);
+        const result = await storeApi.getStore(validatedShopDomain!);
 
-        // Safety check: If result appears to be wrapped (has 'data' and 'correlationId' but not 'id'), unwrap it
-        if (result && typeof result === 'object' && 'data' in result && !('id' in result) && !('shop_domain' in result)) {
-          console.warn('[useStore] Detected wrapped response, unwrapping');
-          return (result as { data: unknown }).data as typeof result;
+        if (isWrappedResponse(result)) {
+          return result.data;
         }
 
         return result;
       } catch (error) {
-        console.error('[useStore] Query error:', { shopDomain, error: error instanceof Error ? error.message : String(error) });
         throw error;
       }
     },
     staleTime: CACHE_TTL.STORE,
     gcTime: CACHE_TTL.STORE * 2,
-    enabled: !!shopDomain,
+    enabled: hasShopDomain,
   });
 }
 
-export function useQuotaStatus(storeId: string) {
+export function useQuotaStatus(storeId: string): UseQueryResult<unknown, Error> {
+  const validatedStoreId = validateStoreId(storeId);
+  const hasStoreId = !!validatedStoreId;
+
   return createCachedQuery(
     queryKeys.quota(storeId),
     async () => {
-      // Defensive check: if storeId is empty, return null instead of throwing
-      // This prevents errors during refetchInterval when storeId becomes empty
-      if (!storeId) {
+      if (!hasStoreId) {
         return null;
       }
-      return storeApi.getQuotaStatus(storeId);
+      return storeApi.getQuotaStatus(validatedStoreId!);
     },
     CACHE_TTL.QUOTA,
     {
-      refetchInterval: CACHE_TTL.QUOTA * 2, // Reduce polling frequency (refetch every 4 minutes instead of 2)
-      enabled: !!storeId, // Only fetch if storeId is provided
+      refetchInterval: CACHE_TTL.QUOTA * 2,
+      enabled: hasStoreId,
     },
   );
 }
 
-export function usePosts(storeId: string, filters?: { readonly status?: string }) {
+export function usePosts(
+  storeId: string,
+  filters?: { readonly status?: string },
+): UseQueryResult<readonly BlogPost[], Error> {
+  const validatedStoreId = validateStoreId(storeId);
+  const hasStoreId = !!validatedStoreId;
+
   return createCachedQuery(
     queryKeys.posts(storeId, filters),
     async () => {
-      // Defensive check: if storeId is empty, return empty array instead of throwing
-      // This prevents errors during refetchInterval when storeId becomes empty
-      if (!storeId) {
+      if (!hasStoreId) {
         return [];
       }
-      return postsApi.list(storeId, filters);
+      return postsApi.list(validatedStoreId!, filters);
     },
     CACHE_TTL.POSTS,
-    { enabled: !!storeId }, // Only fetch if storeId is provided
+    { enabled: hasStoreId },
   );
 }
 
+interface UpdatePostParams {
+  readonly postId: string;
+  readonly updates: Partial<BlogPost>;
+}
 
-export function useUpdatePost() {
+export function useUpdatePost(): UseMutationResult<BlogPost, Error, UpdatePostParams> {
   const queryClient = useQueryClient();
   const cacheManager = getCacheManager();
 
   return useMutation({
-    mutationFn: ({ postId, updates }: { readonly postId: string; readonly updates: Partial<BlogPost> }) =>
-      postsApi.update(postId, updates),
-    onSuccess: async (data: BlogPost) => {
-      queryClient.invalidateQueries({ queryKey: queryKeys.post(data.id) });
-      queryClient.invalidateQueries({ queryKey: ['posts'] });
+    mutationFn: async ({ postId, updates }: UpdatePostParams): Promise<BlogPost> => {
+      const validatedPostId = validatePostId(postId);
+      if (!validatedPostId) {
+        throw new Error('Invalid post ID');
+      }
 
-      await cacheManager.set(buildCacheKey(queryKeys.post(data.id)), data, CACHE_TTL.POSTS);
+      try {
+        return await postsApi.update(validatedPostId, updates);
+      } catch (error) {
+        throw error;
+      }
+    },
+    onSuccess: async (data: BlogPost) => {
+      try {
+        queryClient.invalidateQueries({ queryKey: queryKeys.post(data.id) });
+        queryClient.invalidateQueries({ queryKey: ['posts'] });
+        await cacheManager.set(buildCacheKey(queryKeys.post(data.id)), data, CACHE_TTL.POSTS);
+      } catch {
+      }
     },
   });
 }
-

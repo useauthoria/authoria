@@ -1,4 +1,4 @@
-import { retry, RetryOptions } from './error-handling';
+import { retry, RetryOptions } from './error-handling.ts';
 
 export enum DatabaseErrorType {
   VALIDATION_ERROR = 'VALIDATION_ERROR',
@@ -22,7 +22,7 @@ export class DatabaseError extends Error {
 }
 
 interface SupabaseQuery {
-  select: (fields: string, options?: { count?: string; head?: boolean }) => Promise<{ data: unknown[] | null; error: unknown; count?: number | null }> | SupabaseQuery;
+  select: (fields?: string, options?: { count?: string; head?: boolean }) => SupabaseQuery | Promise<{ data: unknown[] | null; error: unknown; count?: number | null }>;
   limit: (count: number) => SupabaseQuery;
   order: (field: string, opts: { ascending: boolean }) => SupabaseQuery;
   or: (condition: string) => SupabaseQuery;
@@ -35,6 +35,10 @@ interface SupabaseQuery {
   like: (key: string, pattern: string) => SupabaseQuery;
   ilike: (key: string, pattern: string) => SupabaseQuery;
   range: (from: number, to: number) => Promise<{ data: unknown[] | null; error: unknown }>;
+  update: (data: unknown) => SupabaseQuery;
+  insert: (data: unknown) => SupabaseQuery;
+  upsert: (data: unknown) => SupabaseQuery;
+  delete: () => SupabaseQuery;
   toString?: () => string;
 }
 
@@ -61,11 +65,17 @@ export interface BatchContext {
   readonly completed: ReadonlySet<string>;
 }
 
+interface MutableBatchContext {
+  results: Map<string, unknown>;
+  errors: Map<string, Error>;
+  completed: Set<string>;
+}
+
 export interface BatchResult {
   readonly success: boolean;
   readonly results?: readonly unknown[];
   readonly mappedResults?: ReadonlyMap<string, unknown>;
-  readonly errors?: readonly Array<{ readonly operation: number; readonly operationId?: string; readonly error: string; readonly type: string }>;
+  readonly errors?: ReadonlyArray<{ readonly operation: number; readonly operationId?: string; readonly error: string; readonly type: string }>;
   readonly progress?: BatchProgress;
   readonly rollbackData?: readonly unknown[];
 }
@@ -100,7 +110,127 @@ interface BatchOperationWithId extends BatchOperation<unknown> {
   readonly priority: number;
 }
 
+type LogLevel = 'info' | 'warn' | 'error';
+
+const structuredLog = (
+  level: LogLevel,
+  service: string,
+  message: string,
+  context?: Readonly<Record<string, unknown>>,
+): void => {
+  const payload = JSON.stringify({
+    level,
+    service,
+    message,
+    timestamp: new Date().toISOString(),
+    ...context,
+  });
+
+  if (typeof globalThis === 'undefined' || !('Deno' in globalThis)) {
+    return;
+  }
+
+  const encoder = new TextEncoder();
+  const deno = globalThis as unknown as { Deno: { stderr: { writeSync: (data: Uint8Array) => void }; stdout: { writeSync: (data: Uint8Array) => void } } };
+  
+  if (level === 'error') {
+    deno.Deno.stderr.writeSync(encoder.encode(payload + '\n'));
+    return;
+  }
+
+  deno.Deno.stdout.writeSync(encoder.encode(payload + '\n'));
+};
+
+const generateCorrelationId = (): string => {
+  return `batch_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
+};
+
+const validateTableName = (table: string): void => {
+  if (!table || typeof table !== 'string' || table.trim().length === 0) {
+    throw new DatabaseError(
+      DatabaseErrorType.VALIDATION_ERROR,
+      'Invalid table name: must be a non-empty string',
+    );
+  }
+  if (table.length > 100) {
+    throw new DatabaseError(
+      DatabaseErrorType.VALIDATION_ERROR,
+      'Invalid table name: exceeds maximum length',
+    );
+  }
+  if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(table)) {
+    throw new DatabaseError(
+      DatabaseErrorType.VALIDATION_ERROR,
+      'Invalid table name: must match pattern',
+    );
+  }
+};
+
+const validateOperationId = (id: string): void => {
+  if (!id || typeof id !== 'string' || id.trim().length === 0) {
+    throw new DatabaseError(
+      DatabaseErrorType.VALIDATION_ERROR,
+      'Invalid operation ID: must be a non-empty string',
+    );
+  }
+  if (id.length > 100) {
+    throw new DatabaseError(
+      DatabaseErrorType.VALIDATION_ERROR,
+      'Invalid operation ID: exceeds maximum length',
+    );
+  }
+};
+
+const validateFilter = (filter: Readonly<Record<string, unknown>>): void => {
+  if (!filter || typeof filter !== 'object') {
+    throw new DatabaseError(
+      DatabaseErrorType.VALIDATION_ERROR,
+      'Invalid filter: must be an object',
+    );
+  }
+  if (Object.keys(filter).length > 50) {
+    throw new DatabaseError(
+      DatabaseErrorType.VALIDATION_ERROR,
+      'Invalid filter: exceeds maximum key count',
+    );
+  }
+  for (const [key, value] of Object.entries(filter)) {
+    if (typeof key !== 'string' || key.length > 100) {
+      throw new DatabaseError(
+        DatabaseErrorType.VALIDATION_ERROR,
+        'Invalid filter key: must be a string with max length 100',
+      );
+    }
+    if (value !== null && typeof value === 'object' && !Array.isArray(value) && typeof (value as { toISOString?: () => string }).toISOString !== 'function') {
+      throw new DatabaseError(
+        DatabaseErrorType.VALIDATION_ERROR,
+        'Invalid filter value: complex objects not allowed',
+      );
+    }
+  }
+};
+
+const validateDataSize = (data: unknown): void => {
+  const dataStr = JSON.stringify(data);
+  const maxSize = 10 * 1024 * 1024;
+  if (dataStr.length > maxSize) {
+    throw new DatabaseError(
+      DatabaseErrorType.VALIDATION_ERROR,
+      'Invalid data: exceeds maximum size of 10MB',
+    );
+  }
+};
+
+const isOperationType = (type: string): type is BatchOperation<unknown>['type'] => {
+  return ['insert', 'update', 'upsert', 'delete'].includes(type);
+};
+
+const isStrategy = (strategy: string | undefined): strategy is BatchConfig['strategy'] => {
+  return strategy !== undefined && ['sequential', 'parallel', 'smart'].includes(strategy);
+};
+
 export class DatabaseBatch {
+  private static readonly SERVICE_NAME = 'DatabaseBatch';
   private static readonly DEFAULT_MAX_BATCH_SIZE = 1000;
   private static readonly DEFAULT_TIMEOUT = 60000;
   private static readonly DEFAULT_MAX_RETRIES = 3;
@@ -113,14 +243,47 @@ export class DatabaseBatch {
   private static readonly ID_SUBSTRING_START = 2;
   private static readonly ID_SUBSTRING_END = 11;
   private static readonly PERCENTAGE_MULTIPLIER = 100;
+  private static readonly MAX_TABLE_NAME_LENGTH = 100;
+  private static readonly MAX_OPERATION_ID_LENGTH = 100;
+  private static readonly MAX_FILTER_KEYS = 50;
+  private static readonly MAX_DATA_SIZE = 10 * 1024 * 1024;
 
   private readonly supabase: SupabaseClient;
   private readonly operations: BatchOperationWithId[];
   private readonly config: Required<BatchConfig>;
   private readonly progressCallbacks: Array<(progress: BatchProgress) => void>;
   private startTime: number;
+  private correlationId: string;
 
   constructor(supabase: SupabaseClient, config: BatchConfig = {}) {
+    if (!supabase || typeof supabase !== 'object' || typeof supabase.from !== 'function') {
+      throw new DatabaseError(
+        DatabaseErrorType.VALIDATION_ERROR,
+        'Invalid Supabase client: must be a valid client instance',
+      );
+    }
+
+    if (config.maxBatchSize !== undefined && (!Number.isInteger(config.maxBatchSize) || config.maxBatchSize <= 0 || config.maxBatchSize > 10000)) {
+      throw new DatabaseError(
+        DatabaseErrorType.VALIDATION_ERROR,
+        'Invalid maxBatchSize: must be an integer between 1 and 10000',
+      );
+    }
+
+    if (config.timeout !== undefined && (!Number.isInteger(config.timeout) || config.timeout <= 0 || config.timeout > 600000)) {
+      throw new DatabaseError(
+        DatabaseErrorType.VALIDATION_ERROR,
+        'Invalid timeout: must be an integer between 1 and 600000ms',
+      );
+    }
+
+    if (config.strategy !== undefined && !isStrategy(config.strategy)) {
+      throw new DatabaseError(
+        DatabaseErrorType.VALIDATION_ERROR,
+        'Invalid strategy: must be sequential, parallel, or smart',
+      );
+    }
+
     this.supabase = supabase;
     this.operations = [];
     this.config = {
@@ -134,6 +297,7 @@ export class DatabaseBatch {
     };
     this.progressCallbacks = [];
     this.startTime = 0;
+    this.correlationId = generateCorrelationId();
   }
 
   add(operation: BatchOperation<unknown>): void {
@@ -153,37 +317,81 @@ export class DatabaseBatch {
       priority: operation.priority ?? DatabaseBatch.DEFAULT_PRIORITY,
     };
 
+    if (opWithId.id) {
+      validateOperationId(opWithId.id);
+    }
+
     this.operations.push(opWithId);
   }
 
   private validateOperation(operation: BatchOperation<unknown>): void {
-    if (!operation.type || !operation.table) {
+    if (!operation || typeof operation !== 'object') {
       throw new DatabaseError(
         DatabaseErrorType.VALIDATION_ERROR,
-        'Operation must have type and table',
-        { operation },
+        'Invalid operation: must be an object',
       );
     }
+
+    if (!operation.type || !isOperationType(operation.type)) {
+      throw new DatabaseError(
+        DatabaseErrorType.VALIDATION_ERROR,
+        'Invalid operation type: must be insert, update, upsert, or delete',
+      );
+    }
+
+    validateTableName(operation.table);
 
     if ((operation.type === 'insert' || operation.type === 'upsert') && !operation.data) {
       throw new DatabaseError(
         DatabaseErrorType.VALIDATION_ERROR,
         'Insert/upsert operations must have data',
-        { operation },
       );
+    }
+
+    if (operation.data) {
+      validateDataSize(operation.data);
     }
 
     if ((operation.type === 'update' || operation.type === 'delete') && !operation.filter && !operation.data) {
       throw new DatabaseError(
         DatabaseErrorType.VALIDATION_ERROR,
         'Update/delete operations must have filter or data',
-        { operation },
+      );
+    }
+
+    if (operation.filter) {
+      validateFilter(operation.filter);
+    }
+
+    if (operation.id) {
+      validateOperationId(operation.id);
+    }
+
+    if (operation.priority !== undefined && (!Number.isInteger(operation.priority) || operation.priority < 0 || operation.priority > 100)) {
+      throw new DatabaseError(
+        DatabaseErrorType.VALIDATION_ERROR,
+        'Invalid priority: must be an integer between 0 and 100',
+      );
+    }
+
+    if (operation.dependsOn && (!Array.isArray(operation.dependsOn) || operation.dependsOn.length > 100)) {
+      throw new DatabaseError(
+        DatabaseErrorType.VALIDATION_ERROR,
+        'Invalid dependsOn: must be an array with max length 100',
+      );
+    }
+
+    if (operation.select && (typeof operation.select !== 'string' || operation.select.length > 1000)) {
+      throw new DatabaseError(
+        DatabaseErrorType.VALIDATION_ERROR,
+        'Invalid select: must be a string with max length 1000',
       );
     }
   }
 
   async execute(): Promise<BatchResult> {
     this.startTime = Date.now();
+    this.correlationId = generateCorrelationId();
     const results: unknown[] = [];
     const mappedResults = new Map<string, unknown>();
     const errors: Array<{ readonly operation: number; readonly operationId?: string; readonly error: string; readonly type: string }> = [];
@@ -198,11 +406,29 @@ export class DatabaseBatch {
       completed: new Set(),
     };
 
+    structuredLog('info', DatabaseBatch.SERVICE_NAME, 'Batch execution started', {
+      correlationId: this.correlationId,
+      operationCount: this.operations.length,
+      strategy: this.config.strategy,
+      enableTransactions: this.config.enableTransactions,
+      enableRollback: this.config.enableRollback,
+    });
+
     const sortedOperations = this.config.priorityQueue
       ? [...this.operations].sort((a, b) => b.priority - a.priority)
       : this.operations;
 
-    this.validateDependencies(sortedOperations);
+    try {
+      this.validateDependencies(sortedOperations);
+    } catch (error) {
+      const duration = Date.now() - this.startTime;
+      structuredLog('error', DatabaseBatch.SERVICE_NAME, 'Dependency validation failed', {
+        correlationId: this.correlationId,
+        error: error instanceof Error ? error.message : String(error),
+        durationMs: duration,
+      });
+      throw error;
+    }
 
     const grouped = this.groupOperations(sortedOperations);
 
@@ -217,12 +443,24 @@ export class DatabaseBatch {
     try {
       await Promise.race([executePromise, timeoutPromise]);
     } catch (error) {
+      const duration = Date.now() - this.startTime;
       if (error instanceof DatabaseError && error.type === DatabaseErrorType.TIMEOUT) {
+        structuredLog('error', DatabaseBatch.SERVICE_NAME, 'Batch execution timeout', {
+          correlationId: this.correlationId,
+          durationMs: duration,
+          completed: context.completed.size,
+          total: sortedOperations.length,
+        });
         if (this.config.enableRollback && rollbackData.length > 0) {
           await this.rollback(rollbackData);
         }
         throw error;
       }
+      structuredLog('error', DatabaseBatch.SERVICE_NAME, 'Batch execution failed', {
+        correlationId: this.correlationId,
+        error: error instanceof Error ? error.message : String(error),
+        durationMs: duration,
+      });
       throw error;
     }
 
@@ -255,6 +493,16 @@ export class DatabaseBatch {
         callback(progress);
       } catch {
       }
+    });
+
+    const duration = Date.now() - this.startTime;
+    structuredLog('info', DatabaseBatch.SERVICE_NAME, 'Batch execution completed', {
+      correlationId: this.correlationId,
+      success: errors.length === 0,
+      total: sortedOperations.length,
+      completed: context.completed.size,
+      failed: errors.length,
+      durationMs: duration,
     });
 
     return {
@@ -304,7 +552,7 @@ export class DatabaseBatch {
 
   private async executeParallel(
     grouped: Readonly<Record<string, readonly BatchOperationWithId[]>>,
-    context: BatchContext,
+    context: MutableBatchContext,
     rollbackData: RollbackData[],
   ): Promise<void> {
     const allOps: BatchOperationWithId[] = [];
@@ -322,7 +570,7 @@ export class DatabaseBatch {
 
   private async executeSmart(
     grouped: Readonly<Record<string, readonly BatchOperationWithId[]>>,
-    context: BatchContext,
+    context: MutableBatchContext,
     rollbackData: RollbackData[],
   ): Promise<void> {
     for (const [type, ops] of Object.entries(grouped)) {
@@ -347,12 +595,16 @@ export class DatabaseBatch {
 
   private async executeInTransaction(
     grouped: Readonly<Record<string, readonly BatchOperationWithId[]>>,
-    context: BatchContext,
+    context: MutableBatchContext,
     rollbackData: RollbackData[],
   ): Promise<void> {
     try {
       await this.executeSmart(grouped, context, rollbackData);
     } catch (error) {
+      structuredLog('error', DatabaseBatch.SERVICE_NAME, 'Transaction failed, rolling back', {
+        correlationId: this.correlationId,
+        error: error instanceof Error ? error.message : String(error),
+      });
       if (this.config.enableRollback) {
         await this.rollback(rollbackData);
       }
@@ -360,7 +612,7 @@ export class DatabaseBatch {
     }
   }
 
-  private async waitForDependencies(op: BatchOperationWithId, context: BatchContext, maxWait: number = DatabaseBatch.DEFAULT_DEPENDENCY_WAIT): Promise<void> {
+  private async waitForDependencies(op: BatchOperationWithId, context: MutableBatchContext, maxWait: number = DatabaseBatch.DEFAULT_DEPENDENCY_WAIT): Promise<void> {
     if (!op.dependsOn || op.dependsOn.length === 0) {
       return;
     }
@@ -376,8 +628,8 @@ export class DatabaseBatch {
       if (anyFailed) {
         throw new DatabaseError(
           DatabaseErrorType.DEPENDENCY_ERROR,
-          `Operation ${op.id} depends on failed operation`,
-          { operationId: op.id, dependencies: op.dependsOn },
+          `Operation depends on failed operation`,
+          { operationId: op.id },
         );
       }
 
@@ -386,14 +638,14 @@ export class DatabaseBatch {
 
     throw new DatabaseError(
       DatabaseErrorType.TIMEOUT,
-      `Timeout waiting for dependencies: ${op.dependsOn.join(', ')}`,
+      `Timeout waiting for dependencies`,
       { operationId: op.id },
     );
   }
 
   private async executeOperation(
     op: BatchOperationWithId,
-    context: BatchContext,
+    context: MutableBatchContext,
     rollbackData: RollbackData[],
   ): Promise<void> {
     if (op.condition && !op.condition(context)) {
@@ -409,17 +661,59 @@ export class DatabaseBatch {
     }
 
     const executeFn = async () => {
-      const result = await this.executeSingleOperation(op);
-      context.results.set(op.id, result);
-      context.completed.add(op.id);
-      return result;
+      const opStartTime = Date.now();
+      try {
+        const result = await this.executeSingleOperation(op);
+        context.results.set(op.id, result);
+        context.completed.add(op.id);
+        const duration = Date.now() - opStartTime;
+        structuredLog('info', DatabaseBatch.SERVICE_NAME, 'Operation executed', {
+          correlationId: this.correlationId,
+          operationId: op.id,
+          type: op.type,
+          table: op.table,
+          durationMs: duration,
+        });
+        return result;
+      } catch (error) {
+        const duration = Date.now() - opStartTime;
+        structuredLog('error', DatabaseBatch.SERVICE_NAME, 'Operation failed', {
+          correlationId: this.correlationId,
+          operationId: op.id,
+          type: op.type,
+          table: op.table,
+          error: error instanceof Error ? error.message : String(error),
+          durationMs: duration,
+        });
+        throw error;
+      }
     };
 
     try {
       if (op.retry) {
-        await retry(executeFn, op.retry);
+        await retry(executeFn, {
+          ...op.retry,
+          onRetry: (attempt, err) => {
+            structuredLog('warn', DatabaseBatch.SERVICE_NAME, 'Retrying operation', {
+              correlationId: this.correlationId,
+              operationId: op.id,
+              attempt,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          },
+        });
       } else if (this.config.retryOptions) {
-        await retry(executeFn, this.config.retryOptions);
+        await retry(executeFn, {
+          ...this.config.retryOptions,
+          onRetry: (attempt, err) => {
+            structuredLog('warn', DatabaseBatch.SERVICE_NAME, 'Retrying operation', {
+              correlationId: this.correlationId,
+              operationId: op.id,
+              attempt,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          },
+        });
       } else {
         await executeFn();
       }
@@ -433,13 +727,13 @@ export class DatabaseBatch {
   private async getRollbackData(op: BatchOperationWithId): Promise<RollbackData | null> {
     if (op.type === 'update' || op.type === 'delete') {
       try {
-        let query = this.supabase.from(op.table).select('*');
+        let query = this.supabase.from(op.table).select('*') as SupabaseQuery;
         if (op.filter) {
           Object.entries(op.filter).forEach(([key, value]) => {
             query = query.eq(key, value);
           });
         }
-        const result = await query.select('*') as { data: unknown[] | null };
+        const result = await (query.select('*') as Promise<{ data: unknown[] | null }>);
         return { operationId: op.id, type: op.type, table: op.table, data: result.data || [] };
       } catch {
         return null;
@@ -449,6 +743,11 @@ export class DatabaseBatch {
   }
 
   private async rollback(rollbackData: ReadonlyArray<RollbackData>): Promise<void> {
+    structuredLog('info', DatabaseBatch.SERVICE_NAME, 'Starting rollback', {
+      correlationId: this.correlationId,
+      rollbackCount: rollbackData.length,
+    });
+
     for (let i = rollbackData.length - 1; i >= 0; i--) {
       const rollback = rollbackData[i];
       try {
@@ -462,9 +761,19 @@ export class DatabaseBatch {
             await this.supabase.from(rollback.table).insert(rollback.data);
           }
         }
-      } catch {
+      } catch (error) {
+        structuredLog('error', DatabaseBatch.SERVICE_NAME, 'Rollback operation failed', {
+          correlationId: this.correlationId,
+          operationId: rollback.operationId,
+          table: rollback.table,
+          error: error instanceof Error ? error.message : String(error),
+        });
       }
     }
+
+    structuredLog('info', DatabaseBatch.SERVICE_NAME, 'Rollback completed', {
+      correlationId: this.correlationId,
+    });
   }
 
   private async executeSingleOperation(op: BatchOperationWithId): Promise<unknown> {
@@ -480,8 +789,8 @@ export class DatabaseBatch {
       default:
         throw new DatabaseError(
           DatabaseErrorType.VALIDATION_ERROR,
-          `Unknown operation type: ${op.type}`,
-          { operation: op },
+          `Unknown operation type`,
+          { operationId: op.id },
         );
     }
   }
@@ -490,10 +799,11 @@ export class DatabaseBatch {
     const data = Array.isArray(op.data) ? op.data : [op.data];
     const result = await this.supabase.from(op.table).insert(data).select(op.select || '*') as { data: unknown[] | null; error: unknown };
     if (result.error) {
+      const errorMessage = result.error instanceof Error ? result.error.message : 'Insert operation failed';
       throw new DatabaseError(
         DatabaseErrorType.QUERY_ERROR,
-        `Insert failed: ${(result.error as Error).message}`,
-        { error: result.error, operation: op },
+        errorMessage,
+        { operationId: op.id, table: op.table },
       );
     }
     return result.data;
@@ -503,10 +813,11 @@ export class DatabaseBatch {
     const data = Array.isArray(op.data) ? op.data : [op.data];
     const result = await this.supabase.from(op.table).upsert(data).select(op.select || '*') as { data: unknown[] | null; error: unknown };
     if (result.error) {
+      const errorMessage = result.error instanceof Error ? result.error.message : 'Upsert operation failed';
       throw new DatabaseError(
         DatabaseErrorType.QUERY_ERROR,
-        `Upsert failed: ${(result.error as Error).message}`,
-        { error: result.error, operation: op },
+        errorMessage,
+        { operationId: op.id, table: op.table },
       );
     }
     return result.data;
@@ -522,17 +833,18 @@ export class DatabaseBatch {
     }
 
     if (op.select) {
-      query = query.select(op.select);
+      query = query.select(op.select) as SupabaseQuery;
     } else {
-      query = query.select();
+      query = query.select() as SupabaseQuery;
     }
 
-    const result = await query.select() as { data: unknown[] | null; error: unknown };
+    const result = await (query.select() as Promise<{ data: unknown[] | null; error: unknown }>);
     if (result.error) {
+      const errorMessage = result.error instanceof Error ? result.error.message : 'Update operation failed';
       throw new DatabaseError(
         DatabaseErrorType.QUERY_ERROR,
-        `Update failed: ${(result.error as Error).message}`,
-        { error: result.error, operation: op },
+        errorMessage,
+        { operationId: op.id, table: op.table },
       );
     }
     return result.data;
@@ -547,12 +859,13 @@ export class DatabaseBatch {
       });
     }
 
-    const result = await query.select() as { data: unknown[] | null; error: unknown };
+    const result = await (query.select() as Promise<{ data: unknown[] | null; error: unknown }>);
     if (result.error) {
+      const errorMessage = result.error instanceof Error ? result.error.message : 'Delete operation failed';
       throw new DatabaseError(
         DatabaseErrorType.QUERY_ERROR,
-        `Delete failed: ${(result.error as Error).message}`,
-        { error: result.error, operation: op },
+        errorMessage,
+        { operationId: op.id, table: op.table },
       );
     }
     return result.data;
@@ -567,8 +880,8 @@ export class DatabaseBatch {
           if (!operationIds.has(depId)) {
             throw new DatabaseError(
               DatabaseErrorType.DEPENDENCY_ERROR,
-              `Operation ${op.id} depends on non-existent operation: ${depId}`,
-              { operationId: op.id, dependency: depId },
+              `Operation depends on non-existent operation`,
+              { operationId: op.id },
             );
           }
         }
@@ -582,7 +895,7 @@ export class DatabaseBatch {
       if (visiting.has(opId)) {
         throw new DatabaseError(
           DatabaseErrorType.DEPENDENCY_ERROR,
-          `Circular dependency detected: ${opId}`,
+          `Circular dependency detected`,
           { operationId: opId },
         );
       }
@@ -624,7 +937,7 @@ export class DatabaseBatch {
   private async executeGroup(
     type: BatchOperation<unknown>['type'],
     operations: ReadonlyArray<BatchOperationWithId>,
-    context: BatchContext,
+    context: MutableBatchContext,
     rollbackData: RollbackData[],
   ): Promise<void> {
     if (type === 'insert' || type === 'upsert') {
@@ -645,10 +958,11 @@ export class DatabaseBatch {
 
         const resultData = result as { data: unknown[] | null; error: unknown };
         if (resultData.error) {
+          const errorMessage = resultData.error instanceof Error ? resultData.error.message : `Batch ${type} operation failed`;
           throw new DatabaseError(
             DatabaseErrorType.QUERY_ERROR,
-            `Batch ${type} failed: ${(resultData.error as Error).message}`,
-            { error: resultData.error },
+            errorMessage,
+            { table: operations[0].table },
           );
         }
 
@@ -687,6 +1001,12 @@ export class DatabaseBatch {
   }
 
   onProgress(callback: (progress: BatchProgress) => void): () => void {
+    if (typeof callback !== 'function') {
+      throw new DatabaseError(
+        DatabaseErrorType.VALIDATION_ERROR,
+        'Invalid callback: must be a function',
+      );
+    }
     this.progressCallbacks.push(callback);
     return () => {
       const index = this.progressCallbacks.indexOf(callback);
@@ -737,4 +1057,3 @@ export class DatabaseBatch {
     };
   }
 }
-

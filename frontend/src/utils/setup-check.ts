@@ -1,51 +1,64 @@
-/**
- * Utility to check if store setup is complete
- * Setup is considered complete when frequency_settings has been properly configured
- * (not just the default value)
- */
-
-export interface Store {
-  id?: string;
-  frequency_settings?: {
-    interval?: string;
-    count?: number;
-    preferredDays?: number[];
-    preferredTimes?: string[];
-  } | null;
+interface FrequencySettings {
+  readonly interval?: string;
+  readonly count?: number;
+  readonly preferredDays?: readonly number[] | number[];
+  readonly preferredTimes?: readonly string[] | string[];
 }
 
-/**
- * Check if setup is complete by verifying frequency_settings has been configured
- * Setup is complete if:
- * 1. frequency_settings exists
- * 2. preferredDays array exists and has at least 1 day selected
- * 3. preferredTimes array exists and has at least 1 time
- */
-export function isSetupComplete(store: Store | null | undefined): boolean {
-  if (!store) {
+interface StoreWithFrequencySettings {
+  readonly frequency_settings?: FrequencySettings | null;
+}
+
+function isValidDayIndex(day: unknown): day is number {
+  return Number.isInteger(day) && typeof day === 'number' && day >= 0 && day <= 6;
+}
+
+function isValidDayArray(days: unknown): days is readonly number[] | number[] {
+  if (!Array.isArray(days) || days.length === 0) {
+    return false;
+  }
+  return days.every(isValidDayIndex);
+}
+
+function isValidTimeString(time: unknown): time is string {
+  return typeof time === 'string' && time.trim().length > 0;
+}
+
+function isValidTimeArray(times: unknown): times is readonly string[] | string[] {
+  if (!Array.isArray(times) || times.length === 0) {
+    return false;
+  }
+  return times.every(isValidTimeString);
+}
+
+function isValidFrequencySettings(value: unknown): value is FrequencySettings {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+
+  const settings = value as Record<string, unknown>;
+
+  if (!('preferredDays' in settings) || !isValidDayArray(settings.preferredDays)) {
+    return false;
+  }
+
+  if (!('preferredTimes' in settings) || !isValidTimeArray(settings.preferredTimes)) {
+    return false;
+  }
+
+  return true;
+}
+
+export function isSetupComplete(store: StoreWithFrequencySettings | null | undefined): boolean {
+  if (!store || typeof store !== 'object') {
     return false;
   }
 
   const frequencySettings = store.frequency_settings;
-  
-  // If no frequency_settings, setup is not complete
-  if (!frequencySettings || typeof frequencySettings !== 'object') {
+
+  if (frequencySettings === null || frequencySettings === undefined) {
     return false;
   }
 
-  // Check if preferredDays is configured (not just default)
-  const preferredDays = frequencySettings.preferredDays;
-  if (!Array.isArray(preferredDays) || preferredDays.length === 0) {
-    return false;
-  }
-
-  // Check if preferredTimes is configured
-  const preferredTimes = frequencySettings.preferredTimes;
-  if (!Array.isArray(preferredTimes) || preferredTimes.length === 0) {
-    return false;
-  }
-
-  // Setup is complete if we have both days and times configured
-  return true;
+  return isValidFrequencySettings(frequencySettings);
 }
-

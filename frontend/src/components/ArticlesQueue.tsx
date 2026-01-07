@@ -1,269 +1,387 @@
-import { useState, useCallback, useEffect, useMemo } from 'react';
+import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { queueApi, type QueuedArticle } from '../lib/api-client';
 import { useAppBridgeToast } from '../hooks/useAppBridge';
 import { formatAPIErrorMessage } from '../utils/error-messages';
 
 interface ArticlesQueueProps {
-  storeId: string;
-  onArticleClick?: (article: QueuedArticle) => void;
-  showTitle?: boolean;
-  maxItems?: number;
-  selectedDays?: Set<number>; // Day indices: Mon=0, Tue=1, ..., Sun=6
-  publishTime?: string; // Format: "HH:mm"
+  readonly storeId: string;
+  readonly onArticleClick?: (article: QueuedArticle) => void;
+  readonly showTitle?: boolean;
+  readonly maxItems?: number;
+  readonly selectedDays?: ReadonlySet<number>;
+  readonly publishTime?: string;
 }
 
-// Convert our day index (Mon=0, ..., Sun=6) to JS Date.getDay() format (Sun=0, Mon=1, ..., Sat=6)
+const DEFAULT_PUBLISH_TIME = '14:00';
+const REFETCH_INTERVAL_MS = 30000;
+const AUTO_REFILL_DELAY_MS = 2000;
+const DRAG_RESET_DELAY_MS = 0;
+const MAX_DATE_CALCULATION_ATTEMPTS = 100;
+const SUNDAY_INDEX = 6;
+const MINUTES_PER_HOUR = 60;
+const MILLISECONDS_PER_DAY = 86400000;
+
+const QUERY_KEYS = {
+  queue: (storeId: string) => ['queue', storeId] as const,
+  queueMetrics: (storeId: string) => ['queue-metrics', storeId] as const,
+} as const;
+
 function dayIndexToJsDay(index: number): number {
-  return index === 6 ? 0 : index + 1;
+  if (index < 0 || index > 6) {
+    throw new Error(`Invalid day index: ${index}. Must be between 0 and 6.`);
+  }
+  return index === SUNDAY_INDEX ? 0 : index + 1;
 }
 
-// Calculate the next publishing dates based on selected days and publish time
+function validatePublishTime(publishTime: string): void {
+  const timePattern = /^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/;
+  if (!timePattern.test(publishTime)) {
+    throw new Error(`Invalid publish time format: ${publishTime}. Expected format: HH:mm`);
+  }
+}
+
+function parsePublishTime(publishTime: string): readonly [number, number] {
+  validatePublishTime(publishTime);
+  const parts = publishTime.split(':');
+  const hours = Number.parseInt(parts[0] || '0', 10);
+  const minutes = Number.parseInt(parts[1] || '0', 10);
+  if (
+    !Number.isInteger(hours) ||
+    hours < 0 ||
+    hours >= 24 ||
+    !Number.isInteger(minutes) ||
+    minutes < 0 ||
+    minutes >= MINUTES_PER_HOUR
+  ) {
+    throw new Error(`Invalid publish time values: ${publishTime}`);
+  }
+  return [hours, minutes] as const;
+}
+
 function calculateNextPublishingDates(
-  selectedDays: Set<number>,
+  selectedDays: ReadonlySet<number>,
   publishTime: string,
-  count: number
-): Date[] {
-  if (selectedDays.size === 0 || count === 0) return [];
-  
+  count: number,
+): readonly Date[] {
+  if (selectedDays.size === 0 || count <= 0) {
+    return [];
+  }
+
   const dates: Date[] = [];
   const now = new Date();
-  const [hours, minutes] = publishTime.split(':').map(Number);
-  
-  // Convert selected day indices to JS day format
-  const jsDays = Array.from(selectedDays).map(dayIndexToJsDay).sort((a, b) => a - b);
-  
-  // Start from today
+  const [hours, minutes] = parsePublishTime(publishTime);
+
+  const jsDays = Array.from(selectedDays)
+    .map((day) => dayIndexToJsDay(day))
+    .sort((a, b) => a - b);
+
   let currentDate = new Date(now);
   currentDate.setHours(hours, minutes, 0, 0);
-  
-  // If current time has passed today, start from tomorrow
+
   if (currentDate <= now) {
-    currentDate.setDate(currentDate.getDate() + 1);
+    currentDate.setTime(currentDate.getTime() + MILLISECONDS_PER_DAY);
   }
-  
-  // Find the next occurrence of each selected day
+
   let attempts = 0;
-  const maxAttempts = 100; // Safety limit to prevent infinite loops
-  
-  while (dates.length < count && attempts < maxAttempts) {
+
+  while (dates.length < count && attempts < MAX_DATE_CALCULATION_ATTEMPTS) {
     const currentDay = currentDate.getDay();
-    
-    // Check if current day is in selected days
+
     if (jsDays.includes(currentDay)) {
       dates.push(new Date(currentDate));
     }
-    
-    // Move to next day
-    currentDate.setDate(currentDate.getDate() + 1);
+
+    currentDate.setTime(currentDate.getTime() + MILLISECONDS_PER_DAY);
     attempts++;
   }
-  
+
   return dates.slice(0, count);
 }
 
 function formatDate(date: Date): string {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
+
   const tomorrow = new Date(today);
-  tomorrow.setDate(tomorrow.getDate() + 1);
-  
+  tomorrow.setTime(tomorrow.getTime() + MILLISECONDS_PER_DAY);
+
   const dateOnly = new Date(date);
   dateOnly.setHours(0, 0, 0, 0);
-  
-  if (dateOnly.getTime() === today.getTime()) {
+
+  const todayTime = today.getTime();
+  const tomorrowTime = tomorrow.getTime();
+  const dateTime = dateOnly.getTime();
+
+  if (dateTime === todayTime) {
     return 'Today';
-  } else if (dateOnly.getTime() === tomorrow.getTime()) {
+  } else if (dateTime === tomorrowTime) {
     return 'Tomorrow';
   } else {
     return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
   }
 }
 
-export default function ArticlesQueue({ storeId, onArticleClick, showTitle = true, maxItems, selectedDays, publishTime = '14:00' }: ArticlesQueueProps) {
+function validateStoreId(storeId: string): void {
+  if (!storeId || typeof storeId !== 'string' || storeId.trim().length === 0) {
+    throw new Error('Invalid storeId: must be a non-empty string');
+  }
+}
+
+export default function ArticlesQueue({
+  storeId,
+  onArticleClick,
+  showTitle = true,
+  maxItems,
+  selectedDays,
+  publishTime = DEFAULT_PUBLISH_TIME,
+}: ArticlesQueueProps): JSX.Element {
+  validateStoreId(storeId);
+
   const { showToast } = useAppBridgeToast();
   const queryClient = useQueryClient();
+  const isMountedRef = useRef(true);
   const [draggedIndex, setDraggedIndex] = useState<number | null>(null);
   const [dragOverIndex, setDragOverIndex] = useState<number | null>(null);
   const [wasDragging, setWasDragging] = useState(false);
 
-  const { data: queue = [], isLoading, error, refetch } = useQuery({
-    queryKey: ['queue', storeId],
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
+
+  const { data: queue = [], isLoading, error } = useQuery({
+    queryKey: QUERY_KEYS.queue(storeId),
     queryFn: () => queueApi.getQueue(storeId),
-    refetchInterval: 30000, // Refetch every 30 seconds
+    refetchInterval: REFETCH_INTERVAL_MS,
+    enabled: !!storeId,
   });
 
   const { data: metrics } = useQuery({
-    queryKey: ['queue-metrics', storeId],
+    queryKey: QUERY_KEYS.queueMetrics(storeId),
     queryFn: () => queueApi.getMetrics(storeId),
-    refetchInterval: 30000, // Refetch every 30 seconds to ensure queue stays filled
+    refetchInterval: REFETCH_INTERVAL_MS,
+    enabled: !!storeId,
   });
 
-  const displayedQueue = maxItems ? queue.slice(0, maxItems) : queue;
-  
-  // Calculate scheduled dates for articles if schedule settings are provided
+  const displayedQueue = useMemo(() => {
+    return maxItems && maxItems > 0 ? queue.slice(0, maxItems) : queue;
+  }, [queue, maxItems]);
+
   const scheduledDates = useMemo(() => {
-    if (!selectedDays || selectedDays.size === 0) return [];
-    return calculateNextPublishingDates(selectedDays, publishTime, displayedQueue.length);
+    if (!selectedDays || selectedDays.size === 0) {
+      return [];
+    }
+    try {
+      return calculateNextPublishingDates(selectedDays, publishTime, displayedQueue.length);
+    } catch {
+      return [];
+    }
   }, [selectedDays, publishTime, displayedQueue.length]);
 
   const reorderMutation = useMutation({
-    mutationFn: (articleIds: string[]) => queueApi.reorder(storeId, articleIds),
+    mutationFn: (articleIds: readonly string[]) => queueApi.reorder(storeId, [...articleIds]),
     onMutate: async (newArticleIds) => {
-      // Cancel any outgoing refetches
-      await queryClient.cancelQueries({ queryKey: ['queue', storeId] });
+      await queryClient.cancelQueries({ queryKey: QUERY_KEYS.queue(storeId) });
 
-      // Snapshot the previous value
-      const previousQueue = queryClient.getQueryData<QueuedArticle[]>(['queue', storeId]);
+      const previousQueue = queryClient.getQueryData<readonly QueuedArticle[]>(
+        QUERY_KEYS.queue(storeId),
+      );
 
-      // Optimistically update to the new value
-      if (previousQueue) {
-        // Reorder based on new IDs
+      if (previousQueue && previousQueue.length > 0) {
         const articleMap = new Map(previousQueue.map((article) => [article.id, article]));
         const reorderedQueue = newArticleIds
           .map((id) => articleMap.get(id))
           .filter((article): article is QueuedArticle => article !== undefined);
-        
-        queryClient.setQueryData<QueuedArticle[]>(['queue', storeId], reorderedQueue);
+
+        queryClient.setQueryData<readonly QueuedArticle[]>(
+          QUERY_KEYS.queue(storeId),
+          reorderedQueue,
+        );
       }
 
-      // Return context with the previous value
       return { previousQueue };
     },
-    onError: (error, newArticleIds, context) => {
-      // Rollback to previous value on error
-      if (context?.previousQueue) {
-        queryClient.setQueryData(['queue', storeId], context.previousQueue);
+    onError: (error, _newArticleIds, context) => {
+      if (isMountedRef.current) {
+        if (context?.previousQueue) {
+          queryClient.setQueryData(QUERY_KEYS.queue(storeId), context.previousQueue);
+        }
+        const errorMessage = formatAPIErrorMessage(error, {
+          action: 'reorder queue',
+          resource: 'queue',
+        });
+        showToast(errorMessage, { isError: true });
       }
-      console.error('Failed to reorder queue:', error);
-      const errorMessage = formatAPIErrorMessage(error, { action: 'reorder queue', resource: 'queue' });
-      showToast(errorMessage, { isError: true });
     },
     onSettled: () => {
-      // Always refetch after error or success to ensure consistency
-      queryClient.invalidateQueries({ queryKey: ['queue', storeId] });
+      queryClient.invalidateQueries({ queryKey: QUERY_KEYS.queue(storeId) });
     },
     onSuccess: () => {
-      showToast('Queue order updated', { isError: false });
+      if (isMountedRef.current) {
+        showToast('Queue order updated', { isError: false });
+      }
     },
   });
 
   const regenerateTitleMutation = useMutation({
     mutationFn: (articleId: string) => queueApi.regenerateTitle(storeId, articleId),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['queue', storeId] });
-      showToast('Title regenerated successfully', { isError: false });
+      queryClient.invalidateQueries({ queryKey: QUERY_KEYS.queue(storeId) });
+      if (isMountedRef.current) {
+        showToast('Title regenerated successfully', { isError: false });
+      }
     },
     onError: (error) => {
-      console.error('Failed to regenerate title:', error);
-      const errorMessage = formatAPIErrorMessage(error, { action: 'regenerate title', resource: 'article' });
-      showToast(errorMessage, { isError: true });
+      if (isMountedRef.current) {
+        const errorMessage = formatAPIErrorMessage(error, {
+          action: 'regenerate title',
+          resource: 'article',
+        });
+        showToast(errorMessage, { isError: true });
+      }
     },
   });
 
   const refillMutation = useMutation({
     mutationFn: () => queueApi.refill(storeId),
     onSuccess: (data) => {
-      queryClient.invalidateQueries({ queryKey: ['queue', storeId] });
-      queryClient.invalidateQueries({ queryKey: ['queue-metrics', storeId] });
-      if (data.created > 0) {
-        showToast(`${data.created} article${data.created > 1 ? 's' : ''} added to queue`, { isError: false });
+      queryClient.invalidateQueries({ queryKey: QUERY_KEYS.queue(storeId) });
+      queryClient.invalidateQueries({ queryKey: QUERY_KEYS.queueMetrics(storeId) });
+      if (isMountedRef.current && data.created > 0) {
+        showToast(
+          `${data.created} article${data.created > 1 ? 's' : ''} added to queue`,
+          { isError: false },
+        );
       }
     },
-    onError: (error) => {
-      console.error('Failed to refill queue:', error);
-      // Don't show error toast for auto-refill
+    onError: () => {
     },
   });
 
-  // Auto-refill queue when it's below target - ensure queue is always filled for active stores
   useEffect(() => {
-    if (metrics && metrics.targetCount > 0 && metrics.needsRefill && !refillMutation.isPending) {
-      // Small delay to avoid race conditions with other refetches
+    if (
+      metrics &&
+      metrics.targetCount > 0 &&
+      metrics.needsRefill &&
+      !refillMutation.isPending &&
+      isMountedRef.current
+    ) {
       const timer = setTimeout(() => {
-        if (queue.length < metrics.targetCount) {
+        if (isMountedRef.current && queue.length < metrics.targetCount) {
           refillMutation.mutate();
         }
-      }, 2000); // 2 second delay to batch refills
+      }, AUTO_REFILL_DELAY_MS);
       return () => clearTimeout(timer);
     }
-  }, [metrics?.needsRefill, metrics?.targetCount, queue.length, refillMutation, metrics]);
+  }, [
+    metrics?.needsRefill,
+    metrics?.targetCount,
+    queue.length,
+    refillMutation,
+    metrics,
+  ]);
 
-  const handleDragStart = useCallback((e: React.DragEvent, index: number) => {
+  const handleDragStart = useCallback((e: React.DragEvent, index: number): void => {
+    if (index < 0 || !Number.isInteger(index)) {
+      return;
+    }
     setDraggedIndex(index);
     setWasDragging(true);
-    // Set drag data to make it work properly
     e.dataTransfer.effectAllowed = 'move';
     e.dataTransfer.setData('text/html', '');
   }, []);
 
-  const handleDragOver = useCallback((e: React.DragEvent, index: number) => {
+  const handleDragOver = useCallback((e: React.DragEvent, index: number): void => {
     e.preventDefault();
-    setDragOverIndex(index);
+    if (index >= 0 && Number.isInteger(index)) {
+      setDragOverIndex(index);
+    }
   }, []);
 
-  const handleDragLeave = useCallback(() => {
+  const handleDragLeave = useCallback((): void => {
     setDragOverIndex(null);
   }, []);
 
-  const handleDrop = useCallback((e: React.DragEvent, dropIndex: number) => {
-    e.preventDefault();
-    e.stopPropagation();
-    
-    if (draggedIndex === null) {
+  const handleDrop = useCallback(
+    (e: React.DragEvent, dropIndex: number): void => {
+      e.preventDefault();
+      e.stopPropagation();
+
+      if (draggedIndex === null || dropIndex < 0 || draggedIndex < 0) {
+        setDraggedIndex(null);
+        setDragOverIndex(null);
+        return;
+      }
+
+      if (
+        draggedIndex === dropIndex ||
+        draggedIndex >= displayedQueue.length ||
+        dropIndex >= displayedQueue.length
+      ) {
+        setDraggedIndex(null);
+        setDragOverIndex(null);
+        return;
+      }
+
+      const newOrder = [...displayedQueue];
+      const [draggedItem] = newOrder.splice(draggedIndex, 1);
+      newOrder.splice(dropIndex, 0, draggedItem);
+
+      const articleIds = newOrder.map((article) => article.id);
+      reorderMutation.mutate(articleIds);
+
       setDraggedIndex(null);
       setDragOverIndex(null);
-      return;
-    }
+    },
+    [draggedIndex, displayedQueue, reorderMutation],
+  );
 
-    // Use displayedQueue for the calculation since that's what we're displaying
-    const currentQueue = displayedQueue;
-    
-    if (draggedIndex === dropIndex || draggedIndex < 0 || dropIndex < 0 || draggedIndex >= currentQueue.length || dropIndex >= currentQueue.length) {
-      setDraggedIndex(null);
-      setDragOverIndex(null);
-      return;
-    }
-
-    // Create new order by reordering items
-    const newOrder = [...currentQueue];
-    const [draggedItem] = newOrder.splice(draggedIndex, 1);
-    newOrder.splice(dropIndex, 0, draggedItem);
-
-    const articleIds = newOrder.map((article) => article.id);
-    reorderMutation.mutate(articleIds);
-
+  const handleDragEnd = useCallback((): void => {
     setDraggedIndex(null);
     setDragOverIndex(null);
-  }, [draggedIndex, displayedQueue, reorderMutation]);
-
-  const handleDragEnd = useCallback(() => {
-    setDraggedIndex(null);
-    setDragOverIndex(null);
-    // Reset wasDragging after a small delay to allow click event to check it
-    setTimeout(() => setWasDragging(false), 0);
+    setTimeout(() => {
+      if (isMountedRef.current) {
+        setWasDragging(false);
+      }
+    }, DRAG_RESET_DELAY_MS);
   }, []);
 
-  const handleRegenerateTitle = useCallback((e: React.MouseEvent, articleId: string) => {
-    e.stopPropagation();
-    e.preventDefault();
-    regenerateTitleMutation.mutate(articleId);
-  }, [regenerateTitleMutation]);
-  
-  const handleRegenerateMouseDown = useCallback((e: React.MouseEvent) => {
+  const handleRegenerateTitle = useCallback(
+    (e: React.MouseEvent, articleId: string): void => {
+      e.stopPropagation();
+      e.preventDefault();
+      if (articleId && typeof articleId === 'string') {
+        regenerateTitleMutation.mutate(articleId);
+      }
+    },
+    [regenerateTitleMutation],
+  );
+
+  const handleRegenerateMouseDown = useCallback((e: React.MouseEvent): void => {
     e.stopPropagation();
     e.preventDefault();
   }, []);
 
-  const handleArticleClick = useCallback((article: QueuedArticle) => {
-    // Don't trigger click if we were just dragging
-    if (wasDragging) {
-      return;
+  const handleArticleClick = useCallback(
+    (article: QueuedArticle): void => {
+      if (wasDragging || !isMountedRef.current) {
+        return;
+      }
+      if (onArticleClick) {
+        onArticleClick(article);
+      }
+    },
+    [onArticleClick, wasDragging],
+  );
+
+  const handleRefillClick = useCallback((): void => {
+    if (isMountedRef.current && !refillMutation.isPending) {
+      refillMutation.mutate();
     }
-    if (onArticleClick) {
-      onArticleClick(article);
-    }
-  }, [onArticleClick, wasDragging]);
+  }, [refillMutation]);
 
   if (isLoading) {
     return (
@@ -283,17 +401,22 @@ export default function ArticlesQueue({ storeId, onArticleClick, showTitle = tru
     );
   }
 
+  const queueCount = queue.length;
+  const targetCount = metrics?.targetCount ?? 0;
+
   return (
     <div className="space-y-3">
       {showTitle && (
         <div className="flex items-center justify-between">
           <h3 className="text-sm font-semibold text-gray-900">
-            Upcoming Articles ({queue.length}{metrics ? `/${metrics.targetCount}` : ''})
+            Upcoming Articles ({queueCount}
+            {metrics ? `/${targetCount}` : ''})
           </h3>
           {metrics?.needsRefill && (
             <button
-              onClick={() => refillMutation.mutate()}
+              onClick={handleRefillClick}
               disabled={refillMutation.isPending}
+              type="button"
               className="text-xs text-purple-600 hover:text-purple-700 font-medium disabled:opacity-50"
             >
               {refillMutation.isPending ? 'Refilling...' : 'Refill Queue'}
@@ -309,11 +432,14 @@ export default function ArticlesQueue({ storeId, onArticleClick, showTitle = tru
       ) : (
         <div className="space-y-2">
           {displayedQueue.map((article, index) => {
-            const scheduledDate = scheduledDates[index] || null;
-            const displayDate = article.scheduled_publish_at 
+            const scheduledDate = scheduledDates[index] ?? null;
+            const displayDate = article.scheduled_publish_at
               ? new Date(article.scheduled_publish_at)
               : scheduledDate;
-            
+
+            const isDragged = draggedIndex === index;
+            const isDragOver = dragOverIndex === index;
+
             return (
               <div
                 key={article.id}
@@ -326,8 +452,12 @@ export default function ArticlesQueue({ storeId, onArticleClick, showTitle = tru
                 onClick={() => handleArticleClick(article)}
                 className={`
                   p-3 bg-white border-2 rounded-lg transition-all
-                  ${draggedIndex === index ? 'opacity-50 border-purple-500 cursor-grabbing' : 'border-gray-200 hover:border-purple-300 cursor-grab'}
-                  ${dragOverIndex === index ? 'border-purple-500 bg-purple-50' : ''}
+                  ${
+                    isDragged
+                      ? 'opacity-50 border-purple-500 cursor-grabbing'
+                      : 'border-gray-200 hover:border-purple-300 cursor-grab'
+                  }
+                  ${isDragOver ? 'border-purple-500 bg-purple-50' : ''}
                   ${onArticleClick && draggedIndex === null ? 'cursor-pointer' : ''}
                 `}
               >
@@ -337,11 +467,19 @@ export default function ArticlesQueue({ storeId, onArticleClick, showTitle = tru
                     onMouseDown={handleRegenerateMouseDown}
                     onDragStart={(e) => e.stopPropagation()}
                     disabled={regenerateTitleMutation.isPending}
+                    type="button"
                     className="flex-shrink-0 p-1 text-gray-400 hover:text-purple-600 transition-colors disabled:opacity-50"
                     title="Regenerate title"
                     draggable={false}
+                    aria-label="Regenerate title"
                   >
-                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <svg
+                      className="w-4 h-4"
+                      fill="none"
+                      stroke="currentColor"
+                      viewBox="0 0 24 24"
+                      aria-hidden="true"
+                    >
                       <path
                         strokeLinecap="round"
                         strokeLinejoin="round"
@@ -352,7 +490,9 @@ export default function ArticlesQueue({ storeId, onArticleClick, showTitle = tru
                   </button>
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2 flex-wrap">
-                      <p className="text-sm font-medium text-gray-900 line-clamp-2">{article.title}</p>
+                      <p className="text-sm font-medium text-gray-900 line-clamp-2">
+                        {article.title}
+                      </p>
                       {displayDate && (
                         <span className="text-xs text-gray-500 whitespace-nowrap">
                           {formatDate(displayDate)}
@@ -362,14 +502,21 @@ export default function ArticlesQueue({ storeId, onArticleClick, showTitle = tru
                   </div>
                   <div
                     className="flex-shrink-0 p-1 text-gray-400 cursor-grab active:cursor-grabbing"
+                    aria-label="Drag handle"
                   >
                     <svg
                       className="w-4 h-4"
                       fill="none"
                       stroke="currentColor"
                       viewBox="0 0 24 24"
+                      aria-hidden="true"
                     >
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 6h16M4 12h16M4 18h16" />
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        strokeWidth="2"
+                        d="M4 6h16M4 12h16M4 18h16"
+                      />
                     </svg>
                   </div>
                 </div>
@@ -379,16 +526,18 @@ export default function ArticlesQueue({ storeId, onArticleClick, showTitle = tru
         </div>
       )}
 
-      {metrics && queue.length < metrics.targetCount && (
+      {metrics && queueCount < targetCount && (
         <button
-          onClick={() => refillMutation.mutate()}
+          onClick={handleRefillClick}
           disabled={refillMutation.isPending}
+          type="button"
           className="w-full py-2 px-3 text-xs font-medium text-purple-600 border border-purple-300 rounded-lg hover:bg-purple-50 transition-colors disabled:opacity-50"
         >
-          {refillMutation.isPending ? 'Adding articles...' : `Add ${metrics.targetCount - queue.length} more article${metrics.targetCount - queue.length > 1 ? 's' : ''}`}
+          {refillMutation.isPending
+            ? 'Adding articles...'
+            : `Add ${targetCount - queueCount} more article${targetCount - queueCount > 1 ? 's' : ''}`}
         </button>
       )}
     </div>
   );
 }
-

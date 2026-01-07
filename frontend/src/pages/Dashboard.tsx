@@ -1,10 +1,10 @@
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useMemo, useState, useRef, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { useQuery } from '@tanstack/react-query';
 import { useDashboardData } from '../hooks/useDashboardData';
 import { getShopDomain } from '../lib/app-bridge';
-import { queueApi, type BlogPost, type QueuedArticle } from '../lib/api-client';
+import { queueApi, type BlogPost, type QueuedArticle, type Store, type QuotaStatus } from '../lib/api-client';
 import { getPlanFrequencyConfig } from '../utils/plan-frequency';
-import { useQuery } from '@tanstack/react-query';
 import TrialExpirationBanner from '../components/TrialExpirationBanner';
 import PlansModal from '../components/PlansModal';
 import { formatAPIErrorMessage } from '../utils/error-messages';
@@ -20,20 +20,71 @@ import {
   ResponsiveContainer,
 } from 'recharts';
 
+const REFETCH_INTERVAL = 300000;
+const QUEUE_REFETCH_INTERVAL = 30000;
+const MAX_ATTEMPTS = 200;
+const DEFAULT_PUBLISH_TIME = '14:00';
+const DAY_LABELS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'] as const;
+const JS_DAYS_IN_WEEK = 7;
+const HOURS_IN_DAY = 24;
+const MINUTES_IN_HOUR = 60;
+const MILLISECONDS_IN_DAY = 24 * 60 * 60 * 1000;
+const MAX_TITLE_LENGTH = 20;
+
 interface ScheduledArticle {
-  id: string;
-  title: string;
-  scheduledAt: Date;
-  status: 'scheduled' | 'published' | 'queued';
+  readonly id: string;
+  readonly title: string;
+  readonly scheduledAt: Date;
+  readonly status: 'scheduled' | 'published' | 'queued';
 }
 
+interface BlogPostWithQueueMarker extends BlogPost {
+  readonly _isQueueItem?: boolean;
+}
 
-const REFETCH_INTERVAL = 300000; // 5 minutes
+interface ScheduleSettings {
+  readonly selectedDays: Set<number>;
+  readonly publishTime: string;
+}
 
-function formatDate(date: Date | string | null | undefined): string {
-  if (!date) return '';
+interface ScheduleInfo {
+  readonly frequency: string;
+  readonly days: readonly string[];
+  readonly time: string;
+  readonly nextPublish: Date | null;
+  readonly nextArticleTitle: string | null;
+}
+
+interface AnalyticsMetrics {
+  readonly chartData: Array<{
+    readonly name: string;
+    readonly clicks: number;
+    readonly impressions: number;
+  }>;
+}
+
+interface AnalyticsData {
+  readonly topPosts?: ReadonlyArray<{
+    readonly title?: string;
+    readonly clicks?: number;
+    readonly impressions?: number;
+  }>;
+}
+
+interface GroupedScheduledArticles {
+  readonly upcoming: readonly ScheduledArticle[];
+  readonly thisWeek: readonly ScheduledArticle[];
+  readonly later: readonly ScheduledArticle[];
+}
+
+const formatDate = (date: Date | string | null | undefined): string => {
+  if (!date) {
+    return '';
+  }
   const d = typeof date === 'string' ? new Date(date) : date;
-  if (isNaN(d.getTime())) return '';
+  if (isNaN(d.getTime())) {
+    return '';
+  }
 
   const now = new Date();
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
@@ -46,32 +97,75 @@ function formatDate(date: Date | string | null | undefined): string {
   } else if (articleDate.getTime() === tomorrow.getTime()) {
     return `Tomorrow, ${formatTime(d)}`;
   } else {
-    return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) + `, ${formatTime(d)}`;
+    return `${d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}, ${formatTime(d)}`;
   }
-}
+};
 
-// Detect if user's locale uses 12-hour or 24-hour format
-function uses12HourFormat(): boolean {
-  const testDate = new Date(2024, 0, 1, 13, 0); // 1 PM
+const uses12HourFormat = (): boolean => {
+  if (typeof navigator === 'undefined' || !navigator.language) {
+    return true;
+  }
+  const testDate = new Date(2024, 0, 1, 13, 0);
   const formatted = testDate.toLocaleTimeString(navigator.language, { hour: 'numeric' });
-  // If it contains 'PM' or 'AM', it's 12-hour format
   return formatted.includes('PM') || formatted.includes('AM') || formatted.includes('pm') || formatted.includes('am');
-}
+};
 
-function formatTime(date: Date): string {
+const formatTime = (date: Date): string => {
+  if (typeof navigator === 'undefined' || !navigator.language) {
+    return date.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+  }
   const use12Hour = uses12HourFormat();
-  return date.toLocaleTimeString(navigator.language, { 
-    hour: 'numeric', 
-    minute: '2-digit', 
-    hour12: use12Hour 
+  return date.toLocaleTimeString(navigator.language, {
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: use12Hour,
   });
-}
+};
 
-function groupScheduledArticles(posts: readonly (BlogPost | (BlogPost & { _isQueueItem?: boolean }))[]): {
-  upcoming: ScheduledArticle[];
-  thisWeek: ScheduledArticle[];
-  later: ScheduledArticle[];
-} {
+const jsDayToIndex = (jsDay: number): number => {
+  return jsDay === 0 ? 6 : jsDay - 1;
+};
+
+const dayIndexToJsDay = (index: number): number => {
+  return index === 6 ? 0 : index + 1;
+};
+
+const validateJsDay = (jsDay: number): boolean => {
+  return Number.isInteger(jsDay) && jsDay >= 0 && jsDay < JS_DAYS_IN_WEEK;
+};
+
+const validateDayIndex = (index: number): boolean => {
+  return Number.isInteger(index) && index >= 0 && index < JS_DAYS_IN_WEEK;
+};
+
+const parseTime = (time: string): { hours: number; minutes: number } | null => {
+  if (!time || typeof time !== 'string') {
+    return null;
+  }
+  const parts = time.split(':');
+  if (parts.length !== 2) {
+    return null;
+  }
+  const hours = Number.parseInt(parts[0], 10);
+  const minutes = Number.parseInt(parts[1], 10);
+  if (
+    !Number.isFinite(hours) ||
+    !Number.isFinite(minutes) ||
+    hours < 0 ||
+    hours >= HOURS_IN_DAY ||
+    minutes < 0 ||
+    minutes >= MINUTES_IN_HOUR
+  ) {
+    return null;
+  }
+  return { hours, minutes };
+};
+
+const formatTimeString = (hours: number, minutes: number): string => {
+  return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`;
+};
+
+const groupScheduledArticles = (posts: readonly BlogPostWithQueueMarker[]): GroupedScheduledArticles => {
   const now = new Date();
   const endOfToday = new Date(now);
   endOfToday.setHours(23, 59, 59, 999);
@@ -81,20 +175,23 @@ function groupScheduledArticles(posts: readonly (BlogPost | (BlogPost & { _isQue
   endOfTomorrow.setHours(23, 59, 59, 999);
 
   const endOfWeek = new Date(now);
-  endOfWeek.setDate(now.getDate() + (7 - now.getDay()));
+  endOfWeek.setDate(now.getDate() + (JS_DAYS_IN_WEEK - now.getDay()));
   endOfWeek.setHours(23, 59, 59, 999);
 
   const scheduled: ScheduledArticle[] = posts
     .filter((p) => {
       const postDate = p.published_at || p.scheduled_publish_at;
-      if (!postDate) return false;
-      // Include scheduled posts and queue items with scheduled_publish_at
-      return (p.status === 'scheduled' || (p.status === 'queued' && p.scheduled_publish_at));
+      if (!postDate) {
+        return false;
+      }
+      return p.status === 'scheduled' || (p.status === 'queued' && p.scheduled_publish_at);
     })
     .map((p) => {
-      const postWithMarker = p as BlogPost & { _isQueueItem?: boolean };
-      const postDate = p.published_at || p.scheduled_publish_at!;
-      if (postWithMarker._isQueueItem) {
+      const postDate = p.published_at || p.scheduled_publish_at;
+      if (!postDate) {
+        throw new Error('Post date is required');
+      }
+      if (p._isQueueItem) {
         return {
           id: p.id,
           title: p.title,
@@ -119,21 +216,18 @@ function groupScheduledArticles(posts: readonly (BlogPost | (BlogPost & { _isQue
     })
     .sort((a, b) => a.scheduledAt.getTime() - b.scheduledAt.getTime());
 
-  // Upcoming: today or tomorrow (within next ~48 hours)
   const upcoming = scheduled.filter((a) => a.scheduledAt <= endOfTomorrow);
-
-  // This week: after tomorrow but within the current week
   const thisWeek = scheduled.filter((a) => a.scheduledAt > endOfTomorrow && a.scheduledAt <= endOfWeek);
-
-  // Later: beyond this week
   const later = scheduled.filter((a) => a.scheduledAt > endOfWeek);
 
   return { upcoming, thisWeek, later };
-}
+};
 
-function getShopName(): string {
+const getShopName = (): string => {
   const domain = getShopDomain();
-  if (!domain) return 'Merchant';
+  if (!domain) {
+    return 'Merchant';
+  }
   let name = domain;
   if (domain.includes('.')) {
     name = domain.split('.')[0];
@@ -144,22 +238,263 @@ function getShopName(): string {
     .split(' ')
     .map((word) => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
     .join(' ');
-}
+};
 
-function getCurrentDate(): string {
+const getCurrentDate = (): string => {
   const now = new Date();
-  const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'] as const;
+  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'] as const;
   return `${days[now.getDay()]}, ${months[now.getMonth()]} ${now.getDate()}`;
-}
+};
 
-export default function Dashboard() {
+const isQuotaStatus = (quota: unknown): quota is QuotaStatus => {
+  return (
+    quota !== null &&
+    typeof quota === 'object' &&
+    'plan_name' in quota &&
+    typeof (quota as QuotaStatus).plan_name === 'string' &&
+    'articles_used' in quota &&
+    typeof (quota as QuotaStatus).articles_used === 'number' &&
+    'articles_allowed' in quota &&
+    typeof (quota as QuotaStatus).articles_allowed === 'number'
+  );
+};
+
+const isQuotaWithError = (quota: unknown): quota is { error: unknown } => {
+  return quota !== null && typeof quota === 'object' && 'error' in quota;
+};
+
+const isStoreWithFrequencySettings = (store: Store | null): store is Store & { frequency_settings: Store['frequency_settings'] } => {
+  return store !== null && typeof store === 'object' && 'frequency_settings' in store;
+};
+
+const isAnalyticsData = (analytics: unknown): analytics is AnalyticsData => {
+  return analytics !== null && typeof analytics === 'object';
+};
+
+const extractFrequencySettings = (store: Store | null): ScheduleSettings => {
+  if (!isStoreWithFrequencySettings(store)) {
+    return { selectedDays: new Set<number>(), publishTime: DEFAULT_PUBLISH_TIME };
+  }
+
+  const settings = store.frequency_settings;
+  const selectedDays = new Set<number>();
+
+  if (settings?.preferredDays && Array.isArray(settings.preferredDays)) {
+    for (const jsDay of settings.preferredDays) {
+      if (validateJsDay(jsDay)) {
+        const index = jsDayToIndex(jsDay);
+        if (validateDayIndex(index)) {
+          selectedDays.add(index);
+        }
+      }
+    }
+  }
+
+  const publishTime = settings?.preferredTimes?.[0] || DEFAULT_PUBLISH_TIME;
+  const parsed = parseTime(publishTime);
+  if (parsed) {
+    return { selectedDays, publishTime: formatTimeString(parsed.hours, parsed.minutes) };
+  }
+
+  return { selectedDays, publishTime: DEFAULT_PUBLISH_TIME };
+};
+
+const calculateScheduledDates = (
+  queueLength: number,
+  selectedDays: Set<number>,
+  publishTime: string,
+  existingDates: Set<string>,
+): Date[] => {
+  if (selectedDays.size === 0 || queueLength === 0) {
+    return [];
+  }
+
+  const parsed = parseTime(publishTime);
+  if (!parsed) {
+    return [];
+  }
+
+  const dates: Date[] = [];
+  const now = new Date();
+  const jsDays = Array.from(selectedDays)
+    .map(dayIndexToJsDay)
+    .filter(validateJsDay)
+    .sort((a, b) => a - b);
+
+  let currentDate = new Date(now);
+  currentDate.setHours(parsed.hours, parsed.minutes, 0, 0);
+
+  if (currentDate <= now) {
+    currentDate.setDate(currentDate.getDate() + 1);
+  }
+
+  let attempts = 0;
+
+  while (dates.length < queueLength && attempts < MAX_ATTEMPTS) {
+    const currentDay = currentDate.getDay();
+    if (jsDays.includes(currentDay)) {
+      const dateStr = currentDate.toISOString();
+      if (!existingDates.has(dateStr)) {
+        dates.push(new Date(currentDate));
+      }
+    }
+    currentDate.setDate(currentDate.getDate() + 1);
+    attempts++;
+  }
+
+  return dates;
+};
+
+const buildQueuePostsAsBlogPosts = (
+  queue: readonly QueuedArticle[],
+  dates: Date[],
+): readonly BlogPostWithQueueMarker[] => {
+  return queue.slice(0, dates.length).map(
+    (article, index): BlogPostWithQueueMarker => ({
+      id: article.id,
+      store_id: article.store_id,
+      title: article.title,
+      content: article.content || '',
+      status: 'queued' as const,
+      published_at: null,
+      scheduled_publish_at: dates[index].toISOString(),
+      seo_health_score: 0,
+      created_at: article.created_at,
+      _isQueueItem: true,
+    }),
+  );
+};
+
+const formatPlanName = (planName: string | null): string => {
+  if (!planName || planName === 'Unknown') {
+    return 'No Plan';
+  }
+  return planName
+    .split('_')
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(' ');
+};
+
+const calculateQuotaLimit = (quota: QuotaStatus | null): number => {
+  if (!quota) {
+    return 30;
+  }
+
+  if (quota.articles_allowed_display !== undefined) {
+    return quota.articles_allowed_display;
+  }
+
+  const isTrial = quota.is_trial || quota.plan_name === 'free_trial';
+
+  if (isTrial) {
+    return 6;
+  }
+
+  return quota.articles_allowed || 30;
+};
+
+const calculateAnalyticsMetrics = (analytics: unknown): AnalyticsMetrics => {
+  if (!isAnalyticsData(analytics)) {
+    return { chartData: [] };
+  }
+
+  const chartData = (analytics.topPosts || [])
+    .slice(0, 5)
+    .map((post) => {
+      const title = post.title || 'Untitled';
+      const truncatedTitle = title.length > MAX_TITLE_LENGTH ? `${title.substring(0, MAX_TITLE_LENGTH)}...` : title;
+      return {
+        name: truncatedTitle,
+        clicks: post.clicks || 0,
+        impressions: post.impressions || 0,
+      };
+    });
+
+  return { chartData };
+};
+
+const buildScheduleInfo = (
+  store: Store | null,
+  scheduledPosts: readonly BlogPost[],
+  queuePostsAsBlogPosts: readonly BlogPostWithQueueMarker[],
+  planFrequencyConfig: ReturnType<typeof getPlanFrequencyConfig>,
+): ScheduleInfo => {
+  const frequency = planFrequencyConfig.displayName;
+  const settings = isStoreWithFrequencySettings(store) ? store.frequency_settings : null;
+
+  let days: string[] = [];
+
+  if (settings?.preferredDays && Array.isArray(settings.preferredDays) && settings.preferredDays.length > 0) {
+    const indices = settings.preferredDays
+      .filter(validateJsDay)
+      .map(jsDayToIndex)
+      .filter(validateDayIndex)
+      .sort((a, b) => a - b);
+
+    days = indices.map((idx) => DAY_LABELS[idx]);
+
+    if (days.length > planFrequencyConfig.maxDays) {
+      days = days.slice(0, planFrequencyConfig.maxDays);
+    }
+  } else {
+    const defaultDayCount = Math.min(planFrequencyConfig.maxDays, JS_DAYS_IN_WEEK);
+    days = DAY_LABELS.slice(0, defaultDayCount);
+  }
+
+  const time = settings?.preferredTimes?.[0]
+    ? (() => {
+        const parsed = parseTime(settings.preferredTimes![0]);
+        if (parsed) {
+          const date = new Date();
+          date.setHours(parsed.hours, parsed.minutes);
+          return formatTime(date);
+        }
+        const defaultDate = new Date();
+        defaultDate.setHours(14, 0);
+        return formatTime(defaultDate);
+      })()
+    : (() => {
+        const defaultDate = new Date();
+        defaultDate.setHours(14, 0);
+        return formatTime(defaultDate);
+      })();
+
+  const allScheduledWithDates = [
+    ...(scheduledPosts || []).filter((p) => p.status === 'scheduled' && p.scheduled_publish_at),
+    ...queuePostsAsBlogPosts.filter((p) => p.scheduled_publish_at),
+  ];
+  const nextPost = allScheduledWithDates.sort(
+    (a, b) => new Date(a.scheduled_publish_at!).getTime() - new Date(b.scheduled_publish_at!).getTime(),
+  )[0];
+
+  return {
+    frequency,
+    days,
+    time,
+    nextPublish: nextPost?.scheduled_publish_at ? new Date(nextPost.scheduled_publish_at) : null,
+    nextArticleTitle: nextPost?.title || null,
+  };
+};
+
+export default function Dashboard(): JSX.Element {
   const navigate = useNavigate();
   const [expandedSections, setExpandedSections] = useState<Set<string>>(new Set(['upcoming']));
   const [isPlansModalOpen, setIsPlansModalOpen] = useState(false);
+  const isMountedRef = useRef(true);
 
-  const handleError = useCallback((error: Error) => {
-    console.error('[Dashboard] Error:', error);
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
+
+  const handleError = useCallback((error: unknown) => {
+    if (!isMountedRef.current) {
+      return;
+    }
+    const errorMessage = formatAPIErrorMessage(error, { action: 'load dashboard', resource: 'dashboard' });
   }, []);
 
   const {
@@ -182,157 +517,91 @@ export default function Dashboard() {
 
   const totalArticles = useMemo(() => {
     return (posts?.length || 0) + (scheduledPosts?.length || 0) + (draftPosts?.length || 0);
-  }, [posts, scheduledPosts, draftPosts]);
+  }, [posts?.length, scheduledPosts?.length, draftPosts?.length]);
 
-  const publishedCount = useMemo(() => posts?.length || 0, [posts]);
-  const draftsCount = useMemo(() => draftPosts?.length || 0, [draftPosts]);
+  const publishedCount = useMemo(() => posts?.length || 0, [posts?.length]);
+  const draftsCount = useMemo(() => draftPosts?.length || 0, [draftPosts?.length]);
 
   const planName = useMemo(() => {
-    if (!quota || typeof quota !== 'object' || 'error' in quota) return null;
-    return (quota as { plan_name?: string }).plan_name || null;
+    if (!isQuotaStatus(quota)) {
+      return null;
+    }
+    return quota.plan_name || null;
   }, [quota]);
 
-  // Format plan name for display (same logic as Settings page)
   const formattedPlanName = useMemo(() => {
-    if (isLoading) return 'Loading...';
-    if (!quota || typeof quota !== 'object' || 'error' in quota) return 'No Plan';
-    const name = (quota as { plan_name?: string }).plan_name || 'Unknown';
-    if (!name || name === 'Unknown') return 'No Plan';
-    return name
-      .split('_')
-      .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
-      .join(' ');
+    if (isLoading) {
+      return 'Loading...';
+    }
+    if (!isQuotaStatus(quota)) {
+      return 'No Plan';
+    }
+    return formatPlanName(quota.plan_name);
   }, [quota, isLoading]);
 
-  // Check if user has no active plan (no plan or not on trial)
   const hasNoActivePlan = useMemo(() => {
-    if (isLoading) return false;
-    if (!quota || typeof quota !== 'object') return false;
-    if ('error' in quota && quota.error) return true;
+    if (isLoading) {
+      return false;
+    }
+    if (isQuotaWithError(quota)) {
+      return true;
+    }
+    if (!isQuotaStatus(quota)) {
+      return false;
+    }
 
-    const quotaData = quota as { plan_name?: string; is_trial?: boolean };
-    const name = quotaData.plan_name || '';
-    const isTrial = quotaData.is_trial || false;
-
-    // Show banner if:
-    // 1. Formatted plan name is "No Plan" (plan_name is missing/unknown/empty) and not on trial
-    // 2. OR plan_name is "free_trial" but is_trial is false (trial expired/not active)
+    const name = quota.plan_name || '';
+    const isTrial = quota.is_trial || false;
     const isNoPlan = formattedPlanName === 'No Plan';
     const isExpiredTrial = name === 'free_trial' && !isTrial;
 
-    const result = (isNoPlan && !isTrial) || isExpiredTrial;
-
-    return result;
+    return (isNoPlan && !isTrial) || isExpiredTrial;
   }, [quota, isLoading, formattedPlanName]);
 
   const planFrequencyConfig = useMemo(() => getPlanFrequencyConfig(planName), [planName]);
 
-  const storeId = store?.id ?? '';
+  const storeId = useMemo(() => store?.id ?? '', [store?.id]);
 
-  // Fetch queue articles
   const {
     data: queue = [],
   } = useQuery({
-    queryKey: ['queue', storeId],
+    queryKey: ['queue', storeId] as const,
     queryFn: () => queueApi.getQueue(storeId),
     enabled: !!storeId,
-    refetchInterval: 30000,
+    refetchInterval: QUEUE_REFETCH_INTERVAL,
   });
 
-  // Get schedule settings from store
-  const scheduleSettings = useMemo(() => {
-    if (!store) return { selectedDays: new Set<number>(), publishTime: '14:00' };
-    
-    const settings = (store as { frequency_settings?: unknown }).frequency_settings as {
-      preferredDays?: number[];
-      preferredTimes?: string[];
-    } | null | undefined;
-    
-    // Convert JS day format (Sun=0, Mon=1, ..., Sat=6) to our index format (Mon=0, ..., Sun=6)
-    const jsDayToIndex = (jsDay: number): number => jsDay === 0 ? 6 : jsDay - 1;
-    
-    const selectedDays = new Set<number>();
-    if (settings?.preferredDays) {
-      settings.preferredDays.forEach((jsDay) => {
-        const index = jsDayToIndex(jsDay);
-        if (index >= 0 && index < 7) {
-          selectedDays.add(index);
-        }
-      });
-    }
-    
-    const publishTime = settings?.preferredTimes?.[0] || '14:00';
-    const [hours, minutes] = publishTime.split(':').map(Number);
-    const formattedTime = `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`;
-    
-    return { selectedDays, publishTime: formattedTime };
-  }, [store]);
+  const scheduleSettings = useMemo(() => extractFrequencySettings(store), [store]);
 
-  // Convert queue items to BlogPost-like format with calculated scheduled dates
-  const queuePostsAsBlogPosts = useMemo(() => {
-    if (!scheduleSettings.selectedDays || scheduleSettings.selectedDays.size === 0 || queue.length === 0) return [];
-    
-    // Convert our day index (Mon=0, ..., Sun=6) to JS Date.getDay() format (Sun=0, Mon=1, ..., Sat=6)
-    const dayIndexToJsDay = (index: number): number => index === 6 ? 0 : index + 1;
-    
-    // Get existing scheduled/published dates to avoid conflicts
-    const existingDates = new Set(
+  const existingDates = useMemo(() => {
+    return new Set(
       [...(scheduledPosts || []), ...(posts || [])]
         .map((p) => {
           const date = p.published_at || p.scheduled_publish_at;
-          if (!date) return null;
+          if (!date) {
+            return null;
+          }
           const d = new Date(date);
+          if (isNaN(d.getTime())) {
+            return null;
+          }
           return d.toISOString();
         })
-        .filter((d): d is string => d !== null)
+        .filter((d): d is string => d !== null),
     );
-    
-    // Calculate scheduled dates for queue items, avoiding conflicts
-    const dates: Date[] = [];
-    const now = new Date();
-    const [hours, minutes] = scheduleSettings.publishTime.split(':').map(Number);
-    const jsDays = Array.from(scheduleSettings.selectedDays).map(dayIndexToJsDay).sort((a, b) => a - b);
-    
-    let currentDate = new Date(now);
-    currentDate.setHours(hours, minutes, 0, 0);
-    
-    if (currentDate <= now) {
-      currentDate.setDate(currentDate.getDate() + 1);
-    }
-    
-    let attempts = 0;
-    const maxAttempts = 200;
-    
-    while (dates.length < queue.length && attempts < maxAttempts) {
-      const currentDay = currentDate.getDay();
-      if (jsDays.includes(currentDay)) {
-        const dateStr = currentDate.toISOString();
-        if (!existingDates.has(dateStr)) {
-          dates.push(new Date(currentDate));
-        }
-      }
-      currentDate.setDate(currentDate.getDate() + 1);
-      attempts++;
-    }
-    
-    // Convert queue items to BlogPost format with a special marker
-    return queue.slice(0, dates.length).map((article, index): BlogPost & { _isQueueItem?: boolean } => ({
-      id: article.id,
-      store_id: article.store_id,
-      title: article.title,
-      content: article.content || '',
-      status: 'queued' as const,
-      published_at: null,
-      scheduled_publish_at: dates[index].toISOString(),
-      seo_health_score: 0,
-      created_at: article.created_at,
-      _isQueueItem: true,
-    }));
-  }, [queue, scheduleSettings.selectedDays, scheduleSettings.publishTime, scheduledPosts, posts]);
+  }, [scheduledPosts, posts]);
+
+  const scheduledDates = useMemo(() => {
+    return calculateScheduledDates(queue.length, scheduleSettings.selectedDays, scheduleSettings.publishTime, existingDates);
+  }, [queue.length, scheduleSettings.selectedDays, scheduleSettings.publishTime, existingDates]);
+
+  const queuePostsAsBlogPosts = useMemo(() => {
+    return buildQueuePostsAsBlogPosts(queue, scheduledDates);
+  }, [queue, scheduledDates]);
 
   const scheduledCount = useMemo(() => {
     return (scheduledPosts?.length || 0) + queuePostsAsBlogPosts.length;
-  }, [scheduledPosts, queuePostsAsBlogPosts]);
+  }, [scheduledPosts?.length, queuePostsAsBlogPosts.length]);
 
   const { upcoming, thisWeek, later } = useMemo(() => {
     const allScheduled = [...(scheduledPosts || []), ...queuePostsAsBlogPosts];
@@ -340,122 +609,19 @@ export default function Dashboard() {
   }, [scheduledPosts, queuePostsAsBlogPosts]);
 
   const schedule = useMemo(() => {
-    // Get plan-based frequency configuration (must match Schedule page)
-    const frequency = planFrequencyConfig.displayName;
-
-    // Get days from frequency_settings
-    const settings = (store as { frequency_settings?: unknown })?.frequency_settings as {
-      preferredDays?: number[];
-      preferredTimes?: string[];
-    } | null | undefined;
-
-    // Day labels matching Schedule page: Mon=0, Tue=1, ..., Sun=6
-    const dayLabels = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
-    let days: string[] = [];
-
-    if (settings?.preferredDays && settings.preferredDays.length > 0) {
-      // Convert JS day format (Sun=0, Mon=1, ..., Sat=6) to our index format (Mon=0, ..., Sun=6)
-      // This matches the Schedule page conversion logic
-      const jsDayToIndex = (jsDay: number): number => jsDay === 0 ? 6 : jsDay - 1;
-      const indices = settings.preferredDays
-        .map(jsDayToIndex)
-        .filter((idx) => idx >= 0 && idx < 7)
-        .sort((a, b) => a - b); // Sort by index (Mon=0 first, Sun=6 last)
-
-      days = indices.map((idx) => dayLabels[idx]);
-
-      // Ensure days count matches plan limits (enforce max)
-      if (days.length > planFrequencyConfig.maxDays) {
-        days = days.slice(0, planFrequencyConfig.maxDays);
-      }
-    } else {
-      // Default days based on plan frequency (Monday first, matching Schedule page)
-      const defaultDayCount = Math.min(planFrequencyConfig.maxDays, 7);
-      days = dayLabels.slice(0, defaultDayCount); // Mon, Tue, Wed, etc. (Monday first)
-    }
-
-    // Get time from settings
-    const time = settings?.preferredTimes?.[0]
-      ? (() => {
-        const [hours, minutes] = settings.preferredTimes![0].split(':').map(Number);
-        const date = new Date();
-        date.setHours(hours, minutes);
-        return formatTime(date);
-      })()
-      : formatTime((() => { const d = new Date(); d.setHours(14, 0); return d; })());
-
-    // Get next scheduled post (including queue articles)
-    const allScheduledWithDates = [
-      ...(scheduledPosts || []).filter((p) => p.status === 'scheduled' && p.scheduled_publish_at),
-      ...queuePostsAsBlogPosts.filter((p) => p.scheduled_publish_at),
-    ];
-    const nextPost = allScheduledWithDates
-      .sort((a, b) => new Date(a.scheduled_publish_at!).getTime() - new Date(b.scheduled_publish_at!).getTime())[0];
-
-    return {
-      frequency,
-      days,
-      time,
-      nextPublish: nextPost?.scheduled_publish_at ? new Date(nextPost.scheduled_publish_at) : null,
-      nextArticleTitle: nextPost?.title || null,
-    };
+    return buildScheduleInfo(store, scheduledPosts || [], queuePostsAsBlogPosts, planFrequencyConfig);
   }, [store, scheduledPosts, queuePostsAsBlogPosts, planFrequencyConfig]);
 
-  // Articles generated (from article_usage table)
   const quotaUsed = useMemo(() => {
-    if (!quota) return 0;
+    if (!isQuotaStatus(quota)) {
+      return 0;
+    }
     return quota.articles_used || 0;
   }, [quota]);
 
-  // Plan limit: For free trial show total (6), for other plans show monthly limit
-  const quotaLimit = useMemo(() => {
-    if (!quota) return 30;
+  const quotaLimit = useMemo(() => calculateQuotaLimit(isQuotaStatus(quota) ? quota : null), [quota]);
 
-    // Use articles_allowed_display if available (from updated API)
-    // This field is set by the database function: 6 for trial, monthly for paid
-    if (quota.articles_allowed_display !== undefined) {
-      return quota.articles_allowed_display;
-    }
-
-    // Fallback: calculate based on plan
-    const planName = quota.plan_name;
-    const isTrial = quota.is_trial || planName === 'free_trial';
-
-    // For free trial: show total articles in trial period (6 articles in 14 days)
-    if (isTrial) {
-      return 6; // Total articles in 14-day trial (3 per week * 2 weeks)
-    }
-
-    // For other plans: show monthly limit
-    // The quota API returns articles_allowed which is already monthly for paid plans
-    return quota.articles_allowed || 30;
-  }, [quota]);
-
-  // Calculate analytics metrics from real data
-  const analyticsMetrics = useMemo(() => {
-    if (!analytics || typeof analytics !== 'object') {
-      return {
-        chartData: [],
-      };
-    }
-
-    const analyticsData = analytics as {
-      topPosts?: Array<{ title?: string; clicks?: number; impressions?: number }>;
-    };
-
-    // Prepare chart data for top posts
-    const chartData = (analyticsData.topPosts || [])
-      .slice(0, 5)
-      .map((post) => ({
-        name: post.title?.substring(0, 20) + (post.title && post.title.length > 20 ? '...' : '') || 'Untitled',
-        clicks: post.clicks || 0,
-        impressions: post.impressions || 0,
-      }));
-
-    return {
-      chartData,
-    };
-  }, [analytics]);
+  const analyticsMetrics = useMemo(() => calculateAnalyticsMetrics(analytics), [analytics]);
 
   const toggleSection = useCallback((section: string) => {
     setExpandedSections((prev) => {
@@ -473,8 +639,36 @@ export default function Dashboard() {
     navigate('/posts');
   }, [navigate]);
 
+  const handleOpenPlansModal = useCallback(() => {
+    setIsPlansModalOpen(true);
+  }, []);
 
-  // Loading state
+  const handleClosePlansModal = useCallback(() => {
+    setIsPlansModalOpen(false);
+  }, []);
+
+  const handleNavigateToPosts = useCallback(() => {
+    navigate('/posts');
+  }, [navigate]);
+
+  const handleNavigateToSchedule = useCallback(() => {
+    navigate('/schedule');
+  }, [navigate]);
+
+  const handleNavigateToAnalytics = useCallback(() => {
+    navigate('/analytics');
+  }, [navigate]);
+
+  const handleNavigateToSettings = useCallback(() => {
+    navigate('/settings');
+  }, [navigate]);
+
+  const handleReload = useCallback(() => {
+    if (typeof window !== 'undefined') {
+      window.location.reload();
+    }
+  }, []);
+
   if (isLoading) {
     return (
       <div className="h-screen overflow-hidden bg-gray-50">
@@ -522,7 +716,6 @@ export default function Dashboard() {
     );
   }
 
-  // Error state
   if (isError && error && !store) {
     return (
       <div className="h-screen overflow-hidden bg-gray-50">
@@ -530,19 +723,19 @@ export default function Dashboard() {
           <div className="p-4 sm:p-6 lg:p-8">
             <div className="bg-red-50 border border-red-200 rounded-xl p-6 max-w-2xl mx-auto">
               <h2 className="text-lg font-semibold text-red-900 mb-2">Setup Required</h2>
-              <p className="text-sm text-red-700 mb-4">
-                {formatAPIErrorMessage(error, { action: 'load dashboard', resource: 'dashboard' })}
-              </p>
+              <p className="text-sm text-red-700 mb-4">{formatAPIErrorMessage(error, { action: 'load dashboard', resource: 'dashboard' })}</p>
               <div className="flex gap-3">
                 <button
-                  onClick={() => window.location.reload()}
+                  onClick={handleReload}
                   className="px-4 py-2 bg-red-600 text-white rounded-lg text-sm font-medium hover:bg-red-700 transition-colors"
+                  type="button"
                 >
                   Refresh Page
                 </button>
                 <button
                   onClick={() => refetch()}
                   className="px-4 py-2 border border-red-300 text-red-600 rounded-lg text-sm font-medium hover:bg-red-50 transition-colors"
+                  type="button"
                 >
                   Retry
                 </button>
@@ -569,27 +762,37 @@ export default function Dashboard() {
             <div className="flex items-center gap-2 sm:gap-3">
               {hasNoActivePlan ? (
                 <button
-                  onClick={() => setIsPlansModalOpen(true)}
+                  onClick={handleOpenPlansModal}
                   className="px-3 sm:px-4 py-2 sm:py-2.5 bg-purple-600 text-white rounded-lg text-sm sm:text-base font-medium hover:bg-purple-700 transition-colors whitespace-nowrap"
+                  type="button"
                 >
                   Subscribe
                 </button>
               ) : (
-                <Tooltip content={`You've used ${quotaUsed} of ${quotaLimit} articles this ${planFrequencyConfig.displayName.toLowerCase()}. Articles are automatically generated based on your publishing schedule.`}>
+                <Tooltip
+                  content={`You've used ${quotaUsed} of ${quotaLimit} articles this ${planFrequencyConfig.displayName.toLowerCase()}. Articles are automatically generated based on your publishing schedule.`}
+                >
                   <button
-                    onClick={() => navigate('/posts')}
+                    onClick={handleNavigateToPosts}
                     className="px-3 sm:px-4 py-2 sm:py-2.5 bg-purple-600 text-white rounded-lg text-sm sm:text-base font-medium hover:bg-purple-700 transition-colors whitespace-nowrap"
+                    type="button"
                   >
                     {quotaUsed}/{quotaLimit} Articles
                   </button>
                 </Tooltip>
               )}
               <button
-                onClick={() => navigate('/settings')}
+                onClick={handleNavigateToSettings}
                 className="px-3 sm:px-4 py-2 sm:py-2.5 border border-blue-300 text-blue-600 rounded-lg text-sm sm:text-base font-medium hover:bg-blue-50 transition-colors flex items-center gap-1.5 sm:gap-2"
+                type="button"
               >
                 <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth="2"
+                    d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"
+                  />
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
                 </svg>
                 <span className="hidden sm:inline">Settings</span>
@@ -599,12 +802,15 @@ export default function Dashboard() {
         </header>
 
         <div className="p-4 sm:p-6 lg:p-8">
-          {/* No Active Subscription Banner */}
           {hasNoActivePlan && (
             <div className="bg-yellow-50 border border-yellow-200 rounded-xl p-4 sm:p-5 mb-6">
               <div className="flex items-start gap-3">
                 <svg className="w-5 h-5 sm:w-6 sm:h-6 text-yellow-600 mt-0.5 flex-shrink-0" fill="currentColor" viewBox="0 0 20 20">
-                  <path fillRule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clipRule="evenodd" />
+                  <path
+                    fillRule="evenodd"
+                    d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z"
+                    clipRule="evenodd"
+                  />
                 </svg>
                 <div className="flex-1">
                   <h3 className="text-sm sm:text-base font-semibold text-yellow-900 mb-1">No Active Subscription</h3>
@@ -612,8 +818,9 @@ export default function Dashboard() {
                     You don't have an active subscription. Please subscribe to a plan to continue using the service.
                   </p>
                   <button
-                    onClick={() => setIsPlansModalOpen(true)}
+                    onClick={handleOpenPlansModal}
                     className="px-4 py-2 bg-yellow-600 text-white rounded-lg text-sm font-medium hover:bg-yellow-700 transition-colors focus:outline-none focus:ring-2 focus:ring-yellow-500 focus:ring-offset-2"
+                    type="button"
                   >
                     Subscribe Now
                   </button>
@@ -622,26 +829,23 @@ export default function Dashboard() {
             </div>
           )}
 
-          {/* Trial Expiration Banner */}
-          {quota && typeof quota === 'object' && !('error' in quota) && (
+          {isQuotaStatus(quota) && (
             <TrialExpirationBanner
               quota={quota}
               publishedCount={publishedCount}
               scheduledCount={scheduledCount}
               draftsCount={draftsCount}
-              onUpgrade={() => setIsPlansModalOpen(true)}
+              onUpgrade={handleOpenPlansModal}
             />
           )}
 
-          {/* Plans Modal */}
           <PlansModal
             isOpen={isPlansModalOpen}
-            onClose={() => setIsPlansModalOpen(false)}
+            onClose={handleClosePlansModal}
             currentPlanName={planName}
             storeId={store?.id}
           />
 
-          {/* Stats Cards */}
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 sm:gap-5 lg:gap-6 mb-6 sm:mb-8">
             <div className="bg-white rounded-xl p-4 sm:p-5 lg:p-6 border border-gray-200 shadow-sm">
               <div className="flex items-center justify-between">
@@ -712,9 +916,7 @@ export default function Dashboard() {
             </div>
           </div>
 
-          {/* Main Content */}
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 sm:gap-5 lg:gap-6">
-            {/* Scheduled Articles Section */}
             <section className="lg:col-span-2 bg-white rounded-xl border border-gray-200 shadow-sm">
               <div className="p-4 sm:p-5 lg:p-6 border-b border-gray-200">
                 <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 sm:gap-4">
@@ -727,7 +929,6 @@ export default function Dashboard() {
                 </div>
               </div>
               <div className="p-4 sm:p-5 lg:p-6">
-                {/* Upcoming */}
                 {upcoming.length > 0 && (
                   <div className="mb-4 sm:mb-6">
                     <h3 className="text-xs sm:text-sm font-semibold text-gray-700 mb-3">UPCOMING ({upcoming.length})</h3>
@@ -746,6 +947,7 @@ export default function Dashboard() {
                             type="checkbox"
                             className="mt-1 w-4 h-4 sm:w-5 sm:h-5 text-blue-600 rounded flex-shrink-0"
                             onClick={(e) => e.stopPropagation()}
+                            readOnly
                           />
                           <div className="flex-1 min-w-0">
                             <h4 className="text-sm sm:text-base font-medium text-gray-900">{article.title}</h4>
@@ -765,12 +967,12 @@ export default function Dashboard() {
                   </div>
                 )}
 
-                {/* This Week */}
                 {thisWeek.length > 0 && (
                   <div className="mb-4 sm:mb-6">
                     <button
                       className="flex items-center justify-between w-full text-left mb-3"
                       onClick={() => toggleSection('thisWeek')}
+                      type="button"
                     >
                       <h3 className="text-xs sm:text-sm font-semibold text-gray-700">THIS WEEK ({thisWeek.length})</h3>
                       <svg
@@ -798,6 +1000,7 @@ export default function Dashboard() {
                               type="checkbox"
                               className="mt-1 w-4 h-4 sm:w-5 sm:h-5 text-blue-600 rounded flex-shrink-0"
                               onClick={(e) => e.stopPropagation()}
+                              readOnly
                             />
                             <div className="flex-1 min-w-0">
                               <h4 className="text-sm sm:text-base font-medium text-gray-900">{article.title}</h4>
@@ -808,11 +1011,11 @@ export default function Dashboard() {
                                   </svg>
                                   {formatDate(article.scheduledAt)}
                                 </span>
-                                <span className={`px-2 py-0.5 rounded text-xs font-medium w-fit ${
-                                  article.status === 'queued'
-                                    ? 'bg-blue-100 text-blue-700'
-                                    : 'bg-green-100 text-green-700'
-                                }`}>
+                                <span
+                                  className={`px-2 py-0.5 rounded text-xs font-medium w-fit ${
+                                    article.status === 'queued' ? 'bg-blue-100 text-blue-700' : 'bg-green-100 text-green-700'
+                                  }`}
+                                >
                                   {article.status === 'queued' ? 'Queued' : 'Auto-publish'}
                                 </span>
                               </div>
@@ -824,12 +1027,12 @@ export default function Dashboard() {
                   </div>
                 )}
 
-                {/* Later */}
                 {later.length > 0 && (
                   <div>
                     <button
                       className="flex items-center justify-between w-full text-left mb-3"
                       onClick={() => toggleSection('later')}
+                      type="button"
                     >
                       <h3 className="text-xs sm:text-sm font-semibold text-gray-700">LATER ({later.length})</h3>
                       <svg
@@ -857,6 +1060,7 @@ export default function Dashboard() {
                               type="checkbox"
                               className="mt-1 w-4 h-4 sm:w-5 sm:h-5 text-blue-600 rounded flex-shrink-0"
                               onClick={(e) => e.stopPropagation()}
+                              readOnly
                             />
                             <div className="flex-1 min-w-0">
                               <h4 className="text-sm sm:text-base font-medium text-gray-900">{article.title}</h4>
@@ -867,11 +1071,11 @@ export default function Dashboard() {
                                   </svg>
                                   {formatDate(article.scheduledAt)}
                                 </span>
-                                <span className={`px-2 py-0.5 rounded text-xs font-medium w-fit ${
-                                  article.status === 'queued'
-                                    ? 'bg-blue-100 text-blue-700'
-                                    : 'bg-green-100 text-green-700'
-                                }`}>
+                                <span
+                                  className={`px-2 py-0.5 rounded text-xs font-medium w-fit ${
+                                    article.status === 'queued' ? 'bg-blue-100 text-blue-700' : 'bg-green-100 text-green-700'
+                                  }`}
+                                >
                                   {article.status === 'queued' ? 'Queued' : 'Auto-publish'}
                                 </span>
                               </div>
@@ -891,9 +1095,7 @@ export default function Dashboard() {
               </div>
             </section>
 
-            {/* Sidebar */}
             <aside className="space-y-4 sm:space-y-5 lg:space-y-6">
-              {/* Publishing Schedule */}
               <div className="bg-white rounded-xl border border-gray-200 shadow-sm">
                 <div className="p-4 sm:p-5 lg:p-6 border-b border-gray-200">
                   <div className="flex items-center gap-2">
@@ -909,9 +1111,7 @@ export default function Dashboard() {
                       <div className="p-3 bg-blue-50 rounded-lg border border-blue-100">
                         <p className="text-xs text-gray-500 mb-1">Next Scheduled Publish</p>
                         <p className="text-sm font-semibold text-gray-900">{formatDate(schedule.nextPublish)}</p>
-                        {schedule.nextArticleTitle && (
-                          <p className="text-xs text-gray-500 mt-1 line-clamp-2">{schedule.nextArticleTitle}</p>
-                        )}
+                        {schedule.nextArticleTitle && <p className="text-xs text-gray-500 mt-1 line-clamp-2">{schedule.nextArticleTitle}</p>}
                       </div>
                     )}
                     <div>
@@ -933,8 +1133,9 @@ export default function Dashboard() {
                       <p className="text-base sm:text-lg font-semibold text-gray-900">{schedule.time}</p>
                     </div>
                     <button
-                      onClick={() => navigate('/schedule')}
+                      onClick={handleNavigateToSchedule}
                       className="block w-full mt-4 py-2.5 sm:py-2 text-sm text-purple-600 font-medium hover:bg-purple-50 rounded-lg transition-colors border border-purple-200 text-center touch-manipulation"
+                      type="button"
                     >
                       Edit Schedule
                     </button>
@@ -942,13 +1143,17 @@ export default function Dashboard() {
                 </div>
               </div>
 
-              {/* Article Performance */}
               {analyticsMetrics.chartData.length > 0 && (
                 <div className="bg-white rounded-xl border border-gray-200 shadow-sm">
                   <div className="p-4 sm:p-5 lg:p-6 border-b border-gray-200">
                     <div className="flex items-center gap-2">
                       <svg className="w-5 h-5 text-gray-600 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth="2"
+                          d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"
+                        />
                       </svg>
                       <h2 className="text-base sm:text-lg font-semibold text-gray-900">Top Performing Articles</h2>
                     </div>
@@ -975,7 +1180,6 @@ export default function Dashboard() {
                 </div>
               )}
 
-              {/* Quick Actions */}
               <div className="bg-white rounded-xl border border-gray-200 shadow-sm">
                 <div className="p-4 sm:p-5 lg:p-6 border-b border-gray-200">
                   <div className="flex items-center gap-2">
@@ -989,7 +1193,7 @@ export default function Dashboard() {
                   <div className="space-y-2 sm:space-y-3">
                     <button
                       type="button"
-                      onClick={() => navigate('/posts')}
+                      onClick={handleNavigateToPosts}
                       className="block w-full text-left px-3 sm:px-4 py-3 bg-blue-50 hover:bg-blue-100 rounded-lg transition-colors border border-blue-200 touch-manipulation"
                     >
                       <div className="flex items-center gap-2 sm:gap-3">
@@ -1001,7 +1205,7 @@ export default function Dashboard() {
                     </button>
                     <button
                       type="button"
-                      onClick={() => navigate('/schedule')}
+                      onClick={handleNavigateToSchedule}
                       className="block w-full text-left px-3 sm:px-4 py-3 bg-gray-50 hover:bg-gray-100 rounded-lg transition-colors border border-gray-200 touch-manipulation"
                     >
                       <div className="flex items-center gap-2 sm:gap-3">
@@ -1013,24 +1217,34 @@ export default function Dashboard() {
                     </button>
                     <button
                       type="button"
-                      onClick={() => navigate('/analytics')}
+                      onClick={handleNavigateToAnalytics}
                       className="block w-full text-left px-3 sm:px-4 py-3 bg-gray-50 hover:bg-gray-100 rounded-lg transition-colors border border-gray-200 touch-manipulation"
                     >
                       <div className="flex items-center gap-2 sm:gap-3">
                         <svg className="w-5 h-5 text-gray-600 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
+                          <path
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            strokeWidth="2"
+                            d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"
+                          />
                         </svg>
                         <span className="text-sm sm:text-base font-medium text-gray-900">View Analytics</span>
                       </div>
                     </button>
                     <button
                       type="button"
-                      onClick={() => navigate('/settings')}
+                      onClick={handleNavigateToSettings}
                       className="block w-full text-left px-3 sm:px-4 py-3 bg-gray-50 hover:bg-gray-100 rounded-lg transition-colors border border-gray-200 touch-manipulation"
                     >
                       <div className="flex items-center gap-2 sm:gap-3">
                         <svg className="w-5 h-5 text-gray-600 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+                          <path
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            strokeWidth="2"
+                            d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"
+                          />
                           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
                         </svg>
                         <span className="text-sm sm:text-base font-medium text-gray-900">Settings</span>

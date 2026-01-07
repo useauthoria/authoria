@@ -3,25 +3,77 @@ import { useNavigate } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
 import { getShopDomain } from '../lib/app-bridge';
 import { useStore, useQuotaStatus, queryKeys } from '../lib/api-cache';
-import { supabase, googleOAuthApi } from '../lib/api-client';
+import { supabase, googleOAuthApi, type Store, type QuotaStatus } from '../lib/api-client';
 import { useSettingsData, type SettingsData } from '../hooks/useSettingsData';
 import { AppBridgeContextualSaveBar } from '../components/AppBridgeContextualSaveBar';
-import { useAppBridge, useAppBridgeToast } from '../hooks/useAppBridge';
+import { useAppBridgeToast } from '../hooks/useAppBridge';
 import PlansModal from '../components/PlansModal';
 import { formatAPIErrorMessage } from '../utils/error-messages';
 import { HelpIcon } from '../components/Tooltip';
 
-function ToggleSwitch({
-  checked,
-  onChange,
-  id,
-  ariaLabel,
-}: {
-  checked: boolean;
-  onChange: (checked: boolean) => void;
-  id?: string;
-  ariaLabel?: string;
-}) {
+const INTEGRATION_CHECK_THROTTLE_MS = 1000;
+const POPUP_CHECK_INTERVAL_MS = 1000;
+const RESET_RELOAD_DELAY_MS = 1000;
+const POPUP_WIDTH = 500;
+const POPUP_HEIGHT = 600;
+const MAX_PROPERTY_ID_LENGTH = 50;
+const MAX_SITE_URL_LENGTH = 500;
+const MAX_AUTHOR_LENGTH = 200;
+const MAX_TOPIC_LENGTH = 100;
+const MAX_KEYWORD_LENGTH = 100;
+const MAX_ANGLE_LENGTH = 100;
+const MAX_TOPICS = 50;
+const MAX_KEYWORDS = 50;
+const MAX_ANGLES = 50;
+const DEFAULT_REVIEW_WINDOW_HOURS = 24;
+const SKELETON_CARDS_COUNT = 5;
+
+interface ToggleSwitchProps {
+  readonly checked: boolean;
+  readonly onChange: (checked: boolean) => void;
+  readonly id?: string;
+  readonly ariaLabel?: string;
+}
+
+interface AnalyticsIntegration {
+  readonly id: string;
+  readonly is_active: boolean;
+  readonly credentials: unknown;
+}
+
+interface GA4Credentials {
+  readonly property_id?: string;
+}
+
+interface GSCCredentials {
+  readonly site_url?: string;
+}
+
+interface StoreWithContentPreferences extends Store {
+  readonly require_approval?: boolean;
+  readonly review_window_hours?: number;
+  readonly content_preferences?: {
+    readonly topic_preferences?: readonly string[];
+    readonly keyword_focus?: readonly string[];
+    readonly content_angles?: readonly string[];
+    readonly default_author?: string;
+  };
+  readonly shop_metadata?: {
+    readonly name?: string;
+    readonly shop_name?: string;
+    readonly [key: string]: unknown;
+  };
+}
+
+interface WrappedStoreResponse {
+  readonly data: unknown;
+  readonly correlationId?: string;
+}
+
+type IntegrationType = 'google_analytics_4' | 'google_search_console';
+type ConnectingState = IntegrationType | null;
+
+const ToggleSwitch = ({ checked, onChange, id, ariaLabel }: ToggleSwitchProps): JSX.Element => {
   return (
     <label className="relative inline-flex items-center cursor-pointer touch-manipulation" htmlFor={id}>
       <input
@@ -35,9 +87,9 @@ function ToggleSwitch({
       <div className="w-10 h-5 sm:w-11 sm:h-6 bg-gray-200 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-purple-300 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 sm:after:h-5 sm:after:w-5 after:transition-all peer-checked:bg-purple-600"></div>
     </label>
   );
-}
+};
 
-function SkeletonCard() {
+const SkeletonCard = (): JSX.Element => {
   return (
     <div className="bg-white rounded-xl border border-gray-200 shadow-sm">
       <div className="p-4 sm:p-5 lg:p-6 border-b border-gray-200">
@@ -49,11 +101,154 @@ function SkeletonCard() {
       </div>
     </div>
   );
-}
+};
 
-export default function Settings() {
+const isWrappedStoreResponse = (store: unknown): store is WrappedStoreResponse => {
+  return (
+    store !== null &&
+    typeof store === 'object' &&
+    'data' in store &&
+    !('id' in store) &&
+    !('shop_domain' in store)
+  );
+};
+
+const isStoreWithContentPreferences = (store: Store | null): store is StoreWithContentPreferences => {
+  return store !== null && typeof store === 'object';
+};
+
+const isQuotaStatus = (quota: unknown): quota is QuotaStatus => {
+  return (
+    quota !== null &&
+    typeof quota === 'object' &&
+    'plan_name' in quota &&
+    typeof (quota as QuotaStatus).plan_name === 'string' &&
+    'articles_used' in quota &&
+    typeof (quota as QuotaStatus).articles_used === 'number'
+  );
+};
+
+const isQuotaWithError = (quota: unknown): quota is { error: unknown } => {
+  return quota !== null && typeof quota === 'object' && 'error' in quota;
+};
+
+const isGA4Credentials = (credentials: unknown): credentials is GA4Credentials => {
+  return credentials !== null && typeof credentials === 'object';
+};
+
+const isGSCCredentials = (credentials: unknown): credentials is GSCCredentials => {
+  return credentials !== null && typeof credentials === 'object';
+};
+
+const validatePropertyId = (propertyId: string): boolean => {
+  if (!propertyId || typeof propertyId !== 'string') {
+    return false;
+  }
+  const trimmed = propertyId.trim();
+  return trimmed.length > 0 && trimmed.length <= MAX_PROPERTY_ID_LENGTH;
+};
+
+const validateSiteUrl = (url: string): boolean => {
+  if (!url || typeof url !== 'string') {
+    return false;
+  }
+  const trimmed = url.trim();
+  if (trimmed.length === 0 || trimmed.length > MAX_SITE_URL_LENGTH) {
+    return false;
+  }
+  try {
+    new URL(trimmed);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+const validateAuthor = (author: string): boolean => {
+  if (typeof author !== 'string') {
+    return false;
+  }
+  return author.length <= MAX_AUTHOR_LENGTH;
+};
+
+const validateTopic = (topic: string): boolean => {
+  if (typeof topic !== 'string') {
+    return false;
+  }
+  const trimmed = topic.trim();
+  return trimmed.length > 0 && trimmed.length <= MAX_TOPIC_LENGTH;
+};
+
+const validateKeyword = (keyword: string): boolean => {
+  if (typeof keyword !== 'string') {
+    return false;
+  }
+  const trimmed = keyword.trim();
+  return trimmed.length > 0 && trimmed.length <= MAX_KEYWORD_LENGTH;
+};
+
+const validateAngle = (angle: string): boolean => {
+  if (typeof angle !== 'string') {
+    return false;
+  }
+  const trimmed = angle.trim();
+  return trimmed.length > 0 && trimmed.length <= MAX_ANGLE_LENGTH;
+};
+
+const formatStoreName = (store: StoreWithContentPreferences): string => {
+  const rawStoreName =
+    store.shop_metadata?.name || store.shop_metadata?.shop_name || store.shop_domain || 'Authoria';
+
+  let cleaned = rawStoreName;
+  if (cleaned.includes('.')) {
+    cleaned = cleaned.split('.')[0];
+  }
+
+  return cleaned
+    .replace(/[-_]/g, ' ')
+    .replace(/([a-z])([A-Z])/g, '$1 $2')
+    .split(' ')
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
+    .join(' ');
+};
+
+const formatPlanName = (planName: string | null | undefined): string => {
+  if (!planName || planName === 'Unknown' || planName === 'unknown') {
+    return 'No Plan';
+  }
+  return planName
+    .split('_')
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(' ');
+};
+
+const extractGA4PropertyId = (integration: AnalyticsIntegration | null): string => {
+  if (!integration || !isGA4Credentials(integration.credentials)) {
+    return '';
+  }
+  return integration.credentials.property_id || '';
+};
+
+const extractGSCSiteUrl = (integration: AnalyticsIntegration | null): string => {
+  if (!integration || !isGSCCredentials(integration.credentials)) {
+    return '';
+  }
+  return integration.credentials.site_url || '';
+};
+
+const getAllowedOAuthOrigins = (): readonly string[] => {
+  if (typeof window === 'undefined') {
+    return [];
+  }
+  return [window.location.origin, 'https://supabase.co', 'https://app.supabase.com'];
+};
+
+const isAllowedOrigin = (origin: string): boolean => {
+  return getAllowedOAuthOrigins().includes(origin);
+};
+
+export default function Settings(): JSX.Element {
   const navigate = useNavigate();
-  const appBridge = useAppBridge();
   const queryClient = useQueryClient();
   const shopDomain = useMemo(() => getShopDomain(), []);
 
@@ -63,19 +258,17 @@ export default function Settings() {
     error: storeError,
   } = useStore(shopDomain ?? '');
 
-  // Safety check: Unwrap if the store data is still wrapped in API response format
   const store = useMemo(() => {
-    if (!storeRaw) return null;
-    // Check if it's wrapped (has 'data' and 'correlationId' but not 'id' or 'shop_domain')
-    if (typeof storeRaw === 'object' && 'data' in storeRaw && !('id' in storeRaw) && !('shop_domain' in storeRaw)) {
-      console.warn('[Settings] Store data appears wrapped, unwrapping');
-      return (storeRaw as { data: unknown }).data as typeof storeRaw;
+    if (!storeRaw) {
+      return null;
     }
-    return storeRaw;
+    if (isWrappedStoreResponse(storeRaw)) {
+      return storeRaw.data as Store | null;
+    }
+    return storeRaw as Store | null;
   }, [storeRaw]);
 
-
-  const storeId = store?.id ?? '';
+  const storeId = useMemo(() => store?.id ?? '', [store?.id]);
 
   const {
     data: quota,
@@ -83,7 +276,6 @@ export default function Settings() {
     error: quotaError,
     isError: quotaIsError,
   } = useQuotaStatus(storeId);
-
 
   const {
     settings,
@@ -101,17 +293,15 @@ export default function Settings() {
   } = useSettingsData({
     enableRealTime: true,
     autoSave: false,
-    onError: useCallback((error: Error) => {
-      console.error('Settings error:', error);
+    onError: useCallback(() => {
     }, []),
   });
 
   const { showToast } = useAppBridgeToast();
 
-  // Local state for form fields
   const [requireApproval, setRequireApproval] = useState(false);
   const [defaultAuthor, setDefaultAuthor] = useState('');
-  const [reviewWindowHours, setReviewWindowHours] = useState(24);
+  const [reviewWindowHours, setReviewWindowHours] = useState(DEFAULT_REVIEW_WINDOW_HOURS);
   const [emailNotificationsEnabled, setEmailNotificationsEnabled] = useState(true);
   const [emailArticlePublished, setEmailArticlePublished] = useState(true);
   const [emailArticleScheduled, setEmailArticleScheduled] = useState(true);
@@ -121,20 +311,44 @@ export default function Settings() {
   const [googleSearchConsoleEnabled, setGoogleSearchConsoleEnabled] = useState(false);
   const [googleSearchConsoleSiteUrl, setGoogleSearchConsoleSiteUrl] = useState('');
   const [googleSearchConsoleConnected, setGoogleSearchConsoleConnected] = useState(false);
-  const [isConnectingGoogle, setIsConnectingGoogle] = useState<string | null>(null);
+  const [isConnectingGoogle, setIsConnectingGoogle] = useState<ConnectingState>(null);
   const [integrationCheckError, setIntegrationCheckError] = useState<string | null>(null);
-  const [topicPreferences, setTopicPreferences] = useState<string[]>([]);
-  const [keywordFocus, setKeywordFocus] = useState<string[]>([]);
-  const [contentAngles, setContentAngles] = useState<string[]>([]);
+  const [topicPreferences, setTopicPreferences] = useState<readonly string[]>([]);
+  const [keywordFocus, setKeywordFocus] = useState<readonly string[]>([]);
+  const [contentAngles, setContentAngles] = useState<readonly string[]>([]);
   const [newTopic, setNewTopic] = useState('');
   const [newKeyword, setNewKeyword] = useState('');
   const [newAngle, setNewAngle] = useState('');
   const [isPlansModalOpen, setIsPlansModalOpen] = useState(false);
   const [integrationCheckTrigger, setIntegrationCheckTrigger] = useState(0);
+  const [isInitialized, setIsInitialized] = useState(false);
+
+  const isMountedRef = useRef(true);
   const lastIntegrationCheckRef = useRef<number>(0);
   const integrationCheckAbortRef = useRef<AbortController | null>(null);
+  const oauthPopupRef = useRef<Window | null>(null);
+  const oauthMessageHandlerRef = useRef<((event: MessageEvent) => void) | null>(null);
+  const oauthCheckIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // Check if integrations are connected
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+      if (integrationCheckAbortRef.current) {
+        integrationCheckAbortRef.current.abort();
+      }
+      if (oauthCheckIntervalRef.current) {
+        clearInterval(oauthCheckIntervalRef.current);
+      }
+      if (oauthMessageHandlerRef.current) {
+        window.removeEventListener('message', oauthMessageHandlerRef.current);
+      }
+      if (oauthPopupRef.current && !oauthPopupRef.current.closed) {
+        oauthPopupRef.current.close();
+      }
+    };
+  }, []);
+
   useEffect(() => {
     if (!storeId) {
       setIntegrationCheckError(null);
@@ -145,84 +359,76 @@ export default function Settings() {
       return;
     }
 
-    // Abort any in-flight checks
     if (integrationCheckAbortRef.current) {
       integrationCheckAbortRef.current.abort();
     }
 
     const checkIntegrations = async () => {
-      // Throttle: only check if at least 1 second has passed since last check
       const now = Date.now();
-      if (now - lastIntegrationCheckRef.current < 1000) {
+      if (now - lastIntegrationCheckRef.current < INTEGRATION_CHECK_THROTTLE_MS) {
         return;
       }
       lastIntegrationCheckRef.current = now;
 
-      // Create new abort controller for this check
       const abortController = new AbortController();
       integrationCheckAbortRef.current = abortController;
 
       try {
+        if (!isMountedRef.current) {
+          return;
+        }
         setIntegrationCheckError(null);
-        const { data: ga4Integration, error: ga4Error } = await supabase
-          .from('analytics_integrations')
-          .select('id, is_active, credentials')
-          .eq('store_id', storeId)
-          .eq('integration_type', 'google_analytics_4')
-          .eq('is_active', true)
-          .maybeSingle();
 
-        const { data: gscIntegration, error: gscError } = await supabase
-          .from('analytics_integrations')
-          .select('id, is_active, credentials')
-          .eq('store_id', storeId)
-          .eq('integration_type', 'google_search_console')
-          .eq('is_active', true)
-          .maybeSingle();
+        const [ga4Result, gscResult] = await Promise.all([
+          supabase
+            .from('analytics_integrations')
+            .select('id, is_active, credentials')
+            .eq('store_id', storeId)
+            .eq('integration_type', 'google_analytics_4')
+            .eq('is_active', true)
+            .maybeSingle(),
+          supabase
+            .from('analytics_integrations')
+            .select('id, is_active, credentials')
+            .eq('store_id', storeId)
+            .eq('integration_type', 'google_search_console')
+            .eq('is_active', true)
+            .maybeSingle(),
+        ]);
 
-        // Check if request was aborted
-        if (abortController.signal.aborted) {
+        if (abortController.signal.aborted || !isMountedRef.current) {
           return;
         }
 
-        if (ga4Error) {
-          console.error('Error checking Google Analytics integration:', ga4Error);
+        if (ga4Result.error) {
+          const errorMessage = formatAPIErrorMessage(ga4Result.error, {
+            action: 'check Google Analytics integration',
+            resource: 'integration',
+          });
           setIntegrationCheckError('Failed to check integration status. Please refresh the page.');
         } else {
-          const isConnected = !!ga4Integration;
+          const isConnected = !!ga4Result.data;
           setGoogleAnalyticsConnected(isConnected);
-          if (isConnected && ga4Integration?.credentials && typeof ga4Integration.credentials === 'object') {
-            const credentials = ga4Integration.credentials as { property_id?: string };
-            if (credentials.property_id) {
-              setGoogleAnalyticsPropertyId(credentials.property_id);
-            } else {
-              setGoogleAnalyticsPropertyId('');
-            }
-          } else {
-            setGoogleAnalyticsPropertyId('');
-          }
+          setGoogleAnalyticsPropertyId(extractGA4PropertyId(ga4Result.data));
         }
 
-        if (gscError) {
-          console.error('Error checking Google Search Console integration:', gscError);
+        if (gscResult.error) {
+          const errorMessage = formatAPIErrorMessage(gscResult.error, {
+            action: 'check Google Search Console integration',
+            resource: 'integration',
+          });
           setIntegrationCheckError('Failed to check integration status. Please refresh the page.');
         } else {
-          const isConnected = !!gscIntegration;
+          const isConnected = !!gscResult.data;
           setGoogleSearchConsoleConnected(isConnected);
-          if (isConnected && gscIntegration?.credentials && typeof gscIntegration.credentials === 'object') {
-            const credentials = gscIntegration.credentials as { site_url?: string };
-            if (credentials.site_url) {
-              setGoogleSearchConsoleSiteUrl(credentials.site_url);
-            } else {
-              setGoogleSearchConsoleSiteUrl('');
-            }
-          } else {
-            setGoogleSearchConsoleSiteUrl('');
-          }
+          setGoogleSearchConsoleSiteUrl(extractGSCSiteUrl(gscResult.data));
         }
       } catch (error) {
-        if (!abortController.signal.aborted) {
-          console.error('Error checking integrations:', error);
+        if (!abortController.signal.aborted && isMountedRef.current) {
+          const errorMessage = formatAPIErrorMessage(error, {
+            action: 'check integrations',
+            resource: 'integration',
+          });
           setIntegrationCheckError('Failed to check integration status. Please refresh the page.');
         }
       }
@@ -237,8 +443,10 @@ export default function Settings() {
     };
   }, [storeId, integrationCheckTrigger]);
 
-  // Handle OAuth callback redirect
   useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
     const urlParams = new URLSearchParams(window.location.search);
     const connected = urlParams.get('connected');
     if (connected === 'google_analytics_4') {
@@ -254,65 +462,29 @@ export default function Settings() {
     }
   }, [showToast]);
 
-  // Track if we've initialized to prevent overriding user changes
-  const [isInitialized, setIsInitialized] = useState(false);
-
-  // Initialize form values from settings and store (only once on mount)
   useEffect(() => {
-    if (isInitialized) return; // Don't re-initialize if user has made changes
-
-    if (settings) {
-      // Initialize email notifications from settings
-      if (settings.notifications?.email) {
-        setEmailNotificationsEnabled(settings.notifications.email.enabled ?? true);
-        setEmailArticlePublished(settings.notifications.email.article_published ?? true);
-        setEmailArticleScheduled(settings.notifications.email.article_scheduled ?? true);
-      }
+    if (isInitialized) {
+      return;
     }
-    if (store) {
-      const storeData = store as {
-        require_approval?: boolean;
-        review_window_hours?: number;
-        brand_safety_enabled?: boolean;
-        content_preferences?: {
-          topic_preferences?: string[];
-          keyword_focus?: string[];
-          content_angles?: string[];
-          default_author?: string; // Added for default author
-        };
-        readonly shop_metadata?: {
-          readonly name?: string;
-          readonly shop_name?: string;
-          readonly [key: string]: unknown;
-        };
-        readonly shop_domain?: string;
-      };
-      setRequireApproval(storeData.require_approval ?? false);
 
-      let rawStoreName = storeData.shop_metadata?.name ||
-        storeData.shop_metadata?.shop_name ||
-        storeData.shop_domain ||
-        'Authoria';
+    if (settings?.notifications?.email) {
+      setEmailNotificationsEnabled(settings.notifications.email.enabled ?? true);
+      setEmailArticlePublished(settings.notifications.email.article_published ?? true);
+      setEmailArticleScheduled(settings.notifications.email.article_scheduled ?? true);
+    }
 
-      // Clean up the name similar to Dashboard logic
-      if (rawStoreName.includes('.')) {
-        rawStoreName = rawStoreName.split('.')[0];
-      }
+    if (isStoreWithContentPreferences(store)) {
+      setRequireApproval(store.require_approval ?? false);
+      setReviewWindowHours(store.review_window_hours ?? DEFAULT_REVIEW_WINDOW_HOURS);
 
-      const storeName = rawStoreName
-        .replace(/[-_]/g, ' ')
-        .replace(/([a-z])([A-Z])/g, '$1 $2')
-        .split(' ')
-        .map((word) => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
-        .join(' ');
-
-      const defaultAuthorValue = storeData.content_preferences?.default_author || `${storeName}'s Editorial`;
+      const storeName = formatStoreName(store);
+      const contentPrefs = store.content_preferences as StoreWithContentPreferences['content_preferences'] | undefined;
+      const defaultAuthorValue = contentPrefs?.default_author || `${storeName}'s Editorial`;
       setDefaultAuthor(defaultAuthorValue);
 
-      setReviewWindowHours(storeData.review_window_hours ?? 24);
-      setTopicPreferences(storeData.content_preferences?.topic_preferences || []);
-      setKeywordFocus(storeData.content_preferences?.keyword_focus || []);
-      setContentAngles(storeData.content_preferences?.content_angles || []);
+      setTopicPreferences(contentPrefs?.topic_preferences || []);
+      setKeywordFocus(contentPrefs?.keyword_focus || []);
+      setContentAngles(contentPrefs?.content_angles || []);
     }
 
     if (settings || store) {
@@ -320,33 +492,153 @@ export default function Settings() {
     }
   }, [settings, store, isInitialized]);
 
-  // Initialize integration enabled states after checking connections (only once on mount or when connection changes)
   useEffect(() => {
-    // Only auto-enable if connected, but don't disable if user has manually disabled
-    // This prevents the effect from overriding user preferences
     if (googleAnalyticsConnected && !googleAnalyticsEnabled) {
       setGoogleAnalyticsEnabled(true);
     }
     if (googleSearchConsoleConnected && !googleSearchConsoleEnabled) {
       setGoogleSearchConsoleEnabled(true);
     }
-  }, [googleAnalyticsConnected, googleSearchConsoleConnected]); // Removed enabled states from dependencies to prevent loops
+  }, [googleAnalyticsConnected, googleSearchConsoleConnected]);
 
+  const handleConnectOAuth = useCallback(
+    async (integrationType: IntegrationType, propertyId?: string, siteUrl?: string) => {
+      if (!storeId) {
+        showToast("We couldn't load your store information. Please refresh the page and try again.", {
+          isError: true,
+        });
+        return;
+      }
+
+      if (integrationType === 'google_analytics_4' && !validatePropertyId(propertyId || '')) {
+        showToast('Please enter your Google Analytics Property ID before connecting.', { isError: true });
+        return;
+      }
+
+      if (integrationType === 'google_search_console' && !validateSiteUrl(siteUrl || '')) {
+        showToast('Please enter your site URL before connecting.', { isError: true });
+        return;
+      }
+
+      setIsConnectingGoogle(integrationType);
+
+      try {
+        const { authUrl } = await googleOAuthApi.getAuthUrl(storeId, integrationType, propertyId, siteUrl);
+
+        if (typeof window === 'undefined') {
+          setIsConnectingGoogle(null);
+          return;
+        }
+
+        const popup = window.open(authUrl, 'google-oauth', `width=${POPUP_WIDTH},height=${POPUP_HEIGHT},scrollbars=yes,resizable=yes`);
+
+        if (!popup) {
+          showToast('Popup blocked. Please allow popups for this site.', { isError: true });
+          setIsConnectingGoogle(null);
+          return;
+        }
+
+        oauthPopupRef.current = popup;
+
+        const messageHandler = (event: MessageEvent) => {
+          if (!isAllowedOrigin(event.origin)) {
+            return;
+          }
+
+          if (event.data.type === 'oauth-success') {
+            window.removeEventListener('message', messageHandler);
+            oauthMessageHandlerRef.current = null;
+            if (popup && !popup.closed) {
+              popup.close();
+            }
+            oauthPopupRef.current = null;
+
+            if (integrationType === 'google_analytics_4') {
+              setGoogleAnalyticsConnected(true);
+              setGoogleAnalyticsEnabled(true);
+              showToast('Google Analytics connected successfully!', { isError: false });
+            } else {
+              setGoogleSearchConsoleConnected(true);
+              setGoogleSearchConsoleEnabled(true);
+              showToast('Google Search Console connected successfully!', { isError: false });
+            }
+
+            if (shopDomain) {
+              queryClient.invalidateQueries({ queryKey: queryKeys.store(shopDomain) });
+            }
+            setIntegrationCheckTrigger((prev) => prev + 1);
+            setIsConnectingGoogle(null);
+          } else if (event.data.type === 'oauth-error') {
+            window.removeEventListener('message', messageHandler);
+            oauthMessageHandlerRef.current = null;
+            if (popup && !popup.closed) {
+              popup.close();
+            }
+            oauthPopupRef.current = null;
+            const errorMsg = event.data.error || "We couldn't complete the connection";
+            showToast(`Connection failed: ${errorMsg}. Please try again.`, { isError: true });
+            setIsConnectingGoogle(null);
+          }
+        };
+
+        oauthMessageHandlerRef.current = messageHandler;
+        window.addEventListener('message', messageHandler);
+
+        const checkClosed = setInterval(() => {
+          if (popup.closed) {
+            clearInterval(checkClosed);
+            oauthCheckIntervalRef.current = null;
+            if (oauthMessageHandlerRef.current) {
+              window.removeEventListener('message', oauthMessageHandlerRef.current);
+              oauthMessageHandlerRef.current = null;
+            }
+            oauthPopupRef.current = null;
+
+            const message =
+              integrationType === 'google_analytics_4'
+                ? 'Connection cancelled. Please try again if you want to connect Google Analytics.'
+                : 'Connection cancelled. Please try again if you want to connect Google Search Console.';
+            showToast(message, { isError: false, duration: 3000 });
+            setIsConnectingGoogle(null);
+          }
+        }, POPUP_CHECK_INTERVAL_MS);
+
+        oauthCheckIntervalRef.current = checkClosed;
+      } catch (error) {
+        if (!isMountedRef.current) {
+          return;
+        }
+        const errorMessage = formatAPIErrorMessage(error, {
+          action: `connect ${integrationType === 'google_analytics_4' ? 'Google Analytics' : 'Google Search Console'}`,
+          resource: 'integration',
+        });
+        showToast(errorMessage, { isError: true });
+        setIsConnectingGoogle(null);
+      }
+    },
+    [storeId, shopDomain, queryClient, showToast],
+  );
 
   const handleSave = useCallback(async () => {
-    if (!store?.id) {
-      showToast("We couldn't load your store information. Please refresh the page and try again.", { isError: true });
+    if (!isStoreWithContentPreferences(store) || !store.id) {
+      showToast("We couldn't load your store information. Please refresh the page and try again.", {
+        isError: true,
+      });
       return;
     }
 
     if (!isOnline) {
-      showToast("You're currently offline. Please check your internet connection and try again.", { isError: true });
+      showToast("You're currently offline. Please check your internet connection and try again.", {
+        isError: true,
+      });
+      return;
+    }
+
+    if (!isMountedRef.current) {
       return;
     }
 
     try {
-      // Prepare settings updates (for notifications)
-      // Brand safety is always enabled, so we always set it to true
       const updatedSettings: Partial<SettingsData> = {
         brand_safety_enabled: true,
         notifications: {
@@ -359,24 +651,23 @@ export default function Settings() {
         },
       };
 
-      // Update settings via the settings hook
       updateSettings(updatedSettings);
 
-      // Update store-specific fields (approval settings and content preferences)
-      // Brand safety is always enabled
+      const contentPrefs = {
+        default_author: defaultAuthor,
+        topic_preferences: topicPreferences,
+        keyword_focus: keywordFocus,
+        content_angles: contentAngles,
+        internal_linking_preferences: {},
+      } as Record<string, unknown>;
+
       const { error: storeUpdateError } = await supabase
         .from('stores')
         .update({
           require_approval: requireApproval,
           review_window_hours: reviewWindowHours,
           brand_safety_enabled: true,
-          content_preferences: {
-            default_author: defaultAuthor,
-            topic_preferences: topicPreferences,
-            keyword_focus: keywordFocus,
-            content_angles: contentAngles,
-            internal_linking_preferences: {},
-          },
+          content_preferences: contentPrefs,
         })
         .eq('id', store.id);
 
@@ -384,16 +675,18 @@ export default function Settings() {
         throw new Error(storeUpdateError.message);
       }
 
-      // Invalidate store cache so Dashboard and other pages get updated data immediately
-      queryClient.invalidateQueries({ queryKey: queryKeys.store(shopDomain ?? '') });
+      if (!isMountedRef.current) {
+        return;
+      }
 
-      // Save settings (this will update language_settings via storeApi.updateStore)
-      // This also invalidates cache, but we do it explicitly above to ensure immediate sync
+      queryClient.invalidateQueries({ queryKey: queryKeys.store(shopDomain ?? '') });
       saveSettings();
 
       showToast('Settings saved successfully', { isError: false });
     } catch (error) {
-      console.error('Failed to save settings:', error);
+      if (!isMountedRef.current) {
+        return;
+      }
       const errorMessage = formatAPIErrorMessage(error, { action: 'save settings', resource: 'settings' });
       showToast(errorMessage, { isError: true });
     }
@@ -408,6 +701,7 @@ export default function Settings() {
     topicPreferences,
     keywordFocus,
     contentAngles,
+    defaultAuthor,
     updateSettings,
     saveSettings,
     shopDomain,
@@ -416,25 +710,20 @@ export default function Settings() {
     isOnline,
   ]);
 
-  // Track changes when form fields change
   const handleFieldChange = useCallback(
     (field: string, value: unknown) => {
       switch (field) {
         case 'google_analytics_enabled':
           setGoogleAnalyticsEnabled(value as boolean);
-          // Integration state is UI-only; actual integration is managed via analytics_integrations table
           break;
         case 'google_analytics_property_id':
           setGoogleAnalyticsPropertyId(value as string);
-          // Property ID is stored in analytics_integrations.credentials when connected
           break;
         case 'google_search_console_enabled':
           setGoogleSearchConsoleEnabled(value as boolean);
-          // Integration state is UI-only; actual integration is managed via analytics_integrations table
           break;
         case 'google_search_console_site_url':
           setGoogleSearchConsoleSiteUrl(value as string);
-          // Site URL is stored in analytics_integrations.credentials when connected
           break;
         case 'email_notifications_enabled':
           setEmailNotificationsEnabled(value as boolean);
@@ -477,26 +766,22 @@ export default function Settings() {
           break;
       }
     },
-    [
-      settings,
-      googleAnalyticsEnabled,
-      googleAnalyticsPropertyId,
-      googleSearchConsoleEnabled,
-      googleSearchConsoleSiteUrl,
-      emailNotificationsEnabled,
-      emailArticlePublished,
-      emailArticleScheduled,
-      updateSettings,
-    ],
+    [settings, emailNotificationsEnabled, emailArticlePublished, emailArticleScheduled, updateSettings],
   );
 
   const handleResetSettings = useCallback(async () => {
-    if (!store?.id) {
-      showToast("We couldn't load your store information. Please refresh the page and try again.", { isError: true });
+    if (!isStoreWithContentPreferences(store) || !store.id) {
+      showToast("We couldn't load your store information. Please refresh the page and try again.", {
+        isError: true,
+      });
       return;
     }
 
-    if (!confirm('Are you sure you want to reset all settings to default values? This action cannot be undone.')) {
+    if (!window.confirm('Are you sure you want to reset all settings to default values? This action cannot be undone.')) {
+      return;
+    }
+
+    if (!isMountedRef.current) {
       return;
     }
 
@@ -507,7 +792,7 @@ export default function Settings() {
           language_settings: { primary: 'en', enabled: ['en'] },
           frequency_settings: { interval: 'weekly', count: 2 },
           require_approval: false,
-          review_window_hours: 24,
+          review_window_hours: DEFAULT_REVIEW_WINDOW_HOURS,
           content_preferences: {
             default_author: '',
             topic_preferences: [],
@@ -522,7 +807,10 @@ export default function Settings() {
         throw new Error(error.message);
       }
 
-      // Reset integration states
+      if (!isMountedRef.current) {
+        return;
+      }
+
       setGoogleAnalyticsConnected(false);
       setGoogleAnalyticsEnabled(false);
       setGoogleAnalyticsPropertyId('');
@@ -534,76 +822,145 @@ export default function Settings() {
       resetSettings();
       showToast('Settings reset successfully. Reloading page...', { isError: false });
       setTimeout(() => {
-        window.location.reload();
-      }, 1000);
+        if (typeof window !== 'undefined') {
+          window.location.reload();
+        }
+      }, RESET_RELOAD_DELAY_MS);
     } catch (error) {
-      console.error('Failed to reset settings:', error);
+      if (!isMountedRef.current) {
+        return;
+      }
       const errorMessage = formatAPIErrorMessage(error, { action: 'reset settings', resource: 'settings' });
       showToast(errorMessage, { isError: true });
     }
   }, [store, resetSettings, showToast]);
 
+  const handleAddTopic = useCallback(() => {
+    if (!validateTopic(newTopic)) {
+      return;
+    }
+    if (topicPreferences.length >= MAX_TOPICS) {
+      showToast(`Maximum ${MAX_TOPICS} topics allowed`, { isError: true });
+      return;
+    }
+    setTopicPreferences([...topicPreferences, newTopic.trim()]);
+    setNewTopic('');
+  }, [newTopic, topicPreferences, showToast]);
+
+  const handleAddKeyword = useCallback(() => {
+    if (!validateKeyword(newKeyword)) {
+      return;
+    }
+    if (keywordFocus.length >= MAX_KEYWORDS) {
+      showToast(`Maximum ${MAX_KEYWORDS} keywords allowed`, { isError: true });
+      return;
+    }
+    setKeywordFocus([...keywordFocus, newKeyword.trim()]);
+    setNewKeyword('');
+  }, [newKeyword, keywordFocus, showToast]);
+
+  const handleAddAngle = useCallback(() => {
+    if (!validateAngle(newAngle)) {
+      return;
+    }
+    if (contentAngles.length >= MAX_ANGLES) {
+      showToast(`Maximum ${MAX_ANGLES} angles allowed`, { isError: true });
+      return;
+    }
+    setContentAngles([...contentAngles, newAngle.trim()]);
+    setNewAngle('');
+  }, [newAngle, contentAngles, showToast]);
+
+  const handleRemoveTopic = useCallback(
+    (index: number) => {
+      setTopicPreferences(topicPreferences.filter((_, i) => i !== index));
+    },
+    [topicPreferences],
+  );
+
+  const handleRemoveKeyword = useCallback(
+    (index: number) => {
+      setKeywordFocus(keywordFocus.filter((_, i) => i !== index));
+    },
+    [keywordFocus],
+  );
+
+  const handleRemoveAngle = useCallback(
+    (index: number) => {
+      setContentAngles(contentAngles.filter((_, i) => i !== index));
+    },
+    [contentAngles],
+  );
+
+  const handleReload = useCallback(() => {
+    if (typeof window !== 'undefined') {
+      window.location.reload();
+    }
+  }, []);
+
   const isLoading = storeLoading || settingsLoading || quotaLoading;
   const error = storeError || settingsErrorObj;
 
-
-  // Format plan name for display
   const planName = useMemo(() => {
-    if (quotaLoading) return 'Loading...';
+    if (quotaLoading) {
+      return 'Loading...';
+    }
     if (quotaIsError || quotaError) {
-      console.error('[Settings] Quota error:', quotaError);
       return 'Error';
     }
-    if (!quota) return 'No Plan';
-    // Handle error case from backend
-    if (typeof quota === 'object' && 'error' in quota && quota.error) {
-      console.error('[Settings] Quota API error:', quota.error);
+    if (!quota) {
       return 'No Plan';
     }
-    const name = quota.plan_name || 'Unknown';
-    if (!name || name === 'Unknown') {
+    if (isQuotaWithError(quota)) {
       return 'No Plan';
     }
-    return name
-      .split('_')
-      .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
-      .join(' ');
+    if (!isQuotaStatus(quota)) {
+      return 'No Plan';
+    }
+    return formatPlanName(quota.plan_name);
   }, [quota, quotaLoading, quotaIsError, quotaError]);
 
-  // Check if user has no active plan (no plan or not on trial)
   const hasNoActivePlan = useMemo(() => {
-    if (quotaLoading || quotaIsError || !quota) return false;
-    if (typeof quota === 'object' && 'error' in quota && quota.error) return true;
+    if (quotaLoading || quotaIsError || !quota) {
+      return false;
+    }
+    if (isQuotaWithError(quota)) {
+      return true;
+    }
+    if (!isQuotaStatus(quota)) {
+      return false;
+    }
     const name = quota.plan_name || '';
     const isTrial = quota.is_trial || false;
-    // No plan if plan_name is missing, unknown, or empty, and not on trial
     return (!name || name === 'Unknown' || name === 'unknown') && !isTrial;
   }, [quota, quotaLoading, quotaIsError]);
 
-  // Format renewal date
   const renewalDate = useMemo(() => {
-    if (quotaLoading || quotaIsError || !quota) return null;
-    // Handle error case from backend
-    if (typeof quota === 'object' && 'error' in quota && quota.error) {
+    if (quotaLoading || quotaIsError || !quota) {
       return null;
     }
-    // If on trial, show trial end date
+    if (isQuotaWithError(quota)) {
+      return null;
+    }
+    if (!isQuotaStatus(quota)) {
+      return null;
+    }
     if (quota.is_trial && quota.trial_ends_at) {
       return new Date(quota.trial_ends_at);
     }
-    // For paid plans, renewal is typically monthly - show next month from now
-    // In a real implementation, this would come from Shopify subscription data
     const nextMonth = new Date();
     nextMonth.setMonth(nextMonth.getMonth() + 1);
     return nextMonth;
   }, [quota, quotaLoading, quotaIsError]);
 
   const formatRenewalDate = useCallback((date: Date | null): string => {
-    if (!date) return 'N/A';
+    if (!date) {
+      return 'N/A';
+    }
     return date.toLocaleDateString('en-US', {
       month: 'long',
       day: 'numeric',
-      year: 'numeric'
+      year: 'numeric',
     });
   }, []);
 
@@ -617,8 +974,9 @@ export default function Settings() {
               We couldn't determine your shop information. Please refresh the page and try again.
             </p>
             <button
-              onClick={() => window.location.reload()}
+              onClick={handleReload}
               className="px-4 py-2 bg-red-600 text-white text-sm font-medium rounded-md hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-offset-2"
+              type="button"
             >
               Refresh Page
             </button>
@@ -636,6 +994,7 @@ export default function Settings() {
             onClick={() => navigate('/dashboard')}
             className="text-gray-600 hover:text-gray-900 transition-colors touch-manipulation focus:outline-none focus:ring-2 focus:ring-purple-500 focus:ring-offset-2 rounded"
             aria-label="Back to dashboard"
+            type="button"
           >
             <svg className="w-5 h-5 sm:w-6 sm:h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 19l-7-7 7-7" />
@@ -648,7 +1007,6 @@ export default function Settings() {
         </div>
       </header>
 
-      {/* App Bridge Contextual Save Bar */}
       <AppBridgeContextualSaveBar
         visible={hasUnsavedChanges}
         options={{
@@ -666,7 +1024,6 @@ export default function Settings() {
         }}
       />
 
-      {/* Legacy Contextual Save Bar (fallback) */}
       {hasUnsavedChanges && (
         <div className="bg-purple-600 text-white px-4 sm:px-6 lg:px-8 py-3 sm:py-4 flex items-center justify-between flex-shrink-0">
           <p className="text-sm font-medium">You have unsaved changes</p>
@@ -675,6 +1032,7 @@ export default function Settings() {
               onClick={resetSettings}
               disabled={isSaving}
               className="px-4 py-2 text-sm font-medium text-white hover:text-gray-200 focus:outline-none focus:ring-2 focus:ring-white focus:ring-offset-2 focus:ring-offset-purple-600 rounded disabled:opacity-50"
+              type="button"
             >
               Discard
             </button>
@@ -682,6 +1040,7 @@ export default function Settings() {
               onClick={handleSave}
               disabled={isSaving || !isOnline}
               className="px-4 py-2 bg-white text-purple-600 text-sm font-medium rounded-md hover:bg-gray-100 focus:outline-none focus:ring-2 focus:ring-white focus:ring-offset-2 focus:ring-offset-purple-600 disabled:opacity-50"
+              type="button"
             >
               {isSaving ? 'Saving...' : 'Save Changes'}
             </button>
@@ -689,7 +1048,6 @@ export default function Settings() {
         </div>
       )}
 
-      {/* Success/Error Messages */}
       {saveSuccess && (
         <div className="bg-green-50 border-b border-green-200 px-4 sm:px-6 lg:px-8 py-3 flex-shrink-0">
           <p className="text-sm text-green-800">Settings saved successfully</p>
@@ -698,9 +1056,7 @@ export default function Settings() {
 
       {saveError && (
         <div className="bg-red-50 border-b border-red-200 px-4 sm:px-6 lg:px-8 py-3 flex-shrink-0">
-          <p className="text-sm text-red-800">
-            {formatAPIErrorMessage(saveError, { action: 'save settings', resource: 'settings' })}
-          </p>
+          <p className="text-sm text-red-800">{formatAPIErrorMessage(saveError, { action: 'save settings', resource: 'settings' })}</p>
         </div>
       )}
 
@@ -717,9 +1073,10 @@ export default function Settings() {
             <button
               onClick={() => {
                 setIntegrationCheckError(null);
-                setIntegrationCheckTrigger(prev => prev + 1);
+                setIntegrationCheckTrigger((prev) => prev + 1);
               }}
               className="text-sm text-yellow-900 hover:text-yellow-950 underline"
+              type="button"
             >
               Dismiss
             </button>
@@ -730,13 +1087,12 @@ export default function Settings() {
       <div className="flex-1 overflow-y-auto p-4 sm:p-6 lg:p-8">
         {isLoading ? (
           <div className="max-w-4xl mx-auto space-y-4 sm:space-y-5 lg:space-y-6">
-            {[1, 2, 3, 4, 5].map((i) => (
+            {Array.from({ length: SKELETON_CARDS_COUNT }, (_, i) => (
               <SkeletonCard key={i} />
             ))}
           </div>
         ) : (
           <div className="max-w-4xl mx-auto space-y-4 sm:space-y-5 lg:space-y-6">
-            {/* Brand Setup */}
             <div className="bg-white rounded-xl border border-gray-200 shadow-sm">
               <div className="p-4 sm:p-5 lg:p-6 border-b border-gray-200">
                 <h2 className="text-base sm:text-lg font-semibold text-gray-900">Brand Setup</h2>
@@ -749,6 +1105,7 @@ export default function Settings() {
                   <button
                     onClick={() => navigate('/setup')}
                     className="inline-block px-4 sm:px-6 py-2.5 sm:py-3 bg-purple-600 text-white rounded-lg text-sm sm:text-base font-medium hover:bg-purple-700 transition-colors touch-manipulation focus:outline-none focus:ring-2 focus:ring-purple-500 focus:ring-offset-2"
+                    type="button"
                   >
                     Start Brand Setup
                   </button>
@@ -756,7 +1113,6 @@ export default function Settings() {
               </div>
             </div>
 
-            {/* Integrations */}
             <div className="bg-white rounded-xl border border-gray-200 shadow-sm">
               <div className="p-4 sm:p-5 lg:p-6 border-b border-gray-200">
                 <h2 className="text-base sm:text-lg font-semibold text-gray-900">Integrations</h2>
@@ -789,90 +1145,16 @@ export default function Settings() {
                         value={googleAnalyticsPropertyId}
                         onChange={(e) => setGoogleAnalyticsPropertyId(e.target.value)}
                         placeholder="G-XXXXXXXXXX"
+                        maxLength={MAX_PROPERTY_ID_LENGTH}
                         className="w-full px-3 py-2.5 sm:py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-purple-500 focus:border-transparent mb-3"
                       />
                       <button
                         type="button"
-                        onClick={async () => {
-                          if (!googleAnalyticsPropertyId) {
-                            showToast('Please enter your Google Analytics Property ID before connecting.', { isError: true });
-                            return;
-                          }
-                          setIsConnectingGoogle('ga4');
-                          try {
-                            const { authUrl } = await googleOAuthApi.getAuthUrl(storeId, 'google_analytics_4', googleAnalyticsPropertyId);
-
-                            // Open popup window
-                            const popup = window.open(
-                              authUrl,
-                              'google-oauth',
-                              'width=500,height=600,scrollbars=yes,resizable=yes'
-                            );
-
-                            if (!popup) {
-                              showToast('Popup blocked. Please allow popups for this site.', { isError: true });
-                              setIsConnectingGoogle(null);
-                              return;
-                            }
-
-                            // Listen for message from popup
-                            const messageHandler = (event: MessageEvent) => {
-                              // Security: Only accept messages from same origin or exact Supabase domains
-                              const allowedOrigins = [
-                                window.location.origin,
-                                'https://supabase.co',
-                                'https://app.supabase.com',
-                              ];
-                              if (!allowedOrigins.includes(event.origin)) {
-                                return;
-                              }
-
-                              if (event.data.type === 'oauth-success') {
-                                window.removeEventListener('message', messageHandler);
-                                popup.close();
-                                setGoogleAnalyticsConnected(true);
-                                setGoogleAnalyticsEnabled(true);
-                                showToast('Google Analytics connected successfully!', { isError: false });
-                                if (shopDomain) {
-                                  queryClient.invalidateQueries({ queryKey: queryKeys.store(shopDomain) });
-                                }
-                                // Refresh integration check to get updated credentials
-                                setIntegrationCheckTrigger(prev => prev + 1);
-                                setIsConnectingGoogle(null);
-                              } else if (event.data.type === 'oauth-error') {
-                                window.removeEventListener('message', messageHandler);
-                                popup.close();
-                                const errorMsg = event.data.error || 'We couldn\'t complete the connection';
-                                showToast(`Connection failed: ${errorMsg}. Please try again.`, { isError: true });
-                                setIsConnectingGoogle(null);
-                              }
-                            };
-
-                            window.addEventListener('message', messageHandler);
-
-                            // Check if popup is closed manually
-                            const checkClosed = setInterval(() => {
-                              if (popup.closed) {
-                                clearInterval(checkClosed);
-                                window.removeEventListener('message', messageHandler);
-                                if (isConnectingGoogle === 'ga4') {
-                                  showToast('Connection cancelled. Please try again if you want to connect Google Analytics.', { isError: false, duration: 3000 });
-                                } else if (isConnectingGoogle === 'gsc') {
-                                  showToast('Connection cancelled. Please try again if you want to connect Google Search Console.', { isError: false, duration: 3000 });
-                                }
-                                setIsConnectingGoogle(null);
-                              }
-                            }, 1000);
-                          } catch (error) {
-                            const errorMessage = formatAPIErrorMessage(error, { action: 'connect Google Analytics', resource: 'integration' });
-                            showToast(errorMessage, { isError: true });
-                            setIsConnectingGoogle(null);
-                          }
-                        }}
-                        disabled={isConnectingGoogle === 'ga4' || !googleAnalyticsPropertyId}
+                        onClick={() => handleConnectOAuth('google_analytics_4', googleAnalyticsPropertyId)}
+                        disabled={isConnectingGoogle === 'google_analytics_4' || !validatePropertyId(googleAnalyticsPropertyId)}
                         className="w-full px-4 py-2.5 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 transition-colors touch-manipulation focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed"
                       >
-                        {isConnectingGoogle === 'ga4' ? 'Connecting...' : 'Connect Google Analytics'}
+                        {isConnectingGoogle === 'google_analytics_4' ? 'Connecting...' : 'Connect Google Analytics'}
                       </button>
                     </div>
                   )}
@@ -880,13 +1162,15 @@ export default function Settings() {
                     <div className="ml-0 sm:ml-14 mt-3">
                       <div className="flex items-center gap-2 text-sm text-green-600 mb-2">
                         <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 20 20">
-                          <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
+                          <path
+                            fillRule="evenodd"
+                            d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z"
+                            clipRule="evenodd"
+                          />
                         </svg>
                         Connected
                       </div>
-                      {googleAnalyticsPropertyId && (
-                        <p className="text-xs text-gray-500">Property ID: {googleAnalyticsPropertyId}</p>
-                      )}
+                      {googleAnalyticsPropertyId && <p className="text-xs text-gray-500">Property ID: {googleAnalyticsPropertyId}</p>}
                     </div>
                   )}
                 </div>
@@ -917,90 +1201,16 @@ export default function Settings() {
                         value={googleSearchConsoleSiteUrl}
                         onChange={(e) => setGoogleSearchConsoleSiteUrl(e.target.value)}
                         placeholder="https://yourstore.com"
+                        maxLength={MAX_SITE_URL_LENGTH}
                         className="w-full px-3 py-2.5 sm:py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-purple-500 focus:border-transparent mb-3"
                       />
                       <button
                         type="button"
-                        onClick={async () => {
-                          if (!googleSearchConsoleSiteUrl) {
-                            showToast('Please enter your site URL before connecting.', { isError: true });
-                            return;
-                          }
-                          setIsConnectingGoogle('gsc');
-                          try {
-                            const { authUrl } = await googleOAuthApi.getAuthUrl(storeId, 'google_search_console', undefined, googleSearchConsoleSiteUrl);
-
-                            // Open popup window
-                            const popup = window.open(
-                              authUrl,
-                              'google-oauth',
-                              'width=500,height=600,scrollbars=yes,resizable=yes'
-                            );
-
-                            if (!popup) {
-                              showToast('Popup blocked. Please allow popups for this site.', { isError: true });
-                              setIsConnectingGoogle(null);
-                              return;
-                            }
-
-                            // Listen for message from popup
-                            const messageHandler = (event: MessageEvent) => {
-                              // Security: Only accept messages from same origin or exact Supabase domains
-                              const allowedOrigins = [
-                                window.location.origin,
-                                'https://supabase.co',
-                                'https://app.supabase.com',
-                              ];
-                              if (!allowedOrigins.includes(event.origin)) {
-                                return;
-                              }
-
-                              if (event.data.type === 'oauth-success') {
-                                window.removeEventListener('message', messageHandler);
-                                popup.close();
-                                setGoogleSearchConsoleConnected(true);
-                                setGoogleSearchConsoleEnabled(true);
-                                showToast('Google Search Console connected successfully!', { isError: false });
-                                if (shopDomain) {
-                                  queryClient.invalidateQueries({ queryKey: queryKeys.store(shopDomain) });
-                                }
-                                // Refresh integration check to get updated credentials
-                                setIntegrationCheckTrigger(prev => prev + 1);
-                                setIsConnectingGoogle(null);
-                              } else if (event.data.type === 'oauth-error') {
-                                window.removeEventListener('message', messageHandler);
-                                popup.close();
-                                const errorMsg = event.data.error || 'We couldn\'t complete the connection';
-                                showToast(`Connection failed: ${errorMsg}. Please try again.`, { isError: true });
-                                setIsConnectingGoogle(null);
-                              }
-                            };
-
-                            window.addEventListener('message', messageHandler);
-
-                            // Check if popup is closed manually
-                            const checkClosed = setInterval(() => {
-                              if (popup.closed) {
-                                clearInterval(checkClosed);
-                                window.removeEventListener('message', messageHandler);
-                                if (isConnectingGoogle === 'ga4') {
-                                  showToast('Connection cancelled. Please try again if you want to connect Google Analytics.', { isError: false, duration: 3000 });
-                                } else if (isConnectingGoogle === 'gsc') {
-                                  showToast('Connection cancelled. Please try again if you want to connect Google Search Console.', { isError: false, duration: 3000 });
-                                }
-                                setIsConnectingGoogle(null);
-                              }
-                            }, 1000);
-                          } catch (error) {
-                            const errorMessage = formatAPIErrorMessage(error, { action: 'connect Google Search Console', resource: 'integration' });
-                            showToast(errorMessage, { isError: true });
-                            setIsConnectingGoogle(null);
-                          }
-                        }}
-                        disabled={isConnectingGoogle === 'gsc' || !googleSearchConsoleSiteUrl}
+                        onClick={() => handleConnectOAuth('google_search_console', undefined, googleSearchConsoleSiteUrl)}
+                        disabled={isConnectingGoogle === 'google_search_console' || !validateSiteUrl(googleSearchConsoleSiteUrl)}
                         className="w-full px-4 py-2.5 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 transition-colors touch-manipulation focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed"
                       >
-                        {isConnectingGoogle === 'gsc' ? 'Connecting...' : 'Connect Google Search Console'}
+                        {isConnectingGoogle === 'google_search_console' ? 'Connecting...' : 'Connect Google Search Console'}
                       </button>
                     </div>
                   )}
@@ -1008,20 +1218,21 @@ export default function Settings() {
                     <div className="ml-0 sm:ml-14 mt-3">
                       <div className="flex items-center gap-2 text-sm text-green-600 mb-2">
                         <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 20 20">
-                          <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
+                          <path
+                            fillRule="evenodd"
+                            d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z"
+                            clipRule="evenodd"
+                          />
                         </svg>
                         Connected
                       </div>
-                      {googleSearchConsoleSiteUrl && (
-                        <p className="text-xs text-gray-500">Site: {googleSearchConsoleSiteUrl}</p>
-                      )}
+                      {googleSearchConsoleSiteUrl && <p className="text-xs text-gray-500">Site: {googleSearchConsoleSiteUrl}</p>}
                     </div>
                   )}
                 </div>
               </div>
             </div>
 
-            {/* Publishing Settings */}
             <div className="bg-white rounded-xl border border-gray-200 shadow-sm">
               <div className="p-4 sm:p-5 lg:p-6 border-b border-gray-200">
                 <h2 className="text-base sm:text-lg font-semibold text-gray-900">Publishing Settings</h2>
@@ -1039,9 +1250,7 @@ export default function Settings() {
                       id="requireApproval"
                       ariaLabel="Require approval before publishing"
                     />
-                    <span className="text-xs sm:text-sm text-gray-700">
-                      {requireApproval ? 'Enabled' : 'Disabled'}
-                    </span>
+                    <span className="text-xs sm:text-sm text-gray-700">{requireApproval ? 'Enabled' : 'Disabled'}</span>
                   </div>
                   <p className="text-xs text-gray-500 mt-2">
                     {requireApproval
@@ -1058,18 +1267,25 @@ export default function Settings() {
                   <input
                     type="text"
                     value={defaultAuthor}
-                    onChange={(e) => setDefaultAuthor(e.target.value)}
+                    onChange={(e) => {
+                      const value = e.target.value;
+                      if (validateAuthor(value)) {
+                        setDefaultAuthor(value);
+                      }
+                    }}
                     placeholder="e.g. My Store's Editorial"
+                    maxLength={MAX_AUTHOR_LENGTH}
                     className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-purple-500 focus:border-transparent"
                   />
                   <p className="text-xs text-gray-500 mt-2">
-                    Used as the author for published articles. You can use <code className="bg-gray-100 px-1 py-0.5 rounded text-purple-600">{`{Storename}`}</code> to automatically insert your store name.
+                    Used as the author for published articles. You can use{' '}
+                    <code className="bg-gray-100 px-1 py-0.5 rounded text-purple-600">{`{Storename}`}</code> to automatically insert your
+                    store name.
                   </p>
                 </div>
               </div>
             </div>
 
-            {/* Content Strategy */}
             <div className="bg-white rounded-xl border border-gray-200 shadow-sm">
               <div className="p-4 sm:p-5 lg:p-6 border-b border-gray-200">
                 <h2 className="text-base sm:text-lg font-semibold text-gray-900">Content Strategy</h2>
@@ -1078,7 +1294,6 @@ export default function Settings() {
                 </p>
               </div>
               <div className="p-4 sm:p-5 lg:p-6 space-y-6">
-                {/* Topic Preferences */}
                 <div>
                   <label className="flex items-center gap-2 text-xs sm:text-sm font-medium text-gray-700 mb-2">
                     Topic Preferences
@@ -1092,21 +1307,17 @@ export default function Settings() {
                       onKeyPress={(e) => {
                         if (e.key === 'Enter' && newTopic.trim()) {
                           e.preventDefault();
-                          setTopicPreferences([...topicPreferences, newTopic.trim()]);
-                          setNewTopic('');
+                          handleAddTopic();
                         }
                       }}
                       placeholder="Add a topic (e.g., 'sustainable fashion')"
+                      maxLength={MAX_TOPIC_LENGTH}
                       className="flex-1 px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-purple-500 focus:border-transparent"
                     />
                     <button
-                      onClick={() => {
-                        if (newTopic.trim()) {
-                          setTopicPreferences([...topicPreferences, newTopic.trim()]);
-                          setNewTopic('');
-                        }
-                      }}
+                      onClick={handleAddTopic}
                       className="px-4 py-2 bg-purple-600 text-white rounded-lg text-sm font-medium hover:bg-purple-700 transition-colors"
+                      type="button"
                     >
                       Add
                     </button>
@@ -1119,10 +1330,7 @@ export default function Settings() {
                           className="inline-flex items-center gap-1 px-3 py-1 bg-purple-100 text-purple-800 rounded-full text-xs font-medium"
                         >
                           {topic}
-                          <button
-                            onClick={() => setTopicPreferences(topicPreferences.filter((_, i) => i !== idx))}
-                            className="text-purple-600 hover:text-purple-800"
-                          >
+                          <button onClick={() => handleRemoveTopic(idx)} className="text-purple-600 hover:text-purple-800" type="button">
                             ×
                           </button>
                         </span>
@@ -1134,7 +1342,6 @@ export default function Settings() {
                   </p>
                 </div>
 
-                {/* Keyword Focus */}
                 <div>
                   <label className="flex items-center gap-2 text-xs sm:text-sm font-medium text-gray-700 mb-2">
                     Keyword Focus
@@ -1148,21 +1355,17 @@ export default function Settings() {
                       onKeyPress={(e) => {
                         if (e.key === 'Enter' && newKeyword.trim()) {
                           e.preventDefault();
-                          setKeywordFocus([...keywordFocus, newKeyword.trim()]);
-                          setNewKeyword('');
+                          handleAddKeyword();
                         }
                       }}
                       placeholder="Add a keyword (e.g., 'organic cotton')"
+                      maxLength={MAX_KEYWORD_LENGTH}
                       className="flex-1 px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-purple-500 focus:border-transparent"
                     />
                     <button
-                      onClick={() => {
-                        if (newKeyword.trim()) {
-                          setKeywordFocus([...keywordFocus, newKeyword.trim()]);
-                          setNewKeyword('');
-                        }
-                      }}
+                      onClick={handleAddKeyword}
                       className="px-4 py-2 bg-purple-600 text-white rounded-lg text-sm font-medium hover:bg-purple-700 transition-colors"
+                      type="button"
                     >
                       Add
                     </button>
@@ -1175,22 +1378,16 @@ export default function Settings() {
                           className="inline-flex items-center gap-1 px-3 py-1 bg-blue-100 text-blue-800 rounded-full text-xs font-medium"
                         >
                           {keyword}
-                          <button
-                            onClick={() => setKeywordFocus(keywordFocus.filter((_, i) => i !== idx))}
-                            className="text-blue-600 hover:text-blue-800"
-                          >
+                          <button onClick={() => handleRemoveKeyword(idx)} className="text-blue-600 hover:text-blue-800" type="button">
                             ×
                           </button>
                         </span>
                       ))}
                     </div>
                   )}
-                  <p className="text-xs text-gray-500 mt-2">
-                    SEO keywords to prioritize. Articles will naturally incorporate these when relevant.
-                  </p>
+                  <p className="text-xs text-gray-500 mt-2">SEO keywords to prioritize. Articles will naturally incorporate these when relevant.</p>
                 </div>
 
-                {/* Content Angles */}
                 <div>
                   <label className="flex items-center gap-2 text-xs sm:text-sm font-medium text-gray-700 mb-2">
                     Content Angles
@@ -1204,21 +1401,17 @@ export default function Settings() {
                       onKeyPress={(e) => {
                         if (e.key === 'Enter' && newAngle.trim()) {
                           e.preventDefault();
-                          setContentAngles([...contentAngles, newAngle.trim()]);
-                          setNewAngle('');
+                          handleAddAngle();
                         }
                       }}
                       placeholder="Add an angle (e.g., 'how-to guides', 'product comparisons')"
+                      maxLength={MAX_ANGLE_LENGTH}
                       className="flex-1 px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-purple-500 focus:border-transparent"
                     />
                     <button
-                      onClick={() => {
-                        if (newAngle.trim()) {
-                          setContentAngles([...contentAngles, newAngle.trim()]);
-                          setNewAngle('');
-                        }
-                      }}
+                      onClick={handleAddAngle}
                       className="px-4 py-2 bg-purple-600 text-white rounded-lg text-sm font-medium hover:bg-purple-700 transition-colors"
+                      type="button"
                     >
                       Add
                     </button>
@@ -1231,24 +1424,18 @@ export default function Settings() {
                           className="inline-flex items-center gap-1 px-3 py-1 bg-green-100 text-green-800 rounded-full text-xs font-medium"
                         >
                           {angle}
-                          <button
-                            onClick={() => setContentAngles(contentAngles.filter((_, i) => i !== idx))}
-                            className="text-green-600 hover:text-green-800"
-                          >
+                          <button onClick={() => handleRemoveAngle(idx)} className="text-green-600 hover:text-green-800" type="button">
                             ×
                           </button>
                         </span>
                       ))}
                     </div>
                   )}
-                  <p className="text-xs text-gray-500 mt-2">
-                    Preferred content formats or approaches. Examples: tutorials, reviews, comparisons, guides.
-                  </p>
+                  <p className="text-xs text-gray-500 mt-2">Preferred content formats or approaches. Examples: tutorials, reviews, comparisons, guides.</p>
                 </div>
               </div>
             </div>
 
-            {/* Notifications */}
             <div className="bg-white rounded-xl border border-gray-200 shadow-sm">
               <div className="p-4 sm:p-5 lg:p-6 border-b border-gray-200">
                 <h2 className="text-base sm:text-lg font-semibold text-gray-900">Notifications</h2>
@@ -1296,7 +1483,6 @@ export default function Settings() {
               </div>
             </div>
 
-            {/* Billing */}
             <div className="bg-white rounded-xl border border-gray-200 shadow-sm">
               <div className="p-4 sm:p-5 lg:p-6 border-b border-gray-200">
                 <h2 className="text-base sm:text-lg font-semibold text-gray-900">Billing</h2>
@@ -1306,7 +1492,11 @@ export default function Settings() {
                   <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-4 mb-4">
                     <div className="flex items-start gap-3">
                       <svg className="w-5 h-5 text-yellow-600 mt-0.5 flex-shrink-0" fill="currentColor" viewBox="0 0 20 20">
-                        <path fillRule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clipRule="evenodd" />
+                        <path
+                          fillRule="evenodd"
+                          d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z"
+                          clipRule="evenodd"
+                        />
                       </svg>
                       <div className="flex-1">
                         <h3 className="text-sm font-semibold text-yellow-900 mb-1">No Active Subscription</h3>
@@ -1318,16 +1508,14 @@ export default function Settings() {
                   </div>
                 )}
                 <div>
-                  <label className="block text-xs sm:text-sm font-medium text-gray-700 mb-2">
-                    Current Plan
-                  </label>
+                  <label className="block text-xs sm:text-sm font-medium text-gray-700 mb-2">Current Plan</label>
                   <div className="px-3 py-2.5 sm:py-2 bg-gray-50 border border-gray-200 rounded-lg text-sm text-gray-900">
                     {isLoading ? 'Loading...' : planName}
                   </div>
                 </div>
                 <div>
                   <label className="block text-xs sm:text-sm font-medium text-gray-700 mb-2">
-                    {quota?.is_trial ? 'Trial Ends' : 'Renewal Date'}
+                    {isQuotaStatus(quota) && quota.is_trial ? 'Trial Ends' : 'Renewal Date'}
                   </label>
                   <div className="px-3 py-2.5 sm:py-2 bg-gray-50 border border-gray-200 rounded-lg text-sm text-gray-900">
                     {isLoading ? 'Loading...' : formatRenewalDate(renewalDate)}
@@ -1337,6 +1525,7 @@ export default function Settings() {
                   <button
                     onClick={() => setIsPlansModalOpen(true)}
                     className="w-full sm:w-auto px-4 py-2.5 sm:py-2 bg-purple-600 text-white rounded-lg text-sm sm:text-base font-medium hover:bg-purple-700 transition-colors touch-manipulation focus:outline-none focus:ring-2 focus:ring-purple-500 focus:ring-offset-2"
+                    type="button"
                   >
                     Manage Subscription
                   </button>
@@ -1344,7 +1533,6 @@ export default function Settings() {
               </div>
             </div>
 
-            {/* Danger Zone */}
             <div className="bg-white rounded-xl border border-gray-200 shadow-sm">
               <div className="p-4 sm:p-5 lg:p-6 border-b border-gray-200">
                 <h2 className="text-base sm:text-lg font-semibold text-gray-900 text-red-600">Danger Zone</h2>
@@ -1358,6 +1546,7 @@ export default function Settings() {
                   <button
                     onClick={handleResetSettings}
                     className="px-4 py-2.5 sm:py-2 border border-red-300 text-red-600 rounded-lg text-sm sm:text-base font-medium hover:bg-red-50 transition-colors touch-manipulation whitespace-nowrap focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-offset-2"
+                    type="button"
                   >
                     Reset
                   </button>
@@ -1368,7 +1557,6 @@ export default function Settings() {
         )}
       </div>
 
-      {/* Plans Modal */}
       <PlansModal
         isOpen={isPlansModalOpen}
         onClose={() => setIsPlansModalOpen(false)}

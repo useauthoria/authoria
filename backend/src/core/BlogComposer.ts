@@ -1,6 +1,7 @@
 import OpenAI from 'openai';
-import { ToneMatrix, BrandDNA } from './BrandManager.ts';
-import { retry } from '../utils/error-handling.ts';
+import { BrandDNA, ToneMatrix } from './BrandManager';
+import { retry } from '../utils/error-handling';
+import { RateLimiter } from '../utils/rate-limiter';
 
 export interface BlogPostContent {
   readonly title: string;
@@ -72,30 +73,108 @@ interface StructureTemplate {
   readonly [key: string]: readonly string[];
 }
 
-interface LanguageMap {
-  readonly [key: string]: string;
-}
-
 interface PromptConfig {
   readonly model: string;
-  readonly reasoning: { readonly effort: 'none' | 'low' | 'medium' | 'high' };
-  readonly text: { readonly verbosity: 'low' | 'medium' | 'high' };
+  readonly reasoning?: { readonly effort: 'low' | 'medium' | 'high' };
   readonly maxOutputTokens?: number;
   readonly responseFormat?: { readonly type: 'json_object' };
   readonly promptCacheKey: string;
   readonly promptCacheRetention: string;
 }
 
+interface CacheEntry<T> {
+  readonly value: T;
+  readonly expiresAt: number;
+}
+
+type LogLevel = 'info' | 'warn' | 'error';
+
+const structuredLog = (
+  level: LogLevel,
+  service: string,
+  message: string,
+  context?: Readonly<Record<string, unknown>>,
+): void => {
+  const payload = JSON.stringify({
+    level,
+    service,
+    message,
+    timestamp: new Date().toISOString(),
+    ...context,
+  });
+
+  if (typeof globalThis === 'undefined' || !('Deno' in globalThis)) {
+    return;
+  }
+
+  const encoder = new TextEncoder();
+  if (level === 'error') {
+    (globalThis as unknown as { Deno: { stderr: { writeSync: (data: Uint8Array) => void } } }).Deno.stderr.writeSync(
+      encoder.encode(payload + '\n'),
+    );
+    return;
+  }
+
+  (globalThis as unknown as { Deno: { stdout: { writeSync: (data: Uint8Array) => void } } }).Deno.stdout.writeSync(
+    encoder.encode(payload + '\n'),
+  );
+};
+
+const nowMs = (): number => Date.now();
+
+const getCache = <T>(cache: Map<string, CacheEntry<T>>, key: string): T | null => {
+  const entry = cache.get(key);
+  if (!entry) return null;
+  if (nowMs() > entry.expiresAt) {
+    cache.delete(key);
+    return null;
+  }
+  return entry.value;
+};
+
+const setCache = <T>(cache: Map<string, CacheEntry<T>>, key: string, value: T, ttlMs: number): void => {
+  cache.set(key, { value, expiresAt: nowMs() + ttlMs });
+};
+
+const sanitizeStringArray = (items: readonly string[]): readonly string[] => {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const item of items) {
+    const v = typeof item === 'string' ? item.trim() : '';
+    if (!v) continue;
+    const key = v.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(v);
+  }
+  return result;
+};
+
+const hashString = (input: string): string => {
+  let hash = 5381;
+  for (let i = 0; i < input.length; i++) {
+    hash = (hash * 33) ^ input.charCodeAt(i);
+  }
+  return (hash >>> 0).toString(36);
+};
+
 export class BlogComposer {
   private readonly openai: OpenAI;
   private readonly toneMatrix: ToneMatrix;
   private readonly brandDNA: BrandDNA;
+  private readonly limiter: RateLimiter;
+  private readonly responseCache: Map<string, CacheEntry<OpenAIResponse>>;
+  private readonly inflight: Map<string, Promise<OpenAIResponse>>;
   private static readonly DEFAULT_RETRY_OPTIONS = {
     maxAttempts: 3,
     initialDelay: 1000,
     backoffMultiplier: 2,
     retryableErrors: ['rate limit', 'timeout', 'server_error'] as const,
   };
+  private static readonly SERVICE_NAME = 'BlogComposer';
+  private static readonly OPENAI_CACHE_TTL_MS = 10 * 60 * 1000;
+  private static readonly OPENAI_MAX_WAIT_MS = 60_000;
+  private static readonly OPENAI_MAX_INPUT_CHARS = 30_000;
   private static readonly MIN_WORD_COUNT = 1200;
   private static readonly MAX_WORD_COUNT = 1800;
   private static readonly MIN_EXCERPT_LENGTH = 50;
@@ -163,24 +242,20 @@ export class BlogComposer {
     'Conclusion',
   ];
 
-  private static readonly LANGUAGE_NAMES: LanguageMap = {
-    en: 'English',
-    fr: 'French',
-    de: 'German',
-    es: 'Spanish',
-    nl: 'Dutch',
-    it: 'Italian',
-    pt: 'Portuguese',
-    ru: 'Russian',
-    ja: 'Japanese',
-    zh: 'Chinese',
-    ko: 'Korean',
-  };
-
   constructor(apiKey: string, toneMatrix: ToneMatrix, brandDNA: BrandDNA) {
     this.openai = new OpenAI({ apiKey });
     this.toneMatrix = toneMatrix;
     this.brandDNA = brandDNA;
+    this.limiter = new RateLimiter({
+      maxRequests: 10,
+      windowMs: 1000,
+      burst: 2,
+      algorithm: 'token-bucket',
+      keyPrefix: 'openai',
+      concurrency: 10,
+    });
+    this.responseCache = new Map();
+    this.inflight = new Map();
   }
 
   async composePost(
@@ -190,7 +265,6 @@ export class BlogComposer {
   ): Promise<BlogPostContent> {
     const {
       structure = 'default',
-      language = 'en',
       experienceLevel,
       audiencePersona,
       includeCitations = true,
@@ -198,38 +272,50 @@ export class BlogComposer {
       contentPreferences,
     } = options;
 
-    const outline = await this.generateOutline(topic, keywords, structure, contentPreferences);
-    const title = await this.generateTitle(topic, outline, keywords, language, experienceLevel);
-    const content = await this.generateContent(
-      topic,
-      outline,
-      keywords,
-      language,
-      experienceLevel,
-      audiencePersona,
-      contentPreferences,
-    );
-    const excerpt = await this.generateExcerpt(content, title, language);
-    const seoTitle = await this.generateSEOTitle(title, keywords, language);
-    const seoDescription = await this.generateSEODescription(content, keywords, language);
-    const imagePrompt = await this.generateImagePrompt(title, content, keywords);
+    const normalizedTopic = typeof topic === 'string' ? topic.trim() : '';
+    if (!normalizedTopic) {
+      throw new Error('Topic is required');
+    }
 
-    const citations = includeCitations
-      ? await this.generateCitations(content, topic)
-      : undefined;
+    const normalizedKeywords = sanitizeStringArray(keywords);
 
-    let qualityScore: number | undefined;
-    let qualityIssues: ReadonlyArray<QualityIssue> | undefined;
-    if (validateQuality) {
-      const validation = await this.validateContent({
+    const outline = await this.generateOutline(normalizedTopic, normalizedKeywords, structure, contentPreferences);
+    const [title, content] = await Promise.all([
+      this.generateTitle(normalizedTopic, outline, normalizedKeywords, experienceLevel),
+      this.generateContent(
+        normalizedTopic,
+        outline,
+        normalizedKeywords,
+        experienceLevel,
+        audiencePersona,
+        contentPreferences,
+      ),
+    ]);
+
+    const excerptPromise = this.generateExcerpt(content, title);
+    const seoTitlePromise = this.generateSEOTitle(title, normalizedKeywords);
+    const seoDescriptionPromise = this.generateSEODescription(content, normalizedKeywords);
+    const imagePromptPromise = this.generateImagePrompt(title, content, normalizedKeywords);
+    const citationsPromise = includeCitations
+      ? this.generateCitations(content, normalizedTopic)
+      : Promise.resolve(undefined);
+    const validationPromise = validateQuality
+      ? this.validateContent({
         content,
         title,
-        keywords,
+        keywords: normalizedKeywords,
         outline,
-      });
-      qualityScore = validation.score;
-      qualityIssues = validation.issues;
-    }
+      })
+      : Promise.resolve(undefined);
+
+    const [excerpt, seoTitle, seoDescription, imagePrompt, citations, validation] = await Promise.all([
+      excerptPromise,
+      seoTitlePromise,
+      seoDescriptionPromise,
+      imagePromptPromise,
+      citationsPromise,
+      validationPromise,
+    ]);
 
     return {
       title,
@@ -237,12 +323,12 @@ export class BlogComposer {
       excerpt,
       seoTitle,
       seoDescription,
-      keywords,
-      primaryKeyword: keywords[0] || topic,
+      keywords: normalizedKeywords,
+      primaryKeyword: normalizedKeywords[0] || normalizedTopic,
       imagePrompt,
       citations,
-      qualityScore,
-      qualityIssues,
+      qualityScore: validation?.score,
+      qualityIssues: validation?.issues,
     };
   }
 
@@ -260,7 +346,6 @@ export class BlogComposer {
     const response = await this.callOpenAI({
       model: 'gpt-5-mini',
       reasoning: { effort: 'low' },
-      text: { verbosity: 'medium' },
       responseFormat: { type: 'json_object' },
       promptCacheKey: `blog-outline-${this.brandDNA?.brandName || 'default'}-${structure}`,
       promptCacheRetention: '24h',
@@ -278,20 +363,16 @@ export class BlogComposer {
     topic: string,
     outline: readonly string[],
     keywords: readonly string[],
-    language: string = 'en',
     experienceLevel?: string,
   ): Promise<string> {
-    const languageName = this.getLanguageName(language);
-    const staticPrefix = this.buildTitleStaticPrefix(language, languageName, experienceLevel);
+    const staticPrefix = this.buildTitleStaticPrefix(experienceLevel);
     const variableContent = this.buildTitleVariableContent(topic, outline, keywords);
     const prompt = staticPrefix + variableContent;
 
     const response = await this.callOpenAI({
       model: 'gpt-5-nano',
-      reasoning: { effort: 'none' },
-      text: { verbosity: 'low' },
       maxOutputTokens: 100,
-      promptCacheKey: `blog-title-generator-${language}`,
+      promptCacheKey: 'blog-title-generator-en',
       promptCacheRetention: '24h',
     }, prompt);
 
@@ -302,16 +383,12 @@ export class BlogComposer {
     topic: string,
     outline: readonly string[],
     keywords: readonly string[],
-    language: string = 'en',
     experienceLevel?: string,
     audiencePersona?: string,
     contentPreferences?: ContentOptions['contentPreferences'],
   ): Promise<string> {
     const tonePrompt = this.generateTonePrompt();
-    const languageName = this.getLanguageName(language);
     const staticPrefix = this.buildContentStaticPrefix(
-      language,
-      languageName,
       tonePrompt,
       experienceLevel,
       audiencePersona,
@@ -323,9 +400,8 @@ export class BlogComposer {
     const response = await this.callOpenAI({
       model: 'gpt-5.1',
       reasoning: { effort: 'medium' },
-      text: { verbosity: 'high' },
       maxOutputTokens: 4000,
-      promptCacheKey: `blog-content-${this.brandDNA?.brandName || 'default'}-${language}`,
+      promptCacheKey: `blog-content-${this.brandDNA?.brandName || 'default'}-en`,
       promptCacheRetention: '24h',
     }, prompt);
 
@@ -335,19 +411,15 @@ export class BlogComposer {
   private async generateExcerpt(
     content: string,
     title: string,
-    language: string = 'en',
   ): Promise<string> {
-    const languageName = this.getLanguageName(language);
-    const staticPrefix = this.buildExcerptStaticPrefix(language, languageName);
+    const staticPrefix = this.buildExcerptStaticPrefix();
     const variableContent = this.buildExcerptVariableContent(title, content);
     const prompt = staticPrefix + variableContent;
 
     const response = await this.callOpenAI({
       model: 'gpt-5-nano',
-      reasoning: { effort: 'none' },
-      text: { verbosity: 'low' },
       maxOutputTokens: 100,
-      promptCacheKey: `blog-excerpt-generator-${language}`,
+      promptCacheKey: 'blog-excerpt-generator-en',
       promptCacheRetention: '24h',
     }, prompt);
 
@@ -359,7 +431,7 @@ export class BlogComposer {
     return excerpt.substring(0, BlogComposer.MAX_EXCERPT_LENGTH);
   }
 
-  private async generateSEOTitle(title: string, keywords: readonly string[], language: string = 'en'): Promise<string> {
+  private async generateSEOTitle(title: string, keywords: readonly string[]): Promise<string> {
     let seoTitle = title;
     if (keywords.length > 0 && !title.toLowerCase().includes(keywords[0].toLowerCase())) {
       seoTitle = `${keywords[0]}: ${title}`;
@@ -370,19 +442,16 @@ export class BlogComposer {
   private async generateSEODescription(
     content: string,
     keywords: readonly string[],
-    language: string = 'en',
   ): Promise<string> {
-    const languageName = this.getLanguageName(language);
-    const staticPrefix = this.buildSEODescriptionStaticPrefix(language, languageName);
+    const staticPrefix = this.buildSEODescriptionStaticPrefix();
     const variableContent = this.buildSEODescriptionVariableContent(content, keywords);
     const prompt = staticPrefix + variableContent;
 
     const response = await this.callOpenAI({
       model: 'gpt-5-mini',
-      reasoning: { effort: 'none' },
-      text: { verbosity: 'low' },
+      reasoning: { effort: 'low' },
       maxOutputTokens: 100,
-      promptCacheKey: `seo-description-generator-${language}`,
+      promptCacheKey: 'seo-description-generator-en',
       promptCacheRetention: '24h',
     }, prompt);
 
@@ -399,7 +468,6 @@ export class BlogComposer {
       const response = await this.callOpenAI({
         model: 'gpt-5-mini',
         reasoning: { effort: 'low' },
-        text: { verbosity: 'medium' },
         responseFormat: { type: 'json_object' },
         promptCacheKey: 'citation-generator',
         promptCacheRetention: '24h',
@@ -532,7 +600,6 @@ export class BlogComposer {
     const response = await this.callOpenAI({
       model: 'gpt-5-mini',
       reasoning: { effort: 'low' },
-      text: { verbosity: 'medium' },
       maxOutputTokens: 200,
       promptCacheKey: 'flux-image-prompt-generator',
       promptCacheRetention: '24h',
@@ -624,10 +691,6 @@ export class BlogComposer {
     return prompts.join('\n');
   }
 
-  private getLanguageName(code: string): string {
-    return BlogComposer.LANGUAGE_NAMES[code] || code;
-  }
-
   private generateTonePrompt(): string {
     const topTones = Object.entries(this.toneMatrix)
       .sort(([, a], [, b]) => (b ?? 0) - (a ?? 0))
@@ -653,42 +716,78 @@ export class BlogComposer {
     return BlogComposer.STRUCTURE_TEMPLATES[structure] || null;
   }
 
-  /**
-   * Calls OpenAI API with proper error handling and fallback mechanisms
-   * @throws Error if the API call fails after all retries
-   */
   private async callOpenAI(config: PromptConfig, input: string): Promise<OpenAIResponse> {
-    try {
-      return await retry(
-        () => this.openai.responses.create({
-          model: config.model,
-          reasoning: config.reasoning,
-          text: config.text,
-          input,
-          max_output_tokens: config.maxOutputTokens,
-          response_format: config.responseFormat,
-          prompt_cache_key: config.promptCacheKey,
-          prompt_cache_retention: config.promptCacheRetention,
-        }),
+    const normalizedInput = input.length > BlogComposer.OPENAI_MAX_INPUT_CHARS
+      ? input.substring(0, BlogComposer.OPENAI_MAX_INPUT_CHARS)
+      : input;
+
+    const cacheKey = `${config.model}:${config.promptCacheKey}:${hashString(normalizedInput)}`;
+    const cached = getCache(this.responseCache, cacheKey);
+    if (cached) {
+      return cached;
+    }
+
+    const inflight = this.inflight.get(cacheKey);
+    if (inflight) {
+      return inflight;
+    }
+
+    const promise = (async (): Promise<OpenAIResponse> => {
+      const allowed = await this.limiter.waitForToken(config.model, BlogComposer.OPENAI_MAX_WAIT_MS);
+      if (!allowed) {
+        throw new Error('OpenAI rate limit wait exceeded');
+      }
+
+      const start = nowMs();
+      const result = await retry(
+        () => {
+          const requestBody: Readonly<Record<string, unknown>> = {
+            model: config.model,
+            reasoning: config.reasoning,
+            input: normalizedInput,
+            max_output_tokens: config.maxOutputTokens,
+            response_format: config.responseFormat,
+            prompt_cache_key: config.promptCacheKey,
+            prompt_cache_retention: config.promptCacheRetention,
+          };
+
+          return this.openai.responses.create(
+            requestBody as unknown as Parameters<OpenAI['responses']['create']>[0],
+          ) as unknown as Promise<OpenAIResponse>;
+        },
         {
           ...BlogComposer.DEFAULT_RETRY_OPTIONS,
           onRetry: (attempt, error) => {
-            // Enhanced retry logging for debugging
-            const errorMsg = error instanceof Error ? error.message : String(error);
-            if (errorMsg.includes('rate limit')) {
-              // Rate limit errors are expected and handled by retry logic
-            }
+            structuredLog('warn', BlogComposer.SERVICE_NAME, 'OpenAI retry', {
+              attempt,
+              model: config.model,
+              promptCacheKey: config.promptCacheKey,
+              error: error instanceof Error ? error.message : String(error),
+            });
           },
         },
-      ) as OpenAIResponse;
-    } catch (error) {
-      // Enhanced error handling with more context
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      throw new Error(
-        `OpenAI API call failed for model ${config.model}: ${errorMessage}. ` +
-        `Prompt cache key: ${config.promptCacheKey}`,
       );
-    }
+
+      setCache(this.responseCache, cacheKey, result, BlogComposer.OPENAI_CACHE_TTL_MS);
+      structuredLog('info', BlogComposer.SERVICE_NAME, 'OpenAI call ok', {
+        model: config.model,
+        promptCacheKey: config.promptCacheKey,
+        latencyMs: nowMs() - start,
+      });
+      return result;
+    })().catch((error) => {
+      structuredLog('error', BlogComposer.SERVICE_NAME, 'OpenAI call failed', {
+        model: config.model,
+        promptCacheKey: config.promptCacheKey,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }).finally(() => {
+      this.inflight.delete(cacheKey);
+    });
+
+    this.inflight.set(cacheKey, promise);
+    return promise;
   }
 
   private buildOutlineStaticPrefix(template: readonly string[] | null): string {
@@ -744,7 +843,7 @@ ${keywords.length > 0 ? `Focus on these keywords: ${keywords.join(', ')}` : ''}`
     return content;
   }
 
-  private buildTitleStaticPrefix(language: string, languageName: string, experienceLevel?: string): string {
+  private buildTitleStaticPrefix(experienceLevel?: string): string {
     const experiencePrompt = experienceLevel ? `\n## Target Audience\n${experienceLevel} level readers.` : '';
     return `You are an expert SEO content writer specializing in high-converting, search-optimized headlines.
 
@@ -764,7 +863,7 @@ Generate a compelling, SEO-friendly blog post title that:
 - Reflects brand voice${experiencePrompt}
 
 ## Language
-${language !== 'en' ? `Write the title in ${languageName} using natural phrasing.` : 'Write in English.'}
+Write in English.
 
 ## Output Format
 Return ONLY the title text. No quotes, no explanations, no additional text.
@@ -779,8 +878,6 @@ ${keywords.length > 0 ? `Keywords: ${keywords.join(', ')}` : ''}`;
   }
 
   private buildContentStaticPrefix(
-    language: string,
-    languageName: string,
     tonePrompt: string,
     experienceLevel?: string,
     audiencePersona?: string,
@@ -834,7 +931,7 @@ Write a comprehensive, engaging blog post (1,200-1,800 words) that:
 - Make each sentence feel unique and purposeful
 
 ## Language
-${language !== 'en' ? `Write the entire article in ${languageName} using natural, native-level phrasing that sounds conversational and human.` : 'Write in English with natural, conversational phrasing.'}
+Write in English with natural, conversational phrasing.
 
 ## Tone Guidelines
 ${tonePrompt}${experiencePrompt}${personaPrompt}
@@ -876,7 +973,7 @@ ${keywords.length > 0 ? `Naturally incorporate these keywords: ${keywords.join('
     return content;
   }
 
-  private buildExcerptStaticPrefix(language: string, languageName: string): string {
+  private buildExcerptStaticPrefix(): string {
     return `You are an expert at crafting compelling content previews optimized for engagement and SEO.
 
 ## Role
@@ -895,7 +992,7 @@ Generate a compelling blog post excerpt (150-160 characters) that:
 - Creates curiosity without clickbait
 
 ## Language
-${language !== 'en' ? `Write the excerpt in ${languageName} using natural phrasing.` : 'Write in English.'}
+Write in English.
 
 ## Output Format
 Return ONLY the excerpt text. No quotes, no explanations, no additional text.
@@ -909,7 +1006,7 @@ Title: `;
 Content preview: ${content.substring(0, BlogComposer.CONTENT_PREVIEW_LENGTH)}`;
   }
 
-  private buildSEODescriptionStaticPrefix(language: string, languageName: string): string {
+  private buildSEODescriptionStaticPrefix(): string {
     return `You are an expert SEO specialist specializing in meta description optimization.
 
 ## Role
@@ -928,7 +1025,7 @@ Write a compelling SEO meta description (150-160 characters) that:
 - Stays within character limits (150-160)
 
 ## Language
-${language !== 'en' ? `Write the description in ${languageName} using natural, native phrasing.` : 'Write in English.'}
+Write in English.
 
 ## Output Format
 Return ONLY the meta description text. No quotes, no explanations, no additional text.

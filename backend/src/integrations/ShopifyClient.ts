@@ -66,6 +66,135 @@ interface MutableCacheEntry<T> {
   accessCount: number;
 }
 
+type LogLevel = 'info' | 'warn' | 'error';
+
+const structuredLog = (
+  level: LogLevel,
+  service: string,
+  message: string,
+  context?: Readonly<Record<string, unknown>>,
+): void => {
+  const payload = JSON.stringify({
+    level,
+    service,
+    message,
+    timestamp: new Date().toISOString(),
+    ...context,
+  });
+
+  if (typeof globalThis === 'undefined' || !('Deno' in globalThis)) {
+    return;
+  }
+
+  const encoder = new TextEncoder();
+  const deno = globalThis as unknown as { Deno: { stderr: { writeSync: (data: Uint8Array) => void }; stdout: { writeSync: (data: Uint8Array) => void } } };
+  
+  if (level === 'error') {
+    deno.Deno.stderr.writeSync(encoder.encode(payload + '\n'));
+    return;
+  }
+
+  deno.Deno.stdout.writeSync(encoder.encode(payload + '\n'));
+};
+
+const validateShopDomain = (shopDomain: string): void => {
+  if (!shopDomain || typeof shopDomain !== 'string' || shopDomain.trim().length === 0) {
+    throw new Error('Invalid shop domain: must be a non-empty string');
+  }
+  if (!shopDomain.includes('.') || shopDomain.length > 255) {
+    throw new Error('Invalid shop domain format');
+  }
+};
+
+const validateAccessToken = (accessToken: string): void => {
+  if (!accessToken || typeof accessToken !== 'string' || accessToken.trim().length === 0) {
+    throw new Error('Invalid access token: must be a non-empty string');
+  }
+  if (accessToken.length > 10000) {
+    throw new Error('Invalid access token: exceeds maximum length');
+  }
+};
+
+const validateQuery = (query: string): void => {
+  if (!query || typeof query !== 'string' || query.trim().length === 0) {
+    throw new Error('Invalid query: must be a non-empty string');
+  }
+  if (query.length > 100000) {
+    throw new Error('Invalid query: exceeds maximum length');
+  }
+};
+
+const validateImageUrl = (imageUrl: string): void => {
+  if (!imageUrl || typeof imageUrl !== 'string' || imageUrl.trim().length === 0) {
+    throw new Error('Invalid image URL: must be a non-empty string');
+  }
+  try {
+    new URL(imageUrl);
+  } catch {
+    throw new Error(`Invalid image URL format: ${imageUrl}`);
+  }
+  if (imageUrl.length > 2000) {
+    throw new Error('Invalid image URL: exceeds maximum length');
+  }
+};
+
+const validateBlogId = (blogId: number): void => {
+  if (!Number.isInteger(blogId) || blogId <= 0) {
+    throw new Error('Invalid blog ID: must be a positive integer');
+  }
+};
+
+const validateArticleId = (articleId: number): void => {
+  if (!Number.isInteger(articleId) || articleId <= 0) {
+    throw new Error('Invalid article ID: must be a positive integer');
+  }
+};
+
+const validateLimit = (limit: number): void => {
+  if (!Number.isInteger(limit) || limit <= 0 || limit > 250) {
+    throw new Error('Invalid limit: must be an integer between 1 and 250');
+  }
+};
+
+const validateSubscriptionId = (subscriptionId: string): void => {
+  if (!subscriptionId || typeof subscriptionId !== 'string' || subscriptionId.trim().length === 0) {
+    throw new Error('Invalid subscription ID: must be a non-empty string');
+  }
+  if (subscriptionId.length > 100) {
+    throw new Error('Invalid subscription ID: exceeds maximum length');
+  }
+};
+
+const validateArticleInput = (article: BlogArticleInput): void => {
+  if (!article || typeof article !== 'object') {
+    throw new Error('Invalid article: must be an object');
+  }
+  if (!article.title || typeof article.title !== 'string' || article.title.trim().length === 0) {
+    throw new Error('Invalid article title: must be a non-empty string');
+  }
+  if (article.title.length > 500) {
+    throw new Error('Invalid article title: exceeds maximum length');
+  }
+  if (!article.body_html || typeof article.body_html !== 'string') {
+    throw new Error('Invalid article body: must be a string');
+  }
+  if (article.body_html.length > 10000000) {
+    throw new Error('Invalid article body: exceeds maximum length of 10MB');
+  }
+  if (!article.author || typeof article.author !== 'string' || article.author.trim().length === 0) {
+    throw new Error('Invalid article author: must be a non-empty string');
+  }
+  if (article.author.length > 200) {
+    throw new Error('Invalid article author: exceeds maximum length');
+  }
+  if (article.tags && (typeof article.tags !== 'string' || article.tags.length > 1000)) {
+    throw new Error('Invalid article tags: must be a string with max length 1000');
+  }
+  if (article.summary && (typeof article.summary !== 'string' || article.summary.length > 1000)) {
+    throw new Error('Invalid article summary: must be a string with max length 1000');
+  }
+};
+
 export class ShopifyCache {
   private static readonly DEFAULT_TTL_SHOP = 3600000;
   private static readonly DEFAULT_TTL_PRODUCTS = 1800000;
@@ -77,6 +206,7 @@ export class ShopifyCache {
   private static readonly DEFAULT_TTL_DEFAULT = 1800000;
   private static readonly STALE_WHILE_REVALIDATE_MULTIPLIER = 1.5;
   private static readonly MAX_EVENTS = 1000;
+  private static readonly CACHE_CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
   static readonly CACHE_KEY_SEPARATOR = ':';
   private static readonly DEFAULT_CACHE_TYPE = 'default';
 
@@ -84,6 +214,7 @@ export class ShopifyCache {
   private readonly events: CacheEvent[];
   private readonly listeners: Map<string, Set<(key: string) => void>>;
   private readonly defaultTTLs: Readonly<Record<string, number>>;
+  private cacheCleanupInterval?: number;
 
   constructor() {
     this.cache = new Map();
@@ -98,6 +229,29 @@ export class ShopifyCache {
       articles: ShopifyCache.DEFAULT_TTL_ARTICLES,
       graphql: ShopifyCache.DEFAULT_TTL_GRAPHQL,
     };
+    this.startCacheCleanup();
+  }
+
+  destroy(): void {
+    if (this.cacheCleanupInterval !== undefined) {
+      clearInterval(this.cacheCleanupInterval);
+      this.cacheCleanupInterval = undefined;
+    }
+    this.cache.clear();
+    this.events.length = 0;
+    this.listeners.clear();
+  }
+
+  private startCacheCleanup(): void {
+    this.cacheCleanupInterval = setInterval(() => {
+      const now = Date.now();
+      for (const [key, entry] of this.cache.entries()) {
+        if (entry.expiresAt < now) {
+          this.cache.delete(key);
+          this.emitEvent('expire', key);
+        }
+      }
+    }, ShopifyCache.CACHE_CLEANUP_INTERVAL_MS) as unknown as number;
   }
 
   get<T>(key: string, allowStale: boolean = true): { readonly data: T | null; readonly stale: boolean } {
@@ -370,7 +524,7 @@ class ConnectionPool {
         decompress: true,
       });
 
-      instance.interceptors.request.use((config: AxiosRequestConfig) => {
+      instance.interceptors.request.use((config) => {
         if (config.data && typeof config.data === 'object') {
           const dataStr = JSON.stringify(config.data);
           if (dataStr.length > ConnectionPool.LARGE_PAYLOAD_THRESHOLD) {
@@ -413,7 +567,6 @@ export class GraphQLQueryOptimizer {
   private static readonly FIELD_PATTERN = /\w+\s*\{/g;
   private static readonly CONNECTION_PATTERN = /\w+\(first:\s*\d+\)/g;
   private static readonly LIMIT_PATTERN = /first:\s*(\d+)/g;
-  private static readonly DEFAULT_MAX_COST = 1000;
 
   static estimateCost(query: string): number {
     const fieldCount = (query.match(GraphQLQueryOptimizer.FIELD_PATTERN) || []).length;
@@ -423,7 +576,6 @@ export class GraphQLQueryOptimizer {
 
     return GraphQLQueryOptimizer.BASE_COST + fieldCount * GraphQLQueryOptimizer.FIELD_COST_MULTIPLIER + connectionCount * GraphQLQueryOptimizer.CONNECTION_COST + totalLimit * GraphQLQueryOptimizer.LIMIT_COST_MULTIPLIER;
   }
-
 }
 
 interface ShopResponse {
@@ -469,6 +621,7 @@ interface BlogArticleInput {
 }
 
 export class ShopifyAPI {
+  private static readonly SERVICE_NAME = 'ShopifyAPI';
   private static readonly DEFAULT_PRIORITY = 5;
   private static readonly DEFAULT_TIMEOUT = 30000;
   private static readonly DEFAULT_MAX_RETRIES = 3;
@@ -479,8 +632,14 @@ export class ShopifyAPI {
   private static readonly DEFAULT_PRIORITY_MEDIUM = 8;
   private static readonly DEFAULT_PRODUCTS_LIMIT = 250;
   private static readonly DEFAULT_REQUEST_QUEUE_SIZE = 5;
-  private static readonly RETRYABLE_ERRORS: readonly string[] = ['rate limit', 'timeout', 'network', 'server_error'];
+  private static readonly RETRYABLE_ERRORS: readonly string[] = ['rate limit', 'timeout', 'network', 'server_error'] as const;
   private static readonly PAGE_INFO_PATTERN = /<[^>]+page_info=([^>]+)>; rel="next"/;
+  private static readonly HTTP_STATUS_RATE_LIMIT = 429;
+  private static readonly HTTP_STATUS_UNAUTHORIZED = 401;
+  private static readonly HTTP_STATUS_FORBIDDEN = 403;
+  private static readonly HTTP_STATUS_NOT_FOUND = 404;
+  private static readonly HTTP_STATUS_UNPROCESSABLE_ENTITY = 422;
+  private static readonly HTTP_STATUS_SERVER_ERROR_MIN = 500;
 
   private readonly api: AxiosInstance;
   public readonly shopDomain: string;
@@ -490,6 +649,8 @@ export class ShopifyAPI {
   private readonly requestQueue: RequestQueue;
 
   constructor(shopDomain: string, accessToken: string) {
+    validateShopDomain(shopDomain);
+    validateAccessToken(accessToken);
     this.shopDomain = shopDomain;
     this.accessToken = accessToken;
     this.cache = getShopifyCache();
@@ -503,7 +664,6 @@ export class ShopifyAPI {
     this.api.put = withDeduplication(this.api.put.bind(this.api));
     this.api.delete = withDeduplication(this.api.delete.bind(this.api));
 
-    // Add error handling interceptors
     this.api.interceptors.response.use(
       (response) => response,
       async (error) => {
@@ -511,8 +671,7 @@ export class ShopifyAPI {
           const status = error.response.status;
           const data = error.response.data;
 
-          // Handle rate limiting
-          if (status === 429) {
+          if (status === ShopifyAPI.HTTP_STATUS_RATE_LIMIT) {
             const retryAfter = error.response.headers['retry-after'] || error.response.headers['x-shopify-api-version'];
             throw new ShopifyError(
               ShopifyErrorType.RATE_LIMIT,
@@ -522,8 +681,7 @@ export class ShopifyAPI {
             );
           }
 
-          // Handle authentication errors
-          if (status === 401) {
+          if (status === ShopifyAPI.HTTP_STATUS_UNAUTHORIZED) {
             throw new ShopifyError(
               ShopifyErrorType.AUTHENTICATION_FAILED,
               'Shopify authentication failed. Please reconnect your store.',
@@ -531,8 +689,7 @@ export class ShopifyAPI {
             );
           }
 
-          // Handle permission errors
-          if (status === 403) {
+          if (status === ShopifyAPI.HTTP_STATUS_FORBIDDEN) {
             throw new ShopifyError(
               ShopifyErrorType.PERMISSION_DENIED,
               'Insufficient permissions for this Shopify operation',
@@ -540,8 +697,7 @@ export class ShopifyAPI {
             );
           }
 
-          // Handle not found errors
-          if (status === 404) {
+          if (status === ShopifyAPI.HTTP_STATUS_NOT_FOUND) {
             throw new ShopifyError(
               ShopifyErrorType.NOT_FOUND,
               data?.errors?.[0]?.message || 'Resource not found in Shopify',
@@ -549,8 +705,7 @@ export class ShopifyAPI {
             );
           }
 
-          // Handle validation errors
-          if (status === 422) {
+          if (status === ShopifyAPI.HTTP_STATUS_UNPROCESSABLE_ENTITY) {
             const errorMessage = data?.errors?.[0]?.message || data?.error || 'Validation error';
             throw new ShopifyError(
               ShopifyErrorType.VALIDATION_ERROR,
@@ -561,8 +716,7 @@ export class ShopifyAPI {
             );
           }
 
-          // Handle server errors
-          if (status >= 500) {
+          if (status >= ShopifyAPI.HTTP_STATUS_SERVER_ERROR_MIN) {
             throw new ShopifyError(
               ShopifyErrorType.SERVER_ERROR,
               `Shopify server error: ${data?.error || error.message}`,
@@ -570,7 +724,6 @@ export class ShopifyAPI {
             );
           }
 
-          // Generic error
           throw new ShopifyError(
             ShopifyErrorType.UNKNOWN,
             `Shopify API error: ${data?.error || error.message}`,
@@ -578,7 +731,6 @@ export class ShopifyAPI {
           );
         }
 
-        // Network errors
         if (error.code === 'ECONNABORTED' || error.message.includes('timeout')) {
           throw new ShopifyError(ShopifyErrorType.TIMEOUT, 'Request to Shopify timed out', undefined, undefined);
         }
@@ -587,12 +739,10 @@ export class ShopifyAPI {
           throw new ShopifyError(ShopifyErrorType.NETWORK_ERROR, 'Failed to connect to Shopify', undefined, undefined);
         }
 
-        // Re-throw if already a ShopifyError
         if (error instanceof ShopifyError) {
           throw error;
         }
 
-        // Unknown error
         throw new ShopifyError(
           ShopifyErrorType.UNKNOWN,
           `Unexpected error: ${error.message || String(error)}`,
@@ -600,6 +750,10 @@ export class ShopifyAPI {
         );
       },
     );
+  }
+
+  destroy(): void {
+    this.requestQueue.clear();
   }
 
   private async retryWithBackoff<T>(fn: () => Promise<T>, options: RetryOptions = {}): Promise<T> {
@@ -652,7 +806,10 @@ export class ShopifyAPI {
   }
 
   async getShop(shopDomain: string, accessToken: string): Promise<unknown> {
+    validateShopDomain(shopDomain);
+    validateAccessToken(accessToken);
     const cacheKey = ShopifyCache.generateKey(shopDomain, 'shop');
+    const startTime = Date.now();
     return this.executeRequest(
       async () => {
         const rateLimitCheck = await this.rateLimiter.checkRestLimit(shopDomain);
@@ -663,6 +820,13 @@ export class ShopifyAPI {
         const response = await this.api.get<ShopResponse>('/shop.json');
         const shop = response.data.shop;
         this.cache.set(cacheKey, shop);
+        
+        const duration = Date.now() - startTime;
+        structuredLog('info', ShopifyAPI.SERVICE_NAME, 'Shop fetched', {
+          shopDomain,
+          durationMs: duration,
+        });
+
         return shop;
       },
       { cacheKey, priority: ShopifyAPI.DEFAULT_PRIORITY_HIGH },
@@ -670,7 +834,11 @@ export class ShopifyAPI {
   }
 
   async getProducts(shopDomain: string, accessToken: string, limit: number = ShopifyAPI.DEFAULT_PRODUCTS_LIMIT): Promise<readonly unknown[]> {
+    validateShopDomain(shopDomain);
+    validateAccessToken(accessToken);
+    validateLimit(limit);
     const cacheKey = ShopifyCache.generateKey(shopDomain, 'products', { limit });
+    const startTime = Date.now();
     return this.executeRequest(
       async () => {
         const products: unknown[] = [];
@@ -693,6 +861,14 @@ export class ShopifyAPI {
         } while (pageInfo);
 
         this.cache.set(cacheKey, products);
+        
+        const duration = Date.now() - startTime;
+        structuredLog('info', ShopifyAPI.SERVICE_NAME, 'Products fetched', {
+          shopDomain,
+          count: products.length,
+          durationMs: duration,
+        });
+
         return products;
       },
       { cacheKey },
@@ -700,12 +876,23 @@ export class ShopifyAPI {
   }
 
   async getCollections(shopDomain: string, accessToken: string): Promise<readonly unknown[]> {
+    validateShopDomain(shopDomain);
+    validateAccessToken(accessToken);
     const cacheKey = ShopifyCache.generateKey(shopDomain, 'collections');
+    const startTime = Date.now();
     return this.executeRequest(
       async () => {
         const response = await this.api.get<CollectionsResponse>('/collections.json');
         const collections = response.data.collections || [];
         this.cache.set(cacheKey, collections);
+        
+        const duration = Date.now() - startTime;
+        structuredLog('info', ShopifyAPI.SERVICE_NAME, 'Collections fetched', {
+          shopDomain,
+          count: collections.length,
+          durationMs: duration,
+        });
+
         return collections;
       },
       { cacheKey },
@@ -713,12 +900,23 @@ export class ShopifyAPI {
   }
 
   async getPages(shopDomain: string, accessToken: string): Promise<readonly unknown[]> {
+    validateShopDomain(shopDomain);
+    validateAccessToken(accessToken);
     const cacheKey = ShopifyCache.generateKey(shopDomain, 'pages');
+    const startTime = Date.now();
     return this.executeRequest(
       async () => {
         const response = await this.api.get<PagesResponse>('/pages.json');
         const pages = response.data.pages || [];
         this.cache.set(cacheKey, pages);
+        
+        const duration = Date.now() - startTime;
+        structuredLog('info', ShopifyAPI.SERVICE_NAME, 'Pages fetched', {
+          shopDomain,
+          count: pages.length,
+          durationMs: duration,
+        });
+
         return pages;
       },
       { cacheKey },
@@ -726,6 +924,11 @@ export class ShopifyAPI {
   }
 
   async getBlogArticles(shopDomain: string, accessToken: string, blogId?: number): Promise<readonly unknown[]> {
+    validateShopDomain(shopDomain);
+    validateAccessToken(accessToken);
+    if (blogId !== undefined) {
+      validateBlogId(blogId);
+    }
     if (!blogId) {
       const blogs = await this.getBlogs(shopDomain, accessToken);
       if (blogs.length === 0) return [];
@@ -733,11 +936,21 @@ export class ShopifyAPI {
     }
 
     const cacheKey = ShopifyCache.generateKey(shopDomain, 'articles', { blogId });
+    const startTime = Date.now();
     return this.executeRequest(
       async () => {
         const response = await this.api.get<ArticlesResponse>(`/blogs/${blogId}/articles.json`);
         const articles = response.data.articles || [];
         this.cache.set(cacheKey, articles);
+        
+        const duration = Date.now() - startTime;
+        structuredLog('info', ShopifyAPI.SERVICE_NAME, 'Blog articles fetched', {
+          shopDomain,
+          blogId,
+          count: articles.length,
+          durationMs: duration,
+        });
+
         return articles;
       },
       { cacheKey },
@@ -750,9 +963,13 @@ export class ShopifyAPI {
     blogId: number,
     article: BlogArticleInput,
   ): Promise<unknown> {
+    validateShopDomain(shopDomain);
+    validateAccessToken(accessToken);
+    validateBlogId(blogId);
+    validateArticleInput(article);
     const idempotencyKey = `create_article_${blogId}_${article.title}_${Date.now()}`;
     const cacheKey = ShopifyCache.generateKey(shopDomain, 'article_create', { idempotencyKey });
-
+    const startTime = Date.now();
     return this.executeRequest(
       async () => {
         const response = await this.api.post<ArticleResponse>(`/blogs/${blogId}/articles.json`, { article });
@@ -760,6 +977,13 @@ export class ShopifyAPI {
 
         this.cache.invalidate(`^${shopDomain}${ShopifyCache.CACHE_KEY_SEPARATOR}articles:.*blogId.*${blogId}`);
         this.cache.invalidate(`^${shopDomain}${ShopifyCache.CACHE_KEY_SEPARATOR}blogs`);
+
+        const duration = Date.now() - startTime;
+        structuredLog('info', ShopifyAPI.SERVICE_NAME, 'Blog article created', {
+          shopDomain,
+          blogId,
+          durationMs: duration,
+        });
 
         return createdArticle;
       },
@@ -774,12 +998,28 @@ export class ShopifyAPI {
     articleId: number,
     updates: Readonly<Partial<unknown>>,
   ): Promise<unknown> {
+    validateShopDomain(shopDomain);
+    validateAccessToken(accessToken);
+    validateBlogId(blogId);
+    validateArticleId(articleId);
+    if (!updates || typeof updates !== 'object') {
+      throw new Error('Invalid updates: must be an object');
+    }
+    const startTime = Date.now();
     return this.executeRequest(
       async () => {
         const response = await this.api.put<ArticleResponse>(`/blogs/${blogId}/articles/${articleId}.json`, { article: updates });
         const updatedArticle = response.data.article;
 
         this.cache.invalidate(`^${shopDomain}${ShopifyCache.CACHE_KEY_SEPARATOR}articles:.*blogId.*${blogId}`);
+
+        const duration = Date.now() - startTime;
+        structuredLog('info', ShopifyAPI.SERVICE_NAME, 'Blog article updated', {
+          shopDomain,
+          blogId,
+          articleId,
+          durationMs: duration,
+        });
 
         return updatedArticle;
       },
@@ -793,24 +1033,48 @@ export class ShopifyAPI {
     blogId: number,
     articleId: number,
   ): Promise<void> {
+    validateShopDomain(shopDomain);
+    validateAccessToken(accessToken);
+    validateBlogId(blogId);
+    validateArticleId(articleId);
+    const startTime = Date.now();
     return this.executeRequest(
       async () => {
         await this.api.delete(`/blogs/${blogId}/articles/${articleId}.json`);
 
         this.cache.invalidate(`^${shopDomain}${ShopifyCache.CACHE_KEY_SEPARATOR}articles:.*blogId.*${blogId}`);
         this.cache.invalidate(`^${shopDomain}${ShopifyCache.CACHE_KEY_SEPARATOR}blogs`);
+
+        const duration = Date.now() - startTime;
+        structuredLog('info', ShopifyAPI.SERVICE_NAME, 'Blog article deleted', {
+          shopDomain,
+          blogId,
+          articleId,
+          durationMs: duration,
+        });
       },
       { priority: ShopifyAPI.DEFAULT_PRIORITY_MEDIUM },
     );
   }
 
   async getBlogs(shopDomain: string, accessToken: string): Promise<readonly unknown[]> {
+    validateShopDomain(shopDomain);
+    validateAccessToken(accessToken);
     const cacheKey = ShopifyCache.generateKey(shopDomain, 'blogs');
+    const startTime = Date.now();
     return this.executeRequest(
       async () => {
         const response = await this.api.get<BlogsResponse>('/blogs.json');
         const blogs = response.data.blogs || [];
         this.cache.set(cacheKey, blogs);
+        
+        const duration = Date.now() - startTime;
+        structuredLog('info', ShopifyAPI.SERVICE_NAME, 'Blogs fetched', {
+          shopDomain,
+          count: blogs.length,
+          durationMs: duration,
+        });
+
         return blogs;
       },
       { cacheKey },
@@ -862,6 +1126,7 @@ interface FileUploadResult {
 }
 
 export class ShopifyGraphQL {
+  private static readonly SERVICE_NAME = 'ShopifyGraphQL';
   private static readonly DEFAULT_PRIORITY = 5;
   private static readonly DEFAULT_TIMEOUT = 30000;
   private static readonly DEFAULT_USE_CACHE = true;
@@ -901,12 +1166,18 @@ export class ShopifyGraphQL {
   private readonly requestQueue: RequestQueue;
 
   constructor(shopDomain: string, accessToken: string) {
+    validateShopDomain(shopDomain);
+    validateAccessToken(accessToken);
     this.shopDomain = shopDomain;
     this.accessToken = accessToken;
     this.baseUrl = `https://${shopDomain}/admin/api/${API_VERSION}/graphql.json`;
     this.cache = getShopifyCache();
     this.rateLimiter = getShopifyRateLimiter();
     this.requestQueue = new RequestQueue(ShopifyGraphQL.DEFAULT_REQUEST_QUEUE_SIZE);
+  }
+
+  destroy(): void {
+    this.requestQueue.clear();
   }
 
   async query<T>(
@@ -919,6 +1190,7 @@ export class ShopifyGraphQL {
       readonly cacheKey?: string;
     } = {},
   ): Promise<T> {
+    validateQuery(query);
     const { priority = ShopifyGraphQL.DEFAULT_PRIORITY, timeout = ShopifyGraphQL.DEFAULT_TIMEOUT, useCache = ShopifyGraphQL.DEFAULT_USE_CACHE, cacheKey } = options;
 
     const finalCacheKey = cacheKey || this.generateCacheKey(query, variables);
@@ -961,6 +1233,7 @@ export class ShopifyGraphQL {
     priority: number = ShopifyGraphQL.DEFAULT_PRIORITY,
     timeout: number = ShopifyGraphQL.DEFAULT_TIMEOUT,
   ): Promise<T> {
+    const startTime = Date.now();
     const estimatedCost = GraphQLQueryOptimizer.estimateCost(query);
     const rateLimitCheck = await this.rateLimiter.checkGraphQLLimit(this.shopDomain, estimatedCost);
     if (!rateLimitCheck.allowed) {
@@ -997,6 +1270,11 @@ export class ShopifyGraphQL {
       if (data.extensions?.cost) {
         const { throttleStatus } = data.extensions.cost;
         if (throttleStatus.currentlyAvailable < ShopifyGraphQL.THROTTLE_WARNING_THRESHOLD) {
+          structuredLog('warn', ShopifyGraphQL.SERVICE_NAME, 'GraphQL throttle warning', {
+            shopDomain: this.shopDomain,
+            currentlyAvailable: throttleStatus.currentlyAvailable,
+            maximumAvailable: throttleStatus.maximumAvailable,
+          });
         }
         await this.rateLimiter.recordGraphQLCost(this.shopDomain, data.extensions.cost.actualQueryCost);
       }
@@ -1005,9 +1283,24 @@ export class ShopifyGraphQL {
         throw new ShopifyError(ShopifyErrorType.GRAPHQL_ERROR, 'No data returned from GraphQL query');
       }
 
+      const duration = Date.now() - startTime;
+      structuredLog('info', ShopifyGraphQL.SERVICE_NAME, 'GraphQL query executed', {
+        shopDomain: this.shopDomain,
+        estimatedCost,
+        actualCost: data.extensions?.cost?.actualQueryCost,
+        durationMs: duration,
+      });
+
       return data.data;
     } catch (error: unknown) {
       clearTimeout(timeoutId);
+
+      const duration = Date.now() - startTime;
+      structuredLog('error', ShopifyGraphQL.SERVICE_NAME, 'GraphQL query failed', {
+        shopDomain: this.shopDomain,
+        error: error instanceof Error ? error.message : String(error),
+        durationMs: duration,
+      });
 
       if ((error as { name?: string }).name === 'AbortError') {
         throw new ShopifyError(ShopifyErrorType.TIMEOUT, 'GraphQL query timeout', undefined, timeout);
@@ -1103,8 +1396,15 @@ export class ShopifyGraphQL {
     return ShopifyCache.generateKey(this.shopDomain, 'graphql', { query: query.substring(0, ShopifyGraphQL.DEFAULT_CACHE_KEY_LENGTH), vars: varStr });
   }
 
-
   async uploadImage(imageUrl: string, altText?: string, retries: number = ShopifyGraphQL.DEFAULT_IMAGE_UPLOAD_RETRIES): Promise<{ readonly id: string; readonly url: string } | null> {
+    validateImageUrl(imageUrl);
+    if (altText !== undefined && (typeof altText !== 'string' || altText.length > 500)) {
+      throw new Error('Invalid alt text: must be a string with max length 500');
+    }
+    if (!Number.isInteger(retries) || retries < 1 || retries > 10) {
+      throw new Error('Invalid retries: must be an integer between 1 and 10');
+    }
+
     const mutation = `
       mutation fileCreate($files: [FileCreateInput!]!) {
         fileCreate(files: $files) {
@@ -1127,6 +1427,7 @@ export class ShopifyGraphQL {
     `;
 
     let lastError: Error | null = null;
+    const startTime = Date.now();
 
     for (let attempt = 1; attempt <= retries; attempt++) {
       try {
@@ -1153,6 +1454,12 @@ export class ShopifyGraphQL {
 
         const file = result.fileCreate.files[0];
         if (file && file.id && file.image?.url) {
+          const duration = Date.now() - startTime;
+          structuredLog('info', ShopifyGraphQL.SERVICE_NAME, 'Image uploaded', {
+            shopDomain: this.shopDomain,
+            fileId: file.id,
+            durationMs: duration,
+          });
           return {
             id: file.id,
             url: file.image.url,
@@ -1162,6 +1469,12 @@ export class ShopifyGraphQL {
         if (file && file.id && file.fileStatus !== ShopifyGraphQL.FILE_STATUS_READY) {
           const fileUrl = await this.pollFileStatus(file.id, ShopifyGraphQL.DEFAULT_POLL_ATTEMPTS);
           if (fileUrl) {
+            const duration = Date.now() - startTime;
+            structuredLog('info', ShopifyGraphQL.SERVICE_NAME, 'Image uploaded after polling', {
+              shopDomain: this.shopDomain,
+              fileId: file.id,
+              durationMs: duration,
+            });
             return { id: file.id, url: fileUrl };
           }
         }
@@ -1179,10 +1492,24 @@ export class ShopifyGraphQL {
             ShopifyGraphQL.BACKOFF_BASE * Math.pow(2, attempt) + Math.random() * ShopifyGraphQL.JITTER_MAX,
             ShopifyGraphQL.BACKOFF_MAX,
           );
+          structuredLog('warn', ShopifyGraphQL.SERVICE_NAME, 'Retrying image upload', {
+            shopDomain: this.shopDomain,
+            attempt,
+            delayMs: delay,
+            error: lastError.message,
+          });
           await new Promise((resolve) => setTimeout(resolve, delay));
         }
       }
     }
+
+    const duration = Date.now() - startTime;
+    structuredLog('error', ShopifyGraphQL.SERVICE_NAME, 'Image upload failed after retries', {
+      shopDomain: this.shopDomain,
+      retries,
+      durationMs: duration,
+      error: lastError?.message,
+    });
 
     return null;
   }
@@ -1227,7 +1554,6 @@ export class ShopifyGraphQL {
     return null;
   }
 
-
   async cancelSubscription(
     subscriptionId: string,
     prorate: boolean = false,
@@ -1235,6 +1561,8 @@ export class ShopifyGraphQL {
     readonly success: boolean;
     readonly userErrors: ReadonlyArray<Readonly<{ readonly field: readonly string[]; readonly message: string }>>;
   }>> {
+    validateSubscriptionId(subscriptionId);
+    const startTime = Date.now();
     const mutation = `
       mutation AppSubscriptionCancel($id: ID!, $prorate: Boolean) {
         appSubscriptionCancel(id: $id, prorate: $prorate) {
@@ -1261,11 +1589,26 @@ export class ShopifyGraphQL {
         prorate,
       }, { useCache: false, priority: ShopifyGraphQL.DEFAULT_PRIORITY_CRITICAL });
 
+      const duration = Date.now() - startTime;
+      structuredLog('info', ShopifyGraphQL.SERVICE_NAME, 'Subscription cancelled', {
+        shopDomain: this.shopDomain,
+        subscriptionId,
+        success: result.appSubscriptionCancel.userErrors.length === 0,
+        durationMs: duration,
+      });
+
       return {
         success: result.appSubscriptionCancel.userErrors.length === 0,
         userErrors: result.appSubscriptionCancel.userErrors,
       };
     } catch (error: unknown) {
+      const duration = Date.now() - startTime;
+      structuredLog('error', ShopifyGraphQL.SERVICE_NAME, 'Failed to cancel subscription', {
+        shopDomain: this.shopDomain,
+        subscriptionId,
+        error: error instanceof Error ? error.message : String(error),
+        durationMs: duration,
+      });
       return {
         success: false,
         userErrors: [
@@ -1277,149 +1620,7 @@ export class ShopifyGraphQL {
       };
     }
   }
-
 }
-
-interface BatchRequest {
-  readonly id: string;
-  readonly type: 'get' | 'post' | 'put' | 'delete';
-  readonly endpoint: string;
-  readonly params?: Readonly<Record<string, unknown>>;
-  readonly body?: unknown;
-}
-
-interface BatchResponse {
-  readonly id: string;
-  readonly status: number;
-  readonly data?: unknown;
-  readonly error?: string;
-}
-
-class ShopifyBatch {
-  private static readonly HTTP_STATUS_OK = 200;
-  private static readonly HTTP_STATUS_INTERNAL_ERROR = 500;
-  private static readonly DEFAULT_PRIORITY = 5;
-  private static readonly OPERATION_PATTERN = /^(query|mutation)\s+(\w+)?/;
-  private static readonly QUERY_PREFIX = 'query_';
-
-  private readonly shopifyAPI: ShopifyAPI;
-  private readonly shopifyGraphQL: ShopifyGraphQL;
-  private readonly rateLimiter: ReturnType<typeof getShopifyRateLimiter>;
-
-  constructor(shopDomain: string, accessToken: string) {
-    this.shopifyAPI = new ShopifyAPI(shopDomain, accessToken);
-    this.shopifyGraphQL = new ShopifyGraphQL(shopDomain, accessToken);
-    this.rateLimiter = getShopifyRateLimiter();
-  }
-
-  async batchRestRequests(requests: ReadonlyArray<BatchRequest>): Promise<ReadonlyArray<BatchResponse>> {
-    const promises = requests.map(async (request) => {
-      await this.rateLimiter.waitForRestToken(this.shopifyAPI.shopDomain);
-
-      try {
-        let data: unknown;
-
-        switch (request.type) {
-          case 'get':
-            if (request.endpoint.includes('/products')) {
-              data = await this.shopifyAPI.getProducts(
-                this.shopifyAPI.shopDomain,
-                this.shopifyAPI.accessToken,
-              );
-            } else if (request.endpoint.includes('/blogs')) {
-              data = await this.shopifyAPI.getBlogs(
-                this.shopifyAPI.shopDomain,
-                this.shopifyAPI.accessToken,
-              );
-            } else if (request.endpoint.includes('/collections')) {
-              data = await this.shopifyAPI.getCollections(
-                this.shopifyAPI.shopDomain,
-                this.shopifyAPI.accessToken,
-              );
-            } else {
-              throw new Error(`Unsupported endpoint: ${request.endpoint}`);
-            }
-            break;
-          default:
-            throw new Error(`Unsupported request type: ${request.type}`);
-        }
-
-        return {
-          id: request.id,
-          status: ShopifyBatch.HTTP_STATUS_OK,
-          data,
-        };
-      } catch (error: unknown) {
-        return {
-          id: request.id,
-          status: (error as { response?: { status?: number } }).response?.status || ShopifyBatch.HTTP_STATUS_INTERNAL_ERROR,
-          error: error instanceof Error ? error.message : String(error),
-        };
-      }
-    });
-
-    return Promise.all(promises);
-  }
-
-  async batchGraphQLQueries(queries: ReadonlyArray<{ readonly id: string; readonly query: string; readonly variables?: Readonly<Record<string, unknown>> }>): Promise<ReadonlyArray<BatchResponse>> {
-    await this.rateLimiter.waitForGraphQLToken(this.shopifyGraphQL['shopDomain']);
-
-    try {
-      const aliasedQueries = queries.map((q, index) => {
-        const alias = `${ShopifyBatch.QUERY_PREFIX}${index}`;
-        const operationMatch = q.query.match(ShopifyBatch.OPERATION_PATTERN);
-        if (operationMatch) {
-          const operationType = operationMatch[1];
-          const operationName = operationMatch[2] || alias;
-          const aliasedQuery = q.query.replace(
-            new RegExp(`^${operationType}\\s+${operationName}?`),
-            `${operationType} ${alias}`,
-          );
-          return { alias, query: aliasedQuery, variables: q.variables };
-        }
-        return { alias, query: q.query, variables: q.variables };
-      });
-
-      const combinedQuery = aliasedQueries
-        .map((aq) => aq.query)
-        .join('\n');
-
-      const combinedVariables: Record<string, unknown> = aliasedQueries.reduce((acc: Record<string, unknown>, aq) => {
-        if (aq.variables) {
-          return { ...acc, ...aq.variables };
-        }
-        return acc;
-      }, {});
-
-      const response = await this.shopifyGraphQL.query<Record<string, unknown>>(
-        combinedQuery,
-        combinedVariables,
-        { useCache: false, priority: ShopifyBatch.DEFAULT_PRIORITY },
-      );
-
-      const results: BatchResponse[] = aliasedQueries.map((aq, index) => {
-        const data = response[aq.alias] || response[`${ShopifyBatch.QUERY_PREFIX}${index}`];
-        return {
-          id: queries[index].id,
-          status: data ? ShopifyBatch.HTTP_STATUS_OK : ShopifyBatch.HTTP_STATUS_INTERNAL_ERROR,
-          data,
-          error: data ? undefined : 'Query failed',
-        };
-      });
-
-      return results;
-    } catch (error: unknown) {
-      return queries.map((q) => ({
-        id: q.id,
-        status: ShopifyBatch.HTTP_STATUS_INTERNAL_ERROR,
-        error: error instanceof Error ? error.message : String(error),
-      }));
-    }
-  }
-
-}
-
-
 
 export class ShopifyClient {
   public readonly rest: ShopifyAPI;
@@ -1428,10 +1629,17 @@ export class ShopifyClient {
   public readonly imageCDN: ShopifyImageCDN;
 
   constructor(shopDomain: string, accessToken: string) {
+    validateShopDomain(shopDomain);
+    validateAccessToken(accessToken);
     this.rest = new ShopifyAPI(shopDomain, accessToken);
     this.graphql = new ShopifyGraphQL(shopDomain, accessToken);
     this.cache = getShopifyCache();
     this.imageCDN = new ShopifyImageCDN(this.graphql, shopDomain);
+  }
+
+  destroy(): void {
+    this.rest.destroy();
+    this.graphql.destroy();
   }
 
   get shopDomain(): string {
@@ -1468,23 +1676,44 @@ export class ShopifyImageCDN {
   private static readonly DEFAULT_FORMAT = 'webp';
   private static readonly DEFAULT_FORMAT_FALLBACK = 'jpeg';
   private static readonly DEFAULT_IMAGE_UPLOAD_RETRIES = 3;
-  private static readonly DEFAULT_WIDTHS: readonly number[] = [640, 768, 1024, 1280, 1920];
 
   private readonly shopifyGraphQL: ShopifyGraphQL;
   private readonly shopDomain: string;
 
   constructor(shopifyGraphQL: ShopifyGraphQL, shopDomain: string) {
+    validateShopDomain(shopDomain);
     this.shopifyGraphQL = shopifyGraphQL;
     this.shopDomain = shopDomain;
   }
 
   async uploadImage(imageUrl: string, options?: ImageUploadOptions): Promise<ImageUploadResult> {
+    validateImageUrl(imageUrl);
+    if (options?.width !== undefined && (!Number.isInteger(options.width) || options.width <= 0 || options.width > 10000)) {
+      throw new Error('Invalid width: must be an integer between 1 and 10000');
+    }
+    if (options?.height !== undefined && (!Number.isInteger(options.height) || options.height <= 0 || options.height > 10000)) {
+      throw new Error('Invalid height: must be an integer between 1 and 10000');
+    }
+    if (options?.quality !== undefined && (typeof options.quality !== 'number' || options.quality < 0 || options.quality > 100)) {
+      throw new Error('Invalid quality: must be a number between 0 and 100');
+    }
+    if (options?.altText !== undefined && (typeof options.altText !== 'string' || options.altText.length > 500)) {
+      throw new Error('Invalid alt text: must be a string with max length 500');
+    }
+
     const altText = options?.altText || ShopifyImageCDN.DEFAULT_ALT_TEXT;
+    const startTime = Date.now();
 
     try {
       const uploadResult = await this.shopifyGraphQL.uploadImage(imageUrl, altText, ShopifyImageCDN.DEFAULT_IMAGE_UPLOAD_RETRIES);
 
       if (!uploadResult) {
+        const duration = Date.now() - startTime;
+        structuredLog('warn', 'ShopifyImageCDN', 'Image upload returned null', {
+          shopDomain: this.shopDomain,
+          imageUrl,
+          durationMs: duration,
+        });
         return {
           url: imageUrl,
           cdnUrl: imageUrl,
@@ -1496,6 +1725,13 @@ export class ShopifyImageCDN {
         };
       }
 
+      const duration = Date.now() - startTime;
+      structuredLog('info', 'ShopifyImageCDN', 'Image uploaded successfully', {
+        shopDomain: this.shopDomain,
+        shopifyImageId: uploadResult.id,
+        durationMs: duration,
+      });
+
       return {
         url: uploadResult.url,
         cdnUrl: uploadResult.url,
@@ -1505,7 +1741,14 @@ export class ShopifyImageCDN {
         format: options?.format || ShopifyImageCDN.DEFAULT_FORMAT,
         size: 0,
       };
-    } catch {
+    } catch (error) {
+      const duration = Date.now() - startTime;
+      structuredLog('error', 'ShopifyImageCDN', 'Image upload failed', {
+        shopDomain: this.shopDomain,
+        imageUrl,
+        error: error instanceof Error ? error.message : String(error),
+        durationMs: duration,
+      });
       return {
         url: imageUrl,
         cdnUrl: imageUrl,
@@ -1517,5 +1760,4 @@ export class ShopifyImageCDN {
       };
     }
   }
-
 }

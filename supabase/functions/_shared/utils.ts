@@ -91,6 +91,43 @@ interface SupabaseClientOptions {
   };
 }
 
+interface JWTPayload {
+  readonly sub: string;
+  readonly email?: string;
+  readonly role?: string;
+  readonly aud?: string;
+  readonly exp?: number;
+  readonly iat?: number;
+  readonly [key: string]: unknown;
+}
+
+interface JWTValidationResult {
+  readonly valid: boolean;
+  readonly userId?: string;
+  readonly payload?: JWTPayload;
+  readonly error?: string;
+}
+
+interface ValidationRule {
+  readonly field: string;
+  readonly required?: boolean;
+  readonly type?: 'string' | 'number' | 'boolean' | 'array' | 'object';
+  readonly minLength?: number;
+  readonly maxLength?: number;
+  readonly pattern?: RegExp;
+  readonly enum?: readonly string[];
+  readonly validate?: (value: unknown) => boolean | string;
+}
+
+interface ValidationResult {
+  readonly valid: boolean;
+  readonly errors?: ReadonlyArray<{ readonly field: string; readonly error: string }>;
+}
+
+type RequestInterceptor = (request: Request) => Request | Promise<Request>;
+type ResponseInterceptor = (response: Response) => Response | Promise<Response>;
+type ErrorInterceptor = (error: Error, request: Request) => Response | Promise<Response>;
+
 const DEFAULT_CLIENT_REFRESH_INTERVAL = 300000;
 const DEFAULT_CLIENT_HEALTH_CHECK_INTERVAL = 60000;
 const DEFAULT_CLIENT_MAX_RETRIES = 3;
@@ -107,7 +144,6 @@ const BROTLI_LEVEL_MIN = 1;
 const BROTLI_LEVEL_MAX = 11;
 const GZIP_LEVEL_MIN = 1;
 const GZIP_LEVEL_MAX = 9;
-const CACHE_KEY_PREFIX_LENGTH = 50;
 const DEFAULT_STATUS_CODE = 200;
 const IDENTITY_ENCODING = 'identity';
 const GZIP_ENCODING = 'gzip';
@@ -155,6 +191,32 @@ const ENCODING_NONE = 'none';
 const BEARER_PREFIX = 'Bearer ';
 const BEARER_PREFIX_LENGTH = 7;
 const MIN_TOKEN_LENGTH = 10;
+const JWT_PARTS_COUNT = 3;
+const BASE64_PADDING_CHAR = '=';
+const BASE64_URL_REPLACE_DASH = /-/g;
+const BASE64_URL_REPLACE_UNDERSCORE = /_/g;
+const BASE64_URL_PLUS = '+';
+const BASE64_URL_SLASH = '/';
+const BASE64_MODULO = 4;
+const JWT_AUD_AUTHENTICATED = 'authenticated';
+const JWT_AUD_ANON = 'anon';
+const JWT_ROLE_ANON = 'anon';
+const CONTROL_CHARS_REGEX = /[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]/g;
+const SCRIPT_TAG_REGEX = /<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi;
+const EVENT_HANDLER_REGEX = /\son\w+\s*=\s*["'][^"']*["']/gi;
+const JAVASCRIPT_PROTOCOL_REGEX = /javascript:/gi;
+const DATA_HTML_REGEX = /data:\s*text\/html/gi;
+const CORS_HEADER_ORIGIN = 'Origin';
+const CORS_HEADER_ALLOW_ORIGIN = 'Access-Control-Allow-Origin';
+const CORS_HEADER_ALLOW_HEADERS = 'Access-Control-Allow-Headers';
+const CORS_HEADER_ALLOW_METHODS = 'Access-Control-Allow-Methods';
+const CORS_HEADER_MAX_AGE = 'Access-Control-Max-Age';
+const CORS_HEADER_ALLOW_CREDENTIALS = 'Access-Control-Allow-Credentials';
+const CORS_MAX_AGE = '86400';
+const CORS_CREDENTIALS_TRUE = 'true';
+const CORS_CREDENTIALS_FALSE = 'false';
+const CORS_ALLOWED_HEADERS = 'authorization, x-client-info, apikey, content-type, x-correlation-id, x-request-id';
+const CORS_ALLOWED_METHODS = 'GET, POST, PATCH, DELETE, OPTIONS';
 
 function getEnv(key: string, defaultValue = ''): string {
   try {
@@ -165,29 +227,34 @@ function getEnv(key: string, defaultValue = ''): string {
   }
 }
 
+function parseIntSafe(value: string, defaultValue: number): number {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isNaN(parsed) ? defaultValue : parsed;
+}
+
 const CONFIG = {
-  CLIENT_REFRESH_INTERVAL: parseInt(getEnv(ENV_SUPABASE_CLIENT_REFRESH_INTERVAL, String(DEFAULT_CLIENT_REFRESH_INTERVAL))),
-  CLIENT_HEALTH_CHECK_INTERVAL: parseInt(getEnv(ENV_SUPABASE_CLIENT_HEALTH_CHECK_INTERVAL, String(DEFAULT_CLIENT_HEALTH_CHECK_INTERVAL))),
-  CLIENT_MAX_RETRIES: parseInt(getEnv(ENV_SUPABASE_CLIENT_MAX_RETRIES, String(DEFAULT_CLIENT_MAX_RETRIES))),
+  CLIENT_REFRESH_INTERVAL: parseIntSafe(getEnv(ENV_SUPABASE_CLIENT_REFRESH_INTERVAL, String(DEFAULT_CLIENT_REFRESH_INTERVAL)), DEFAULT_CLIENT_REFRESH_INTERVAL),
+  CLIENT_HEALTH_CHECK_INTERVAL: parseIntSafe(getEnv(ENV_SUPABASE_CLIENT_HEALTH_CHECK_INTERVAL, String(DEFAULT_CLIENT_HEALTH_CHECK_INTERVAL)), DEFAULT_CLIENT_HEALTH_CHECK_INTERVAL),
+  CLIENT_MAX_RETRIES: parseIntSafe(getEnv(ENV_SUPABASE_CLIENT_MAX_RETRIES, String(DEFAULT_CLIENT_MAX_RETRIES)), DEFAULT_CLIENT_MAX_RETRIES),
   ENABLE_CONNECTION_POOLING: getEnv(ENV_SUPABASE_ENABLE_POOLING, ENV_VALUE_TRUE) !== ENV_VALUE_FALSE,
-  COMPRESSION_LEVEL: parseInt(getEnv(ENV_COMPRESSION_LEVEL, String(DEFAULT_COMPRESSION_LEVEL))),
-  COMPRESSION_THRESHOLD: parseInt(getEnv(ENV_COMPRESSION_THRESHOLD, String(DEFAULT_COMPRESSION_THRESHOLD))),
+  COMPRESSION_LEVEL: parseIntSafe(getEnv(ENV_COMPRESSION_LEVEL, String(DEFAULT_COMPRESSION_LEVEL)), DEFAULT_COMPRESSION_LEVEL),
+  COMPRESSION_THRESHOLD: parseIntSafe(getEnv(ENV_COMPRESSION_THRESHOLD, String(DEFAULT_COMPRESSION_THRESHOLD)), DEFAULT_COMPRESSION_THRESHOLD),
   COMPRESSION_CACHE_ENABLED: getEnv(ENV_COMPRESSION_CACHE_ENABLED, ENV_VALUE_TRUE) !== ENV_VALUE_FALSE,
-  COMPRESSION_CACHE_TTL: parseInt(getEnv(ENV_COMPRESSION_CACHE_TTL, String(DEFAULT_COMPRESSION_CACHE_TTL))),
+  COMPRESSION_CACHE_TTL: parseIntSafe(getEnv(ENV_COMPRESSION_CACHE_TTL, String(DEFAULT_COMPRESSION_CACHE_TTL)), DEFAULT_COMPRESSION_CACHE_TTL),
   LOG_LEVEL: (getEnv(ENV_LOG_LEVEL, DEFAULT_LOG_LEVEL)) as LogLevelKey,
   ENABLE_METRICS: getEnv(ENV_ENABLE_METRICS, ENV_VALUE_TRUE) !== ENV_VALUE_FALSE,
   ENABLE_PERFORMANCE_MONITORING: getEnv(ENV_ENABLE_PERFORMANCE_MONITORING, ENV_VALUE_TRUE) !== ENV_VALUE_FALSE,
   RATE_LIMIT_ENABLED: getEnv(ENV_RATE_LIMIT_ENABLED, ENV_VALUE_FALSE) === ENV_VALUE_TRUE,
-  RATE_LIMIT_MAX_REQUESTS: parseInt(getEnv(ENV_RATE_LIMIT_MAX_REQUESTS, String(DEFAULT_RATE_LIMIT_MAX_REQUESTS))),
-  RATE_LIMIT_WINDOW_MS: parseInt(getEnv(ENV_RATE_LIMIT_WINDOW_MS, String(DEFAULT_RATE_LIMIT_WINDOW_MS))),
-};
+  RATE_LIMIT_MAX_REQUESTS: parseIntSafe(getEnv(ENV_RATE_LIMIT_MAX_REQUESTS, String(DEFAULT_RATE_LIMIT_MAX_REQUESTS)), DEFAULT_RATE_LIMIT_MAX_REQUESTS),
+  RATE_LIMIT_WINDOW_MS: parseIntSafe(getEnv(ENV_RATE_LIMIT_WINDOW_MS, String(DEFAULT_RATE_LIMIT_WINDOW_MS)), DEFAULT_RATE_LIMIT_WINDOW_MS),
+} as const;
 
 const LOG_LEVELS: LogLevel = {
   DEBUG: 0,
   INFO: 1,
   WARN: 2,
   ERROR: 3,
-};
+} as const;
 
 const currentLogLevel = LOG_LEVELS[CONFIG.LOG_LEVEL] ?? LOG_LEVELS.INFO;
 
@@ -291,10 +358,6 @@ export function getPerformanceMetrics(functionName?: string): readonly Performan
     return performanceMetrics.filter((m) => m.functionName === functionName);
   }
   return [...performanceMetrics];
-}
-
-function clearPerformanceMetrics(): void {
-  performanceMetrics.length = 0;
 }
 
 function withPerformanceTracking<T>(
@@ -459,16 +522,6 @@ export async function createAuthenticatedClient(authHeader: string): Promise<Ret
   });
 }
 
-function resetSupabaseClient(cacheKey?: string): void {
-  if (cacheKey) {
-    clientInstances.delete(cacheKey);
-    logger.info('Reset specific Supabase client', { cacheKey });
-  } else {
-    clientInstances.clear();
-    logger.info('Reset all Supabase clients');
-  }
-}
-
 export function getClientMetrics() {
   return {
     ...clientMetrics,
@@ -517,13 +570,13 @@ function getCompressionLevel(encoding: string, level?: number): number {
   return defaultLevel;
 }
 
-async function compressGzip(input: Uint8Array, level = DEFAULT_COMPRESSION_LEVEL): Promise<Uint8Array> {
+async function compressStream(input: Uint8Array, format: CompressionFormat): Promise<Uint8Array> {
   if (typeof CompressionStream === 'undefined') {
     return input;
   }
 
   try {
-    const stream = new CompressionStream(GZIP_ENCODING);
+    const stream = new CompressionStream(format);
     const writer = stream.writable.getWriter();
     const reader = stream.readable.getReader();
 
@@ -550,67 +603,34 @@ async function compressGzip(input: Uint8Array, level = DEFAULT_COMPRESSION_LEVEL
 
     return compressed;
   } catch (error) {
-    logger.error('Gzip compression failed', { error });
-    throw new CompressionError('Gzip compression failed', error);
+    logger.error('Compression failed', { format, error });
+    throw new CompressionError(`Compression failed: ${format}`, { format, error });
   }
+}
+
+async function compressGzip(input: Uint8Array, level = DEFAULT_COMPRESSION_LEVEL): Promise<Uint8Array> {
+  return compressStream(input, GZIP_ENCODING);
 }
 
 async function compressBrotli(input: Uint8Array, level = DEFAULT_COMPRESSION_LEVEL): Promise<Uint8Array> {
-  if (typeof CompressionStream === 'undefined') {
-    return input;
-  }
-
-  try {
-    const stream = new CompressionStream(BROTLI_ENCODING as CompressionFormat);
-    const writer = stream.writable.getWriter();
-    const reader = stream.readable.getReader();
-
-    writer.write(input as BufferSource);
-    writer.close();
-
-    const chunks: Uint8Array[] = [];
-    let done = false;
-
-    while (!done) {
-      const { value, done: readerDone } = await reader.read();
-      done = readerDone;
-      if (value) {
-        chunks.push(value);
-      }
-    }
-
-    const compressed = new Uint8Array(chunks.reduce((acc, chunk) => acc + chunk.length, 0));
-    let offset = 0;
-    for (const chunk of chunks) {
-      compressed.set(chunk, offset);
-      offset += chunk.length;
-    }
-
-    return compressed;
-  } catch (error) {
-    logger.error('Brotli compression failed', { error });
-    throw new CompressionError('Brotli compression failed', error);
-  }
+  return compressStream(input, BROTLI_ENCODING as CompressionFormat);
 }
 
-function chooseAdaptiveEncoding(
-  size: number,
-  acceptsBrotli: boolean,
-  acceptsGzip: boolean,
-): 'gzip' | 'brotli' | 'identity' {
-  if (size < CONFIG.COMPRESSION_THRESHOLD) {
-    return IDENTITY_ENCODING;
+function generateCompressionCacheKey(jsonString: string, encoding: string, level: number): string {
+  return `${jsonString}_${encoding}_${level}`;
+}
+
+function cleanupCompressionCache(): void {
+  if (compressionCache.size <= COMPRESSION_CACHE_CLEANUP_THRESHOLD) {
+    return;
   }
 
-  if (acceptsBrotli) {
-    return 'brotli';
+  const now = Date.now();
+  for (const [key, value] of compressionCache.entries()) {
+    if (now - value.timestamp > CONFIG.COMPRESSION_CACHE_TTL) {
+      compressionCache.delete(key);
+    }
   }
-
-  if (acceptsGzip) {
-    return GZIP_ENCODING;
-  }
-
-  return IDENTITY_ENCODING;
 }
 
 async function compressResponse(
@@ -643,8 +663,11 @@ async function compressResponse(
       };
     }
 
+    const encoding = options.encoding ?? DEFAULT_ENCODING;
+    const compressionLevel = getCompressionLevel(encoding, options.level);
+
     if (CONFIG.COMPRESSION_CACHE_ENABLED && options.cache !== false) {
-      const cacheKey = `${jsonString}_${options.encoding ?? DEFAULT_ENCODING}_${options.level ?? CONFIG.COMPRESSION_LEVEL}`;
+      const cacheKey = generateCompressionCacheKey(jsonString, encoding, compressionLevel);
       const cached = compressionCache.get(cacheKey);
       if (cached && (Date.now() - cached.timestamp) < CONFIG.COMPRESSION_CACHE_TTL) {
         logger.debug('Using cached compression result');
@@ -662,9 +685,6 @@ async function compressResponse(
         };
       }
     }
-
-    let encoding = options.encoding ?? DEFAULT_ENCODING;
-    const compressionLevel = getCompressionLevel(encoding, options.level);
 
     let finalEncoding = encoding;
     if (options.adaptive || encoding === DEFAULT_ENCODING) {
@@ -690,21 +710,13 @@ async function compressResponse(
       }
 
       if (CONFIG.COMPRESSION_CACHE_ENABLED && options.cache !== false) {
-        const cacheKey = `${jsonString}_${options.encoding ?? DEFAULT_ENCODING}_${options.level ?? CONFIG.COMPRESSION_LEVEL}`;
+        const cacheKey = generateCompressionCacheKey(jsonString, encoding, compressionLevel);
         compressionCache.set(cacheKey, {
           data: compressed,
           encoding: finalEncodingResult,
           timestamp: Date.now(),
         });
-
-        if (compressionCache.size > COMPRESSION_CACHE_CLEANUP_THRESHOLD) {
-          const now = Date.now();
-          for (const [key, value] of compressionCache.entries()) {
-            if (now - value.timestamp > CONFIG.COMPRESSION_CACHE_TTL) {
-              compressionCache.delete(key);
-            }
-          }
-        }
+        cleanupCompressionCache();
       }
 
       const metrics: CompressionMetrics = {
@@ -803,11 +815,6 @@ export function acceptsCompression(request: Request): 'gzip' | 'brotli' | 'none'
   return ENCODING_NONE;
 }
 
-function clearCompressionCache(): void {
-  compressionCache.clear();
-  logger.info('Compression cache cleared');
-}
-
 const rateLimitStore = new Map<string, RateLimitEntry>();
 
 export function checkRateLimit(
@@ -847,18 +854,9 @@ export function checkRateLimit(
   };
 }
 
-function clearRateLimit(key: string): void {
-  rateLimitStore.delete(key);
-}
-
-type RequestInterceptor = (request: Request) => Request | Promise<Request>;
-type ResponseInterceptor = (response: Response) => Response | Promise<Response>;
-type ErrorInterceptor = (error: Error, request: Request) => Response | Promise<Response>;
-
 const requestInterceptors: RequestInterceptor[] = [];
 const responseInterceptors: ResponseInterceptor[] = [];
 const errorInterceptors: ErrorInterceptor[] = [];
-
 
 export async function executeRequestInterceptors(request: Request): Promise<Request> {
   let processedRequest = request;
@@ -886,55 +884,33 @@ export async function executeErrorInterceptors(error: Error, request: Request): 
   return null;
 }
 
-// JWT Validation
-interface JWTPayload {
-  readonly sub: string;
-  readonly email?: string;
-  readonly role?: string;
-  readonly aud?: string;
-  readonly exp?: number;
-  readonly iat?: number;
-  readonly [key: string]: unknown;
+function decodeBase64Url(base64Url: string): string {
+  const base64 = base64Url
+    .replace(BASE64_URL_REPLACE_DASH, BASE64_URL_PLUS)
+    .replace(BASE64_URL_REPLACE_UNDERSCORE, BASE64_URL_SLASH);
+  const padding = BASE64_PADDING_CHAR.repeat((BASE64_MODULO - (base64.length % BASE64_MODULO)) % BASE64_MODULO);
+  return atob(base64 + padding);
 }
 
-interface JWTValidationResult {
-  readonly valid: boolean;
-  readonly userId?: string;
-  readonly payload?: JWTPayload;
-  readonly error?: string;
-}
-
-/**
- * Validates a Supabase JWT token
- * Validates JWT structure and expiration
- * Note: Full signature verification is handled by Supabase client when used
- */
 export async function validateJWT(
   token: string,
   supabaseUrl: string,
   anonKey: string,
 ): Promise<JWTValidationResult> {
   try {
-    // Basic JWT structure check (header.payload.signature)
     const parts = token.split('.');
-    if (parts.length !== 3) {
+    if (parts.length !== JWT_PARTS_COUNT) {
       return { valid: false, error: 'Invalid JWT format' };
     }
 
-    // Decode payload (base64url)
     let payload: JWTPayload;
     try {
-      const payloadBase64 = parts[1]!
-        .replace(/-/g, '+')
-        .replace(/_/g, '/');
-      const padding = '='.repeat((4 - (payloadBase64.length % 4)) % 4);
-      const payloadJson = atob(payloadBase64 + padding);
+      const payloadJson = decodeBase64Url(parts[1]!);
       payload = JSON.parse(payloadJson) as JWTPayload;
     } catch {
       return { valid: false, error: 'Invalid JWT payload' };
     }
 
-    // Check expiration
     if (payload.exp) {
       const now = Math.floor(Date.now() / 1000);
       if (payload.exp < now) {
@@ -942,16 +918,12 @@ export async function validateJWT(
       }
     }
 
-    // Extract user ID (anon keys might not have a sub field)
     const userId = payload.sub;
-    // Anon keys are valid even without a subject - they're service keys
-    if (!userId && payload.role !== 'anon') {
+    if (!userId && payload.role !== JWT_ROLE_ANON) {
       return { valid: false, error: 'JWT missing subject' };
     }
 
-    // Additional validation: check audience matches Supabase
-    if (payload.aud && payload.aud !== 'authenticated' && payload.aud !== 'anon') {
-      // Allow but log
+    if (payload.aud && payload.aud !== JWT_AUD_AUTHENTICATED && payload.aud !== JWT_AUD_ANON) {
       logger.debug('JWT has unexpected audience', { aud: payload.aud });
     }
 
@@ -971,9 +943,6 @@ export async function validateJWT(
   }
 }
 
-/**
- * Validates JWT from Authorization header
- */
 export async function validateAuthHeader(
   authHeader: string | null,
   supabaseUrl: string,
@@ -995,26 +964,6 @@ export async function validateAuthHeader(
   return await validateJWT(token, supabaseUrl, anonKey);
 }
 
-// Input Validation Utilities
-interface ValidationRule {
-  readonly field: string;
-  readonly required?: boolean;
-  readonly type?: 'string' | 'number' | 'boolean' | 'array' | 'object';
-  readonly minLength?: number;
-  readonly maxLength?: number;
-  readonly pattern?: RegExp;
-  readonly enum?: readonly string[];
-  readonly validate?: (value: unknown) => boolean | string;
-}
-
-interface ValidationResult {
-  readonly valid: boolean;
-  readonly errors?: ReadonlyArray<{ readonly field: string; readonly error: string }>;
-}
-
-/**
- * Validates input data against rules
- */
 export function validateInput(
   data: Readonly<Record<string, unknown>>,
   rules: ReadonlyArray<ValidationRule>,
@@ -1024,18 +973,15 @@ export function validateInput(
   for (const rule of rules) {
     const value = data[rule.field];
 
-    // Check required
     if (rule.required && (value === undefined || value === null || value === '')) {
       errors.push({ field: rule.field, error: `${rule.field} is required` });
       continue;
     }
 
-    // Skip validation if field is optional and not provided
     if (!rule.required && (value === undefined || value === null)) {
       continue;
     }
 
-    // Check type
     if (rule.type) {
       const typeMatch = checkType(value, rule.type);
       if (!typeMatch) {
@@ -1047,7 +993,6 @@ export function validateInput(
       }
     }
 
-    // Check string length
     if (rule.type === 'string' && typeof value === 'string') {
       if (rule.minLength !== undefined && value.length < rule.minLength) {
         errors.push({
@@ -1069,7 +1014,6 @@ export function validateInput(
       }
     }
 
-    // Check enum
     if (rule.enum && !rule.enum.includes(value as string)) {
       errors.push({
         field: rule.field,
@@ -1077,7 +1021,6 @@ export function validateInput(
       });
     }
 
-    // Custom validation
     if (rule.validate) {
       const customResult = rule.validate(value);
       if (customResult !== true) {
@@ -1100,7 +1043,7 @@ function checkType(value: unknown, type: string): boolean {
     case 'string':
       return typeof value === 'string';
     case 'number':
-      return typeof value === 'number' && !isNaN(value);
+      return typeof value === 'number' && !Number.isNaN(value);
     case 'boolean':
       return typeof value === 'boolean';
     case 'array':
@@ -1112,47 +1055,25 @@ function checkType(value: unknown, type: string): boolean {
   }
 }
 
-// Content Sanitization Utilities
-/**
- * Basic HTML sanitization - removes potentially dangerous tags and attributes
- * Note: For production, consider using a library like DOMPurify
- */
 export function sanitizeHTML(content: string): string {
-  // Remove script tags and their content
-  let sanitized = content.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '');
-  
-  // Remove event handlers (onclick, onerror, etc.)
-  sanitized = sanitized.replace(/\son\w+\s*=\s*["'][^"']*["']/gi, '');
-  
-  // Remove javascript: protocol
-  sanitized = sanitized.replace(/javascript:/gi, '');
-  
-  // Remove data: URLs in certain contexts (can be used for XSS)
-  sanitized = sanitized.replace(/data:\s*text\/html/gi, '');
-  
+  let sanitized = content.replace(SCRIPT_TAG_REGEX, '');
+  sanitized = sanitized.replace(EVENT_HANDLER_REGEX, '');
+  sanitized = sanitized.replace(JAVASCRIPT_PROTOCOL_REGEX, '');
+  sanitized = sanitized.replace(DATA_HTML_REGEX, '');
   return sanitized.trim();
 }
 
-/**
- * Sanitizes text content - removes control characters and trims
- */
 export function sanitizeText(content: string): string {
-  // Remove control characters except newline, tab, and carriage return
   return content
-    .replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]/g, '')
+    .replace(CONTROL_CHARS_REGEX, '')
     .trim();
 }
 
-// CORS Utilities
-/**
- * Creates CORS headers based on allowed origins
- * If origins includes '*', uses wildcard, otherwise checks origin against allowed list
- */
 export function createCORSHeaders(
   request: Request,
   allowedOrigins: ReadonlyArray<string> | string = '*',
 ): Readonly<Record<string, string>> {
-  const originHeader = request.headers.get('Origin');
+  const originHeader = request.headers.get(CORS_HEADER_ORIGIN);
   let allowedOrigin = '*';
 
   if (typeof allowedOrigins === 'string') {
@@ -1168,14 +1089,13 @@ export function createCORSHeaders(
   }
 
   return {
-    'Access-Control-Allow-Origin': allowedOrigin,
-    'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-correlation-id, x-request-id',
-    'Access-Control-Allow-Methods': 'GET, POST, PATCH, DELETE, OPTIONS',
-    'Access-Control-Max-Age': '86400',
-    'Access-Control-Allow-Credentials': allowedOrigin !== '*' ? 'true' : 'false',
+    [CORS_HEADER_ALLOW_ORIGIN]: allowedOrigin,
+    [CORS_HEADER_ALLOW_HEADERS]: CORS_ALLOWED_HEADERS,
+    [CORS_HEADER_ALLOW_METHODS]: CORS_ALLOWED_METHODS,
+    [CORS_HEADER_MAX_AGE]: CORS_MAX_AGE,
+    [CORS_HEADER_ALLOW_CREDENTIALS]: allowedOrigin !== '*' ? CORS_CREDENTIALS_TRUE : CORS_CREDENTIALS_FALSE,
   };
 }
-
 
 export function getMemoryStats() {
   try {
@@ -1197,4 +1117,3 @@ export function getMemoryStats() {
     };
   }
 }
-

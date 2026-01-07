@@ -6,6 +6,7 @@
   margin: 0;
   padding: 0;
   box-sizing: border-box;
+  will-change: auto;
 }
 
 body {
@@ -21,28 +22,17 @@ body {
   min-height: 100vh;
 }
 
-/* Performance optimizations */
-* {
-  will-change: auto;
-}
-
 img {
   content-visibility: auto;
 }
 
-/* Accessibility improvements */
-:focus-visible {
-  outline: 2px solid #3b82f6;
-  outline-offset: 2px;
-}
-
+:focus-visible,
 button:focus-visible,
 a:focus-visible {
   outline: 2px solid #3b82f6;
   outline-offset: 2px;
 }
 
-/* Skip to main content link for screen readers */
 .skip-to-main {
   position: absolute;
   left: -9999px;
@@ -59,7 +49,6 @@ a:focus-visible {
   border-radius: 0.25rem;
 }
 
-/* Dashboard improvements */
 .dashboard-stat-card {
   transition: all 0.2s ease;
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
@@ -85,7 +74,17 @@ a:focus-visible {
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
 }
 
-/* Mobile optimizations */
+.loading-skeleton {
+  background: linear-gradient(90deg, #f0f0f0 25%, #e0e0e0 50%, #f0f0f0 75%);
+  background-size: 200% 100%;
+  animation: loading 1.5s ease-in-out infinite;
+}
+
+.gpu-accelerated {
+  transform: translateZ(0);
+  will-change: transform;
+}
+
 @media (max-width: 768px) {
   .dashboard-main-grid {
     grid-template-columns: 1fr !important;
@@ -95,7 +94,6 @@ a:focus-visible {
     margin-bottom: 1rem;
   }
 
-  /* Improve touch targets */
   button,
   a,
   input[type="button"],
@@ -104,7 +102,6 @@ a:focus-visible {
     min-width: 44px;
   }
 
-  /* Optimize font sizes for mobile */
   body {
     font-size: 16px;
   }
@@ -121,21 +118,18 @@ a:focus-visible {
     font-size: 1.25rem;
   }
 
-  /* Improve spacing on mobile */
   .container {
     padding-left: 1rem;
     padding-right: 1rem;
   }
 }
 
-/* Tablet optimizations */
 @media (min-width: 769px) and (max-width: 1024px) {
   .dashboard-main-grid {
     grid-template-columns: repeat(2, 1fr) !important;
   }
 }
 
-/* Reduce motion for users who prefer it */
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
@@ -146,7 +140,6 @@ a:focus-visible {
   }
 }
 
-/* High contrast mode support */
 @media (prefers-contrast: high) {
   button,
   a {
@@ -154,16 +147,10 @@ a:focus-visible {
   }
 }
 
-/* Dark mode support (if needed) */
-@media (prefers-color-scheme: dark) {
-  /* Add dark mode styles if needed */
-}
-
-/* Loading states */
-.loading-skeleton {
-  background: linear-gradient(90deg, #f0f0f0 25%, #e0e0e0 50%, #f0f0f0 75%);
-  background-size: 200% 100%;
-  animation: loading 1.5s ease-in-out infinite;
+@media print {
+  .no-print {
+    display: none !important;
+  }
 }
 
 @keyframes loading {
@@ -175,7 +162,6 @@ a:focus-visible {
   }
 }
 
-/* Toast animations */
 @keyframes slideInRight {
   from {
     transform: translateX(100%);
@@ -198,7 +184,6 @@ a:focus-visible {
   }
 }
 
-/* Onboarding animations */
 @keyframes fadeInUp {
   from {
     opacity: 0;
@@ -247,17 +232,3 @@ a:focus-visible {
     background-position: 200% 0;
   }
 }
-
-/* Performance: Optimize repaints */
-.gpu-accelerated {
-  transform: translateZ(0);
-  will-change: transform;
-}
-
-/* Print styles */
-@media print {
-  .no-print {
-    display: none !important;
-  }
-}
-

@@ -3,32 +3,19 @@
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
-    <!-- Viewport meta tag for proper scaling in Shopify Mobile app -->
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <!-- Shopify App Bridge Configuration -->
     <meta name="shopify-api-key" content="%VITE_SHOPIFY_API_KEY%" />
     <title>Authoria - AI Blog Writer</title>
-    
-    <!-- App Bridge must be first script without defer/async/module -->
     <script src="https://cdn.shopify.com/shopifycloud/app-bridge.js"></script>
-    
-    <!-- Web Vitals monitoring - inline script must be before stylesheets -->
     <script>
-      // Web Vitals monitoring callback
-      // This must be defined before App Bridge loads to capture metrics
       (function() {
-        // Wait for App Bridge to be available
+        const RETRY_DELAY_MS = 100;
+        const MAX_RETRIES = 50;
+        let retryCount = 0;
+
         function setupWebVitals() {
           if (typeof shopify !== 'undefined' && shopify.webVitals) {
             shopify.webVitals.onReport(function(metrics) {
-              // Send metrics to your analytics endpoint
-              // metrics.appId - App identifier
-              // metrics.shopId - Shop identifier
-              // metrics.userId - User identifier
-              // metrics.appLoadId - Unique load session ID
-              // metrics.metrics - Array of Web Vitals metrics (LCP, FCP, CLS, INP, etc.)
-              
-              // Example: Send to your backend for analysis
               if (navigator.sendBeacon) {
                 try {
                   const data = JSON.stringify({
@@ -39,28 +26,18 @@
                     metrics: metrics.metrics,
                     timestamp: new Date().toISOString()
                   });
-                  
-                  // Uncomment and configure your analytics endpoint
-                  // navigator.sendBeacon('/api/analytics/web-vitals', data);
-                  
-                  // Log to console in development
-                  if (typeof process !== 'undefined' && process?.env?.NODE_ENV === 'development') {
-                    console.log('[Web Vitals]', metrics);
-                  }
-                } catch (error) {
-                  console.error('[Web Vitals] Failed to report metrics:', error);
+                } catch {
                 }
               }
             });
-          } else {
-            // Retry if App Bridge not loaded yet
-            setTimeout(setupWebVitals, 100);
+          } else if (retryCount < MAX_RETRIES) {
+            retryCount++;
+            setTimeout(setupWebVitals, RETRY_DELAY_MS);
           }
         }
-        
-        // Setup after DOM is ready
+
         if (document.readyState === 'loading') {
-          document.addEventListener('DOMContentLoaded', setupWebVitals);
+          document.addEventListener('DOMContentLoaded', setupWebVitals, { once: true });
         } else {
           setupWebVitals();
         }
@@ -68,9 +45,6 @@
     </script>
   </head>
   <body>
-    <!-- App Navigation - MUST be first element in body, before any scripts -->
-    <!-- App Bridge reads this synchronously during initialization -->
-    <!-- CRITICAL: Must be present when App Bridge script executes -->
     <s-app-nav>
       <s-link href="/" rel="home">Home</s-link>
       <s-link href="/dashboard">Dashboard</s-link>
@@ -81,8 +55,6 @@
     </s-app-nav>
     <div id="root"></div>
     <div id="toast-container"></div>
-    <!-- Main app script loaded as module (non-blocking) -->
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
-

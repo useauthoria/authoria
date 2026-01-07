@@ -1,6 +1,8 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
-import { ShopifyAPI } from '../integrations/ShopifyClient';
 import OpenAI from 'openai';
+import { ShopifyAPI } from '../integrations/ShopifyClient.ts';
+import { retry } from '../utils/error-handling.ts';
+import { RateLimiter } from '../utils/rate-limiter.ts';
 
 export interface ProductMention {
   readonly productId: string;
@@ -117,12 +119,129 @@ interface InjectionResult {
   readonly mentions: readonly ProductMention[];
 }
 
+interface EmbeddingCacheEntry {
+  readonly embedding: readonly number[];
+  readonly expiresAt: number;
+}
+
+type LogLevel = 'info' | 'warn' | 'error';
+
+const structuredLog = (
+  level: LogLevel,
+  service: string,
+  message: string,
+  context?: Readonly<Record<string, unknown>>,
+): void => {
+  const payload = JSON.stringify({
+    level,
+    service,
+    message,
+    timestamp: new Date().toISOString(),
+    ...context,
+  });
+
+  if (typeof globalThis === 'undefined' || !('Deno' in globalThis)) {
+    return;
+  }
+
+  const encoder = new TextEncoder();
+  const deno = globalThis as unknown as { Deno: { stderr: { writeSync: (data: Uint8Array) => void }; stdout: { writeSync: (data: Uint8Array) => void } } };
+  
+  if (level === 'error') {
+    deno.Deno.stderr.writeSync(encoder.encode(payload + '\n'));
+    return;
+  }
+
+  deno.Deno.stdout.writeSync(encoder.encode(payload + '\n'));
+};
+
+const truncateText = (text: string, maxLength: number): string => {
+  if (text.length <= maxLength) return text;
+  return text.substring(0, maxLength);
+};
+
+const parseJSONResponse = <T>(jsonString: string, fallback: T): T => {
+  try {
+    const parsed = JSON.parse(jsonString) as unknown;
+    return parsed as T;
+  } catch {
+    return fallback;
+  }
+};
+
+const validateContent = (content: string): void => {
+  if (!content || typeof content !== 'string') {
+    throw new Error('Invalid content: must be a non-empty string');
+  }
+  if (content.length > 1000000) {
+    throw new Error('Invalid content: exceeds maximum length of 1MB');
+  }
+};
+
+const validateTitle = (title: string): void => {
+  if (!title || typeof title !== 'string' || title.trim().length === 0) {
+    throw new Error('Invalid title: must be a non-empty string');
+  }
+  if (title.length > 500) {
+    throw new Error('Invalid title: exceeds maximum length of 500 characters');
+  }
+};
+
+const validateKeywords = (keywords: readonly string[]): void => {
+  if (!Array.isArray(keywords)) {
+    throw new Error('Invalid keywords: must be an array');
+  }
+  if (keywords.length > 100) {
+    throw new Error('Invalid keywords: exceeds maximum count of 100');
+  }
+  for (const keyword of keywords) {
+    if (typeof keyword !== 'string' || keyword.length > 100) {
+      throw new Error('Invalid keyword: must be a string with max length 100');
+    }
+  }
+};
+
+const validateMaxMentions = (maxMentions: number): void => {
+  if (!Number.isInteger(maxMentions) || maxMentions < 0 || maxMentions > 20) {
+    throw new Error('Invalid maxMentions: must be an integer between 0 and 20');
+  }
+};
+
+const validateStoreId = (storeId?: string): void => {
+  if (storeId !== undefined && (!storeId || typeof storeId !== 'string' || storeId.trim().length === 0)) {
+    throw new Error('Invalid storeId: must be a non-empty string');
+  }
+};
+
+const hasVariantStock = (variant: ProductVariantData): boolean => {
+  return (variant.inventory_quantity !== undefined && variant.inventory_quantity > 0) || variant.available === true;
+};
+
+const hasProductStock = (product: Product): boolean => {
+  if (!product.variants || !Array.isArray(product.variants)) {
+    return true;
+  }
+  return product.variants.some(hasVariantStock);
+};
+
+const hasDatabaseProductStock = (product: DatabaseProductRow): boolean => {
+  if (!product.variants || !Array.isArray(product.variants)) {
+    return true;
+  }
+  return product.variants.some(hasVariantStock);
+};
+
 export class ProductContextEngine {
   private readonly shopifyAPI: ShopifyAPI;
   private readonly supabase?: SupabaseClient;
   private readonly openai?: OpenAI;
   private readonly products: Map<string, Product>;
-  private readonly embeddingCache: Map<string, readonly number[]>;
+  private readonly embeddingCache: Map<string, EmbeddingCacheEntry>;
+  private readonly limiter: RateLimiter;
+  private readonly inflightRequests: Map<string, Promise<unknown>>;
+  private cacheCleanupInterval?: number;
+
+  private static readonly SERVICE_NAME = 'ProductContextEngine';
   private static readonly EMBEDDING_MODEL = 'text-embedding-3-small';
   private static readonly EMBEDDING_DIMENSION = 1536;
   private static readonly CONTENT_LENGTH_LIMIT = 8000;
@@ -143,13 +262,22 @@ export class ProductContextEngine {
   private static readonly MIN_SEMANTIC_SIMILARITY = 0.3;
   private static readonly CACHE_KEY_PREFIX = 'embedding:';
   private static readonly CACHE_KEY_LENGTH = 100;
+  private static readonly EMBEDDING_CACHE_TTL_MS = 30 * 60 * 1000;
+  private static readonly CACHE_CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
+  private static readonly OPENAI_MAX_WAIT_MS = 60000;
+  private static readonly DEFAULT_RETRY_OPTIONS = {
+    maxAttempts: 3,
+    initialDelay: 1000,
+    backoffMultiplier: 2,
+    retryableErrors: ['rate limit', 'timeout', 'server_error'] as const,
+  } as const;
 
   private static readonly MENTION_TEMPLATES: readonly string[] = [
     'Check out our {title}',
     'Learn more about {title}',
     'Discover {title}',
     'Explore {title}',
-  ];
+  ] as const;
 
   private static readonly RELEVANCE_PROMPT_PREFIX = `You are an expert SEO specialist specializing in product-content relevance analysis and semantic matching.
 
@@ -198,12 +326,32 @@ Product: `;
     supabase?: SupabaseClient,
     openaiKey?: string,
   ) {
+    if (!shopifyAPI) {
+      throw new Error('ShopifyAPI is required');
+    }
     this.shopifyAPI = shopifyAPI;
     this.supabase = supabase;
     this.products = new Map();
     this.embeddingCache = new Map();
+    this.inflightRequests = new Map();
+    
     if (openaiKey) {
+      if (typeof openaiKey !== 'string' || openaiKey.trim().length === 0) {
+        throw new Error('Invalid OpenAI API key');
+      }
       this.openai = new OpenAI({ apiKey: openaiKey });
+      this.limiter = new RateLimiter({
+        maxRequests: 50,
+        windowMs: 60000,
+        burst: 50,
+        algorithm: 'token-bucket',
+      });
+      this.startCacheCleanup();
+    } else {
+      this.limiter = new RateLimiter({
+        maxRequests: Infinity,
+        windowMs: 1000,
+      });
     }
   }
 
@@ -214,32 +362,92 @@ Product: `;
     maxMentions: number = 3,
     storeId?: string,
   ): Promise<InjectionResult> {
-    const availableProducts = await this.getAvailableProducts(storeId);
-    if (availableProducts.length === 0) {
-      return { content, mentions: [] };
+    const startTime = Date.now();
+    validateContent(content);
+    validateTitle(title);
+    validateKeywords(keywords);
+    validateMaxMentions(maxMentions);
+    validateStoreId(storeId);
+
+    try {
+      const availableProducts = await this.getAvailableProducts(storeId);
+      if (availableProducts.length === 0) {
+        structuredLog('info', ProductContextEngine.SERVICE_NAME, 'No available products', {
+          storeId,
+        });
+        return { content, mentions: [] };
+      }
+
+      const scoredProducts = await this.scoreProductRelevance(
+        content,
+        title,
+        keywords,
+        availableProducts,
+      );
+
+      const selectedProducts = this.selectTopProducts(scoredProducts, maxMentions);
+      if (selectedProducts.length === 0) {
+        structuredLog('info', ProductContextEngine.SERVICE_NAME, 'No products met relevance threshold', {
+          storeId,
+          threshold: ProductContextEngine.MIN_RELEVANCE_THRESHOLD,
+        });
+        return { content, mentions: [] };
+      }
+
+      const insertionPoints = await this.findSmartInsertionPoints(content, selectedProducts.length);
+      const result = await this.injectMentionsAtPoints(content, selectedProducts, availableProducts, insertionPoints);
+
+      const duration = Date.now() - startTime;
+      structuredLog('info', ProductContextEngine.SERVICE_NAME, 'Product mentions injected', {
+        storeId,
+        mentionsCount: result.mentions.length,
+        durationMs: duration,
+      });
+
+      return result;
+    } catch (error) {
+      const duration = Date.now() - startTime;
+      structuredLog('error', ProductContextEngine.SERVICE_NAME, 'Failed to inject product mentions', {
+        storeId,
+        error: error instanceof Error ? error.message : String(error),
+        durationMs: duration,
+      });
+      throw error;
     }
+  }
 
-    const scoredProducts = await this.scoreProductRelevance(
-      content,
-      title,
-      keywords,
-      availableProducts,
-    );
-
-    const selectedProducts = this.selectTopProducts(scoredProducts, maxMentions);
-    if (selectedProducts.length === 0) {
-      return { content, mentions: [] };
+  destroy(): void {
+    if (this.cacheCleanupInterval !== undefined) {
+      clearInterval(this.cacheCleanupInterval);
+      this.cacheCleanupInterval = undefined;
     }
+    this.embeddingCache.clear();
+    this.inflightRequests.clear();
+  }
 
-    const insertionPoints = await this.findSmartInsertionPoints(content, selectedProducts.length);
-    return this.injectMentionsAtPoints(content, selectedProducts, availableProducts, insertionPoints);
+  private startCacheCleanup(): void {
+    this.cacheCleanupInterval = setInterval(() => {
+      const now = Date.now();
+      for (const [key, entry] of this.embeddingCache.entries()) {
+        if (entry.expiresAt < now) {
+          this.embeddingCache.delete(key);
+        }
+      }
+    }, ProductContextEngine.CACHE_CLEANUP_INTERVAL_MS) as unknown as number;
   }
 
   private async getAvailableProducts(storeId?: string): Promise<ReadonlyArray<Product>> {
     if (storeId && this.supabase) {
-      const cachedProducts = await this.getCachedProducts(storeId);
-      if (cachedProducts && cachedProducts.length > 0) {
-        return this.mapCachedProducts(cachedProducts);
+      try {
+        const cachedProducts = await this.getCachedProducts(storeId);
+        if (cachedProducts && cachedProducts.length > 0) {
+          return this.mapCachedProducts(cachedProducts);
+        }
+      } catch (error) {
+        structuredLog('warn', ProductContextEngine.SERVICE_NAME, 'Failed to get cached products', {
+          storeId,
+          error: error instanceof Error ? error.message : String(error),
+        });
       }
     }
 
@@ -247,18 +455,44 @@ Product: `;
   }
 
   private async getCachedProducts(storeId: string): Promise<ReadonlyArray<DatabaseProductRow> | null> {
-    const { data } = await this.supabase!
-      .from('products_cache')
-      .select('*')
-      .eq('store_id', storeId)
-      .eq('is_published', true);
+    try {
+      const { data, error } = await retry(
+        async () => {
+          return await this.supabase!
+            .from('products_cache')
+            .select('*')
+            .eq('store_id', storeId)
+            .eq('is_published', true);
+        },
+        {
+          ...ProductContextEngine.DEFAULT_RETRY_OPTIONS,
+          onRetry: (attempt, err) => {
+            structuredLog('warn', ProductContextEngine.SERVICE_NAME, 'Retrying cached products fetch', {
+              attempt,
+              storeId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          },
+        },
+      );
 
-    return data as ReadonlyArray<DatabaseProductRow> | null;
+      if (error || !data) {
+        return null;
+      }
+
+      return data as ReadonlyArray<DatabaseProductRow>;
+    } catch (error) {
+      structuredLog('warn', ProductContextEngine.SERVICE_NAME, 'Failed to get cached products', {
+        storeId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
   }
 
   private mapCachedProducts(cachedProducts: ReadonlyArray<DatabaseProductRow>): ReadonlyArray<Product> {
     return cachedProducts
-      .filter((p) => this.isProductAvailable(p))
+      .filter(hasDatabaseProductStock)
       .map((p) => ({
         id: p.shopify_product_id,
         title: p.title,
@@ -273,26 +507,8 @@ Product: `;
       }));
   }
 
-  private isProductAvailable(product: DatabaseProductRow): boolean {
-    if (!product.variants || !Array.isArray(product.variants)) {
-      return true;
-    }
-
-    return product.variants.some(
-      (v) => (v.inventory_quantity && v.inventory_quantity > 0) || v.available === true,
-    );
-  }
-
   private filterAvailableProducts(products: ReadonlyArray<Product>): ReadonlyArray<Product> {
-    return products.filter((product) => {
-      if (!product.variants || !Array.isArray(product.variants)) {
-        return true;
-      }
-
-      return product.variants.some(
-        (v) => (v.inventory_quantity && v.inventory_quantity > 0) || v.available !== false,
-      );
-    });
+    return products.filter(hasProductStock);
   }
 
   private async scoreProductRelevance(
@@ -305,7 +521,7 @@ Product: `;
       return this.getDefaultScores(products);
     }
 
-    const contentText = `${title}\n\n${content.substring(0, ProductContextEngine.CONTENT_LENGTH_LIMIT)}`;
+    const contentText = `${title}\n\n${truncateText(content, ProductContextEngine.CONTENT_LENGTH_LIMIT)}`;
     const contentEmbedding = await this.createEmbedding(contentText);
 
     const scores = await Promise.all(
@@ -370,13 +586,8 @@ Product: `;
     const semanticScore = semanticSimilarity * ProductContextEngine.SEMANTIC_SCORE_WEIGHT;
     
     let availabilityBonus = 0;
-    if (product.variants && Array.isArray(product.variants)) {
-      const hasStock = product.variants.some(
-        (v) => (v.inventory_quantity && v.inventory_quantity > 0) || v.available === true,
-      );
-      if (hasStock) {
-        availabilityBonus = 0.1;
-      }
+    if (hasProductStock(product)) {
+      availabilityBonus = 0.1;
     }
 
     const titleMatchBonus = this.calculateTitleMatchBonus(product.title, matchingKeywords);
@@ -419,9 +630,13 @@ Product: `;
 
     try {
       const response = await this.callOpenAI(prompt, 'product-relevance-reasons', true);
-      const result = JSON.parse(response.output_text || '{}') as OpenAIRelevanceResponse;
+      const result = parseJSONResponse<OpenAIRelevanceResponse>(response.output_text || '{}', { reasons: [] });
       return result.reasons || [];
-    } catch {
+    } catch (error) {
+      structuredLog('warn', ProductContextEngine.SERVICE_NAME, 'Failed to generate relevance reasons', {
+        productId: product.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
       return [];
     }
   }
@@ -438,7 +653,7 @@ Product: `;
 
     try {
       const response = await this.callOpenAI(prompt, 'product-insertion-points', true);
-      const result = JSON.parse(response.output_text || '{}') as OpenAIInsertionResponse;
+      const result = parseJSONResponse<OpenAIInsertionResponse>(response.output_text || '{}', { insertionPoints: [] });
       const points = this.mapInsertionPoints(result.insertionPoints || [], content);
 
       if (points.length < count) {
@@ -447,7 +662,10 @@ Product: `;
       }
 
       return points.slice(0, count).sort((a, b) => a.position - b.position);
-    } catch {
+    } catch (error) {
+      structuredLog('warn', ProductContextEngine.SERVICE_NAME, 'Failed to find smart insertion points', {
+        error: error instanceof Error ? error.message : String(error),
+      });
       return this.findBasicInsertionPoints(content, count);
     }
   }
@@ -606,7 +824,11 @@ Product: `;
     try {
       const response = await this.callOpenAI(prompt, 'product-mention-generation');
       return response.output_text?.trim() || this.getDefaultMention(product.title);
-    } catch {
+    } catch (error) {
+      structuredLog('warn', ProductContextEngine.SERVICE_NAME, 'Failed to generate contextual mention', {
+        productId: product.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
       return this.getDefaultMention(product.title);
     }
   }
@@ -620,9 +842,7 @@ Product: `;
       return this.mapVariantToProductVariant(product.variants[0], product.title);
     }
 
-    const inStockVariants = product.variants.filter(
-      (v) => (v.inventory_quantity && v.inventory_quantity > 0) || v.available === true,
-    );
+    const inStockVariants = product.variants.filter(hasVariantStock);
 
     if (inStockVariants.length > 0) {
       return this.mapVariantToProductVariant(inStockVariants[0], product.title, true);
@@ -700,25 +920,66 @@ Product: `;
   private async createEmbedding(text: string): Promise<readonly number[]> {
     const cacheKey = `${ProductContextEngine.CACHE_KEY_PREFIX}${text.substring(0, ProductContextEngine.CACHE_KEY_LENGTH)}`;
     const cached = this.embeddingCache.get(cacheKey);
-    if (cached) {
-      return cached;
+    if (cached && cached.expiresAt > Date.now()) {
+      return cached.embedding;
     }
 
     if (!this.openai) {
       return new Array(ProductContextEngine.EMBEDDING_DIMENSION).fill(0);
     }
 
-    try {
-      const response = await this.openai.embeddings.create({
-        model: ProductContextEngine.EMBEDDING_MODEL,
-        input: text.substring(0, ProductContextEngine.CONTENT_LENGTH_LIMIT),
-      }) as unknown as EmbeddingResponse;
+    const requestKey = `embedding:${cacheKey}`;
+    const inflight = this.inflightRequests.get(requestKey);
+    if (inflight) {
+      return (await inflight) as readonly number[];
+    }
 
-      const embedding = response.data[0]?.embedding || [];
-      this.embeddingCache.set(cacheKey, embedding);
+    const embeddingPromise = retry(
+      async () => {
+        const allowed = await this.limiter.waitForToken('openai-embeddings', ProductContextEngine.OPENAI_MAX_WAIT_MS);
+        if (!allowed) {
+          throw new Error('OpenAI rate limit wait exceeded');
+        }
+
+        const start = Date.now();
+        const response = await this.openai!.embeddings.create({
+          model: ProductContextEngine.EMBEDDING_MODEL,
+          input: truncateText(text, ProductContextEngine.CONTENT_LENGTH_LIMIT),
+        }) as unknown as EmbeddingResponse;
+
+        structuredLog('info', ProductContextEngine.SERVICE_NAME, 'Embedding created', {
+          latencyMs: Date.now() - start,
+        });
+
+        return response.data[0]?.embedding || [];
+      },
+      {
+        ...ProductContextEngine.DEFAULT_RETRY_OPTIONS,
+        onRetry: (attempt, err) => {
+          structuredLog('warn', ProductContextEngine.SERVICE_NAME, 'Retrying embedding creation', {
+            attempt,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        },
+      },
+    );
+
+    this.inflightRequests.set(requestKey, embeddingPromise);
+
+    try {
+      const embedding = await embeddingPromise;
+      this.embeddingCache.set(cacheKey, {
+        embedding,
+        expiresAt: Date.now() + ProductContextEngine.EMBEDDING_CACHE_TTL_MS,
+      });
       return embedding;
-    } catch {
+    } catch (error) {
+      structuredLog('error', ProductContextEngine.SERVICE_NAME, 'Failed to create embedding', {
+        error: error instanceof Error ? error.message : String(error),
+      });
       return new Array(ProductContextEngine.EMBEDDING_DIMENSION).fill(0);
+    } finally {
+      this.inflightRequests.delete(requestKey);
     }
   }
 
@@ -747,7 +1008,7 @@ Product: `;
       (product.tags || []).join(' '),
     ].filter(Boolean);
 
-    return parts.join(' ').substring(0, ProductContextEngine.PRODUCT_TEXT_LIMIT);
+    return truncateText(parts.join(' '), ProductContextEngine.PRODUCT_TEXT_LIMIT);
   }
 
   private buildRelevancePrompt(
@@ -758,12 +1019,12 @@ Product: `;
     matchingKeywords: readonly string[],
   ): string {
     return `${ProductContextEngine.RELEVANCE_PROMPT_PREFIX}${product.title}
-${product.description ? `Description: ${product.description.substring(0, ProductContextEngine.PRODUCT_DESCRIPTION_LIMIT)}` : ''}
+${product.description ? `Description: ${truncateText(product.description, ProductContextEngine.PRODUCT_DESCRIPTION_LIMIT)}` : ''}
 ${product.product_type ? `Type: ${product.product_type}` : ''}
 
 ## Blog Post Context
 Blog Post Title: ${title}
-Content Excerpt: ${content.substring(0, ProductContextEngine.CONTENT_EXCERPT_LENGTH)}
+Content Excerpt: ${truncateText(content, ProductContextEngine.CONTENT_EXCERPT_LENGTH)}
 
 ## Analysis Data
 Semantic Similarity Score: ${semanticSimilarity.toFixed(2)}
@@ -826,10 +1087,10 @@ Return ONLY valid JSON array:
   ): string {
     return `${ProductContextEngine.MENTION_PROMPT_PREFIX}${product.title}
 ${variant ? `Variant: ${variant.title}` : ''}
-${product.description ? `Description: ${product.description.substring(0, ProductContextEngine.PRODUCT_SUMMARY_DESCRIPTION_LIMIT)}` : ''}
+${product.description ? `Description: ${truncateText(product.description, ProductContextEngine.PRODUCT_SUMMARY_DESCRIPTION_LIMIT)}` : ''}
 
 ## Insertion Context
-Insertion Context: ${insertionContext.substring(0, ProductContextEngine.INSERTION_CONTEXT_LIMIT)}
+Insertion Context: ${truncateText(insertionContext, ProductContextEngine.INSERTION_CONTEXT_LIMIT)}
 Relevance Score: ${relevanceScore.toFixed(2)}
 
 ## Requirements
@@ -853,15 +1114,56 @@ Return ONLY the mention text. No quotes, no markdown, no explanations.`;
       throw new Error('OpenAI client not initialized');
     }
 
-    return await this.openai.responses.create({
-      model: 'gpt-5-mini',
-      reasoning: { effort: 'low' },
-      text: { verbosity: useJsonFormat ? 'medium' : 'low' },
-      input: prompt,
-      response_format: useJsonFormat ? { type: 'json_object' } : undefined,
-      prompt_cache_key: cacheKey,
-      prompt_cache_retention: '24h',
-    }) as OpenAIResponse;
+    const requestKey = `openai:${cacheKey}:${prompt.substring(0, 50)}`;
+    const inflight = this.inflightRequests.get(requestKey);
+    if (inflight) {
+      return (await inflight) as OpenAIResponse;
+    }
+
+    const requestPromise = retry(
+      async () => {
+        const allowed = await this.limiter.waitForToken('openai-responses', ProductContextEngine.OPENAI_MAX_WAIT_MS);
+        if (!allowed) {
+          throw new Error('OpenAI rate limit wait exceeded');
+        }
+
+        const start = Date.now();
+        const response = await this.openai!.responses.create({
+          model: 'gpt-5-mini',
+          reasoning: { effort: 'low' },
+          text: { verbosity: useJsonFormat ? 'medium' : 'low' },
+          input: prompt,
+          response_format: useJsonFormat ? { type: 'json_object' } : undefined,
+          prompt_cache_key: cacheKey,
+          prompt_cache_retention: '24h',
+        }) as OpenAIResponse;
+
+        structuredLog('info', ProductContextEngine.SERVICE_NAME, 'OpenAI call completed', {
+          cacheKey,
+          latencyMs: Date.now() - start,
+        });
+
+        return response;
+      },
+      {
+        ...ProductContextEngine.DEFAULT_RETRY_OPTIONS,
+        onRetry: (attempt, err) => {
+          structuredLog('warn', ProductContextEngine.SERVICE_NAME, 'Retrying OpenAI call', {
+            attempt,
+            cacheKey,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        },
+      },
+    );
+
+    this.inflightRequests.set(requestKey, requestPromise);
+
+    try {
+      return await requestPromise;
+    } finally {
+      this.inflightRequests.delete(requestKey);
+    }
   }
 
   private getDefaultMention(title: string): string {
@@ -875,5 +1177,4 @@ Return ONLY the mention text. No quotes, no markdown, no explanations.`;
       ];
     return template.replace('{title}', title);
   }
-
 }

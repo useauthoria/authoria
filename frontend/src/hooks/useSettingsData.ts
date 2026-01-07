@@ -1,4 +1,4 @@
-import { useMemo, useEffect, useCallback, useState } from 'react';
+import { useMemo, useEffect, useCallback, useState, useRef } from 'react';
 import { useQueryClient, useMutation } from '@tanstack/react-query';
 import { useStore, queryKeys } from '../lib/api-cache';
 import { getShopDomain } from '../lib/app-bridge';
@@ -41,24 +41,137 @@ export interface UseSettingsDataReturn {
 }
 
 interface StoreWithSettings extends Store {
-  readonly brand_safety_enabled?: boolean; // Now stored in stores.brand_safety_enabled column
+  readonly brand_safety_enabled?: boolean;
   readonly notifications?: SettingsData['notifications'];
 }
 
+const DEFAULT_ENABLE_REAL_TIME = false;
+const DEFAULT_REFETCH_INTERVAL = 300000;
+const DEFAULT_AUTO_SAVE = false;
+const DEFAULT_AUTO_SAVE_DELAY = 2000;
+const MIN_REFETCH_INTERVAL = 30000;
+const MIN_AUTO_SAVE_DELAY = 0;
+const MAX_AUTO_SAVE_DELAY = 30000;
+const MAX_SHOP_DOMAIN_LENGTH = 200;
+
+const isStoreWithSettings = (store: Store | null): store is StoreWithSettings => {
+  return store !== null && typeof store === 'object';
+};
+
+const validateRefetchInterval = (interval: number | undefined): number => {
+  if (interval === undefined || interval === null) {
+    return DEFAULT_REFETCH_INTERVAL;
+  }
+  if (typeof interval !== 'number' || !Number.isFinite(interval)) {
+    return DEFAULT_REFETCH_INTERVAL;
+  }
+  if (interval < MIN_REFETCH_INTERVAL) {
+    return MIN_REFETCH_INTERVAL;
+  }
+  return Math.floor(interval);
+};
+
+const validateAutoSaveDelay = (delay: number | undefined): number => {
+  if (delay === undefined || delay === null) {
+    return DEFAULT_AUTO_SAVE_DELAY;
+  }
+  if (typeof delay !== 'number' || !Number.isFinite(delay)) {
+    return DEFAULT_AUTO_SAVE_DELAY;
+  }
+  if (delay < MIN_AUTO_SAVE_DELAY) {
+    return MIN_AUTO_SAVE_DELAY;
+  }
+  if (delay > MAX_AUTO_SAVE_DELAY) {
+    return MAX_AUTO_SAVE_DELAY;
+  }
+  return Math.floor(delay);
+};
+
+const validateShopDomain = (shopDomain: string | null | undefined): string | null => {
+  if (!shopDomain || typeof shopDomain !== 'string') {
+    return null;
+  }
+  const trimmed = shopDomain.trim();
+  if (trimmed.length === 0 || trimmed.length > MAX_SHOP_DOMAIN_LENGTH) {
+    return null;
+  }
+  return trimmed;
+};
+
+const normalizeError = (error: unknown): Error => {
+  if (error instanceof Error) {
+    return error;
+  }
+  if (error !== null && typeof error === 'object' && 'message' in error) {
+    const message = String(error.message);
+    return new Error(message.length > 0 ? message : 'Unknown error');
+  }
+  return new Error(String(error));
+};
+
+const validateSettingsData = (settings: SettingsData | null): SettingsData | null => {
+  if (!settings || typeof settings !== 'object') {
+    return null;
+  }
+  if (typeof settings.brand_safety_enabled !== 'boolean') {
+    return null;
+  }
+  return settings;
+};
+
+const validatePartialSettings = (updates: Partial<SettingsData> | null | undefined): Partial<SettingsData> => {
+  if (!updates || typeof updates !== 'object') {
+    return {};
+  }
+  const validated: Partial<SettingsData> = {};
+  if ('brand_safety_enabled' in updates && typeof updates.brand_safety_enabled === 'boolean') {
+    validated.brand_safety_enabled = updates.brand_safety_enabled;
+  }
+  if ('notifications' in updates && updates.notifications !== null && typeof updates.notifications === 'object') {
+    const notifications = updates.notifications;
+    const email = notifications.email;
+    if (email !== null && typeof email === 'object') {
+      const validatedEmail: SettingsData['notifications']['email'] = {};
+      if (typeof email.enabled === 'boolean') {
+        validatedEmail.enabled = email.enabled;
+      }
+      if (typeof email.article_published === 'boolean') {
+        validatedEmail.article_published = email.article_published;
+      }
+      if (typeof email.article_scheduled === 'boolean') {
+        validatedEmail.article_scheduled = email.article_scheduled;
+      }
+      if (Object.keys(validatedEmail).length > 0) {
+        validated.notifications = { email: validatedEmail };
+      }
+    }
+  }
+  return validated;
+};
+
 function mapStoreToSettings(store: StoreWithSettings | null): SettingsData | null {
-  if (!store) return null;
-  return {
-    brand_safety_enabled: store.brand_safety_enabled ?? true,
-    notifications: store.notifications,
-  };
+  if (!isStoreWithSettings(store)) {
+    return null;
+  }
+  try {
+    return {
+      brand_safety_enabled: typeof store.brand_safety_enabled === 'boolean' ? store.brand_safety_enabled : true,
+      notifications: store.notifications || undefined,
+    };
+  } catch {
+    return null;
+  }
 }
 
-export function useSettingsData(options: UseSettingsDataOptions = {}): UseSettingsDataReturn {
+export function useSettingsData(
+  options: UseSettingsDataOptions = {},
+): UseSettingsDataReturn {
+  const isMountedRef = useRef(true);
   const {
-    enableRealTime = false,
-    refetchInterval = 300000, // 5 minute interval to reduce API load
-    autoSave = false,
-    autoSaveDelay = 2000,
+    enableRealTime = DEFAULT_ENABLE_REAL_TIME,
+    refetchInterval = DEFAULT_REFETCH_INTERVAL,
+    autoSave = DEFAULT_AUTO_SAVE,
+    autoSaveDelay = DEFAULT_AUTO_SAVE_DELAY,
     onError,
   } = options;
 
@@ -67,116 +180,253 @@ export function useSettingsData(options: UseSettingsDataOptions = {}): UseSettin
   const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
   const [localSettings, setLocalSettings] = useState<Partial<SettingsData>>({});
 
+  const validatedRefetchInterval = useMemo(
+    () => validateRefetchInterval(refetchInterval),
+    [refetchInterval],
+  );
+
+  const validatedAutoSaveDelay = useMemo(
+    () => validateAutoSaveDelay(autoSaveDelay),
+    [autoSaveDelay],
+  );
+
   const shopDomain = useMemo(() => {
     const domain = getShopDomain();
-    if (!domain && onError) {
-      onError(new Error('Shop domain not available'));
+    const validated = validateShopDomain(domain);
+    if (!validated && onError && isMountedRef.current) {
+      try {
+        onError(new Error('Shop domain not available'));
+      } catch {
+      }
     }
-    return domain;
+    return validated;
   }, [onError]);
+
+  const validatedShopDomain = useMemo(() => shopDomain ?? '', [shopDomain]);
 
   const {
     data: store,
     isLoading: storeLoading,
     error: storeError,
     refetch: refetchStore,
-  } = useStore(shopDomain ?? '');
+  } = useStore(validatedShopDomain);
 
-  const settings = useMemo(() => mapStoreToSettings(store as StoreWithSettings | null), [store]);
+  const storeWithSettings = useMemo((): StoreWithSettings | null => {
+    if (!isStoreWithSettings(store)) {
+      return null;
+    }
+    return store;
+  }, [store]);
+
+  const settings = useMemo(
+    () => mapStoreToSettings(storeWithSettings),
+    [storeWithSettings],
+  );
 
   const mergedSettings = useMemo((): SettingsData | null => {
-    if (!settings) return null;
-    return { ...settings, ...localSettings };
+    if (!settings) {
+      return null;
+    }
+    try {
+      const merged = { ...settings, ...localSettings };
+      return validateSettingsData(merged);
+    } catch {
+      return settings;
+    }
   }, [settings, localSettings]);
 
   const saveMutation = useMutation({
     mutationFn: async (settingsToSave: SettingsData): Promise<SettingsData> => {
-      if (!store?.id) throw new Error('Store not loaded');
-      await storeApi.updateStore(store.id, settingsToSave);
-      return settingsToSave;
+      if (!store?.id || typeof store.id !== 'string' || store.id.trim().length === 0) {
+        throw new Error('Store not loaded');
+      }
+      const validated = validateSettingsData(settingsToSave);
+      if (!validated) {
+        throw new Error('Invalid settings data');
+      }
+      try {
+        await storeApi.updateStore(store.id, validated);
+        return validated;
+      } catch (error) {
+        throw normalizeError(error);
+      }
     },
     onSuccess: () => {
-      setHasUnsavedChanges(false);
-      setLocalSettings({});
-      queryClient.invalidateQueries({ queryKey: queryKeys.store(shopDomain ?? '') });
+      if (isMountedRef.current) {
+        setHasUnsavedChanges(false);
+        setLocalSettings({});
+      }
+      try {
+        queryClient.invalidateQueries({ queryKey: queryKeys.store(validatedShopDomain) });
+      } catch {
+      }
     },
-    onError: (error: Error) => {
-      if (onError) {
-        onError(error);
+    onError: (error: unknown) => {
+      if (onError && isMountedRef.current) {
+        try {
+          onError(normalizeError(error));
+        } catch {
+        }
       }
     },
   });
 
   useEffect(() => {
-    if (!autoSave || !hasUnsavedChanges || !mergedSettings || saveMutation.isPending) {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!autoSave || !hasUnsavedChanges || !mergedSettings || saveMutation.isPending || !isMountedRef.current) {
       return;
     }
 
-    const timer = setTimeout(() => {
-      if (mergedSettings) {
-        saveMutation.mutate(mergedSettings);
+    const timerId = setTimeout(() => {
+      if (mergedSettings && isMountedRef.current) {
+        try {
+          saveMutation.mutate(mergedSettings);
+        } catch {
+        }
       }
-    }, autoSaveDelay);
+    }, validatedAutoSaveDelay);
 
-    return () => clearTimeout(timer);
-  }, [autoSave, hasUnsavedChanges, mergedSettings, autoSaveDelay, saveMutation]);
+    return () => {
+      clearTimeout(timerId);
+    };
+  }, [autoSave, hasUnsavedChanges, mergedSettings, validatedAutoSaveDelay, saveMutation]);
 
-  const updateSettings = useCallback((updates: Partial<SettingsData>) => {
-    setLocalSettings((prev) => ({ ...prev, ...updates }));
-    setHasUnsavedChanges(true);
-  }, []);
+  const updateSettings = useCallback(
+    (updates: Partial<SettingsData>) => {
+      if (!isMountedRef.current) {
+        return;
+      }
+      try {
+        const validated = validatePartialSettings(updates);
+        if (Object.keys(validated).length === 0) {
+          return;
+        }
+        setLocalSettings((prev) => {
+          try {
+            return { ...prev, ...validated };
+          } catch {
+            return prev;
+          }
+        });
+        setHasUnsavedChanges(true);
+      } catch {
+      }
+    },
+    [],
+  );
 
   const saveSettings = useCallback(() => {
-    if (mergedSettings) {
+    if (!isMountedRef.current || !mergedSettings) {
+      return;
+    }
+    try {
       saveMutation.mutate(mergedSettings);
+    } catch {
     }
   }, [mergedSettings, saveMutation]);
 
   const resetSettings = useCallback(() => {
+    if (!isMountedRef.current) {
+      return;
+    }
     setLocalSettings({});
     setHasUnsavedChanges(false);
   }, []);
 
-  const isLoading = storeLoading || saveMutation.isPending;
-  const isError = !!storeError;
-  const error = storeError || null;
+  const isLoading = useMemo(
+    () => storeLoading || saveMutation.isPending,
+    [storeLoading, saveMutation.isPending],
+  );
+
+  const isError = useMemo(() => !!storeError, [storeError]);
+
+  const error = useMemo(() => {
+    if (storeError) {
+      return normalizeError(storeError);
+    }
+    return null;
+  }, [storeError]);
+
+  const saveError = useMemo(() => {
+    if (saveMutation.error) {
+      return normalizeError(saveMutation.error);
+    }
+    return null;
+  }, [saveMutation.error]);
 
   useEffect(() => {
-    if (error && onError) {
-      onError(error instanceof Error ? error : new Error(String(error)));
+    if (!error || !onError || !isMountedRef.current) {
+      return;
+    }
+    try {
+      onError(error);
+    } catch {
     }
   }, [error, onError]);
 
   useEffect(() => {
-    if (isOnline && !isLoading) {
+    if (!isOnline || isLoading || !isMountedRef.current) {
+      return;
+    }
+    try {
       refetchStore();
+    } catch {
     }
   }, [isOnline, isLoading, refetchStore]);
 
   useEffect(() => {
-    if (!enableRealTime || !store?.id) {
+    if (!enableRealTime || !store?.id || !isMountedRef.current) {
       return;
     }
 
-    const interval = setInterval(() => {
-      refetchStore();
-    }, refetchInterval);
+    const intervalId = setInterval(() => {
+      if (isMountedRef.current) {
+        try {
+          refetchStore();
+        } catch {
+        }
+      }
+    }, validatedRefetchInterval);
 
-    return () => clearInterval(interval);
-  }, [enableRealTime, refetchInterval, store?.id, refetchStore]);
+    return () => {
+      clearInterval(intervalId);
+    };
+  }, [enableRealTime, validatedRefetchInterval, store?.id, refetchStore]);
 
-  return {
-    settings: mergedSettings,
-    hasUnsavedChanges,
-    isLoading,
-    isError,
-    error,
-    saveSettings,
-    updateSettings,
-    resetSettings,
-    isSaving: saveMutation.isPending,
-    saveError: saveMutation.error ?? null,
-    saveSuccess: saveMutation.isSuccess,
-    isOnline,
-  };
+  return useMemo(
+    () => ({
+      settings: mergedSettings,
+      hasUnsavedChanges,
+      isLoading,
+      isError,
+      error,
+      saveSettings,
+      updateSettings,
+      resetSettings,
+      isSaving: saveMutation.isPending,
+      saveError,
+      saveSuccess: saveMutation.isSuccess,
+      isOnline,
+    }),
+    [
+      mergedSettings,
+      hasUnsavedChanges,
+      isLoading,
+      isError,
+      error,
+      saveSettings,
+      updateSettings,
+      resetSettings,
+      saveMutation.isPending,
+      saveError,
+      saveMutation.isSuccess,
+      isOnline,
+    ],
+  );
 }

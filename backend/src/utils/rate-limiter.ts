@@ -32,6 +32,20 @@ export interface RateLimitResult {
   readonly cost?: number;
 }
 
+interface MutableRateLimitMetrics {
+  totalRequests: number;
+  totalAllowed: number;
+  totalRejected: number;
+  rejectionRate: number;
+  averageWaitTime: number;
+  averageCost: number;
+  concurrency: {
+    average: number;
+    peak: number;
+  };
+  history: Array<{ readonly timestamp: number; readonly requests: number; readonly rejected: number }>;
+}
+
 export interface RateLimitMetrics {
   readonly totalRequests: number;
   readonly totalAllowed: number;
@@ -43,14 +57,14 @@ export interface RateLimitMetrics {
     readonly average: number;
     readonly peak: number;
   };
-  readonly history: readonly Array<{ readonly timestamp: number; readonly requests: number; readonly rejected: number }>;
+  readonly history: ReadonlyArray<{ readonly timestamp: number; readonly requests: number; readonly rejected: number }>;
 }
 
 export interface DistributedStorage {
   get(key: string): Promise<unknown>;
   set(key: string, value: unknown, ttl?: number): Promise<void>;
   increment(key: string, by?: number, ttl?: number): Promise<number>;
-  decrement(key: string, by?: number): Promise<number>;
+  decrement(key: string, by?: number, ttl?: number): Promise<number>;
   delete(key: string): Promise<void>;
 }
 
@@ -80,7 +94,109 @@ interface PlanLimit {
   readonly bucketSize: number;
 }
 
+type LogLevel = 'info' | 'warn' | 'error';
+
+const structuredLog = (
+  level: LogLevel,
+  service: string,
+  message: string,
+  context?: Readonly<Record<string, unknown>>,
+): void => {
+  const payload = JSON.stringify({
+    level,
+    service,
+    message,
+    timestamp: new Date().toISOString(),
+    ...context,
+  });
+
+  if (typeof globalThis === 'undefined' || !('Deno' in globalThis)) {
+    return;
+  }
+
+  const encoder = new TextEncoder();
+  const deno = globalThis as unknown as { Deno: { stderr: { writeSync: (data: Uint8Array) => void }; stdout: { writeSync: (data: Uint8Array) => void } } };
+  
+  if (level === 'error') {
+    deno.Deno.stderr.writeSync(encoder.encode(payload + '\n'));
+    return;
+  }
+
+  deno.Deno.stdout.writeSync(encoder.encode(payload + '\n'));
+};
+
+const sleep = (ms: number): Promise<void> => {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+};
+
+const generateCorrelationId = (): string => {
+  return `rate_limit_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
+};
+
+const validateKey = (key: string): void => {
+  if (!key || typeof key !== 'string' || key.trim().length === 0) {
+    throw new Error('Invalid key: must be a non-empty string');
+  }
+  if (key.length > 500) {
+    throw new Error('Invalid key: exceeds maximum length of 500');
+  }
+};
+
+const validateShopDomain = (shopDomain: string): void => {
+  if (!shopDomain || typeof shopDomain !== 'string' || shopDomain.trim().length === 0) {
+    throw new Error('Invalid shop domain: must be a non-empty string');
+  }
+  if (!shopDomain.includes('.') || shopDomain.length > 255) {
+    throw new Error('Invalid shop domain format');
+  }
+};
+
+const validateMaxRequests = (maxRequests: number): void => {
+  if (!Number.isInteger(maxRequests) || maxRequests <= 0 || maxRequests > 1000000) {
+    throw new Error('Invalid maxRequests: must be an integer between 1 and 1000000');
+  }
+};
+
+const validateWindowMs = (windowMs: number): void => {
+  if (!Number.isInteger(windowMs) || windowMs <= 0 || windowMs > 3600000) {
+    throw new Error('Invalid windowMs: must be an integer between 1 and 3600000ms');
+  }
+};
+
+const validateBurst = (burst: number): void => {
+  if (!Number.isFinite(burst) || burst <= 0 || burst > 10000000) {
+    throw new Error('Invalid burst: must be a number between 0 and 10000000');
+  }
+};
+
+const validateRestoreRate = (restoreRate: number): void => {
+  if (!Number.isFinite(restoreRate) || restoreRate <= 0 || restoreRate > 1000000) {
+    throw new Error('Invalid restoreRate: must be a number between 0 and 1000000');
+  }
+};
+
+const validateConcurrency = (concurrency: number): void => {
+  if (!Number.isFinite(concurrency) || concurrency <= 0 || concurrency > 100000) {
+    throw new Error('Invalid concurrency: must be a number between 0 and 100000');
+  }
+};
+
+const validateKeyPrefix = (keyPrefix: string): void => {
+  if (keyPrefix !== undefined && (typeof keyPrefix !== 'string' || keyPrefix.length > 100)) {
+    throw new Error('Invalid keyPrefix: must be a string with max length 100');
+  }
+};
+
+const isRateLimitAlgorithm = (algorithm: string): algorithm is RateLimitAlgorithm => {
+  return ['token-bucket', 'leaky-bucket', 'sliding-window', 'fixed-window'].includes(algorithm);
+};
+
+const isShopifyPlanTier = (tier: string): tier is ShopifyPlanTier => {
+  return Object.values(ShopifyPlanTier).includes(tier as ShopifyPlanTier);
+};
+
 export class RateLimiter {
+  private static readonly SERVICE_NAME = 'RateLimiter';
   private static readonly DEFAULT_ALGORITHM: RateLimitAlgorithm = 'token-bucket';
   private static readonly DEFAULT_CACHE_TTL = 1000;
   private static readonly DEFAULT_CONCURRENCY = Infinity;
@@ -94,18 +210,37 @@ export class RateLimiter {
   private static readonly MILLISECONDS_PER_SECOND = 1000;
   private static readonly SECONDS_PER_MINUTE = 60;
   private static readonly MILLISECONDS_PER_MINUTE = 60000;
-  private static readonly MAX_QUERY_COST = 1000;
-  private static readonly KEY_SEPARATOR = ':';
+  static readonly MAX_QUERY_COST = 1000;
+  static readonly KEY_SEPARATOR = ':';
+  private static readonly CACHE_CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
+  private static readonly MAX_CACHE_SIZE = 10000;
 
   private readonly state: Map<string, RateLimitState>;
   private readonly config: Required<Omit<RateLimitConfig, 'distributed' | 'keyPrefix'>> &
     Pick<RateLimitConfig, 'distributed' | 'keyPrefix'>;
-  private readonly metrics: Map<string, RateLimitMetrics>;
+  private readonly metrics: Map<string, MutableRateLimitMetrics>;
   private readonly cache: Map<string, CacheEntry>;
   private readonly cacheTTL: number;
   private readonly validator: RateLimitValidator;
+  private cacheCleanupInterval?: number;
 
   constructor(config: RateLimitConfig) {
+    validateMaxRequests(config.maxRequests);
+    validateWindowMs(config.windowMs);
+    if (config.burst !== undefined) {
+      validateBurst(config.burst);
+    }
+    if (config.restoreRate !== undefined) {
+      validateRestoreRate(config.restoreRate);
+    }
+    if (config.concurrency !== undefined) {
+      validateConcurrency(config.concurrency);
+    }
+    if (config.algorithm !== undefined && !isRateLimitAlgorithm(config.algorithm)) {
+      throw new Error(`Invalid algorithm: ${config.algorithm}`);
+    }
+    validateKeyPrefix(config.keyPrefix ?? '');
+
     this.state = new Map();
     this.config = {
       maxRequests: config.maxRequests,
@@ -121,6 +256,36 @@ export class RateLimiter {
     this.cache = new Map();
     this.cacheTTL = RateLimiter.DEFAULT_CACHE_TTL;
     this.validator = new RateLimitValidator();
+    this.startCacheCleanup();
+  }
+
+  destroy(): void {
+    if (this.cacheCleanupInterval !== undefined) {
+      clearInterval(this.cacheCleanupInterval);
+      this.cacheCleanupInterval = undefined;
+    }
+    this.state.clear();
+    this.metrics.clear();
+    this.cache.clear();
+  }
+
+  private startCacheCleanup(): void {
+    this.cacheCleanupInterval = setInterval(() => {
+      const now = Date.now();
+      for (const [key, entry] of this.cache.entries()) {
+        if (entry.expiresAt < now) {
+          this.cache.delete(key);
+        }
+      }
+      if (this.cache.size > RateLimiter.MAX_CACHE_SIZE) {
+        const entries = Array.from(this.cache.entries());
+        entries.sort((a, b) => a[1].expiresAt - b[1].expiresAt);
+        const toDelete = entries.slice(0, entries.length - RateLimiter.MAX_CACHE_SIZE);
+        for (const [key] of toDelete) {
+          this.cache.delete(key);
+        }
+      }
+    }, RateLimiter.CACHE_CLEANUP_INTERVAL_MS) as unknown as number;
   }
 
   async checkLimit(
@@ -128,9 +293,12 @@ export class RateLimiter {
     cost: number = 1,
     priority: number = 5,
   ): Promise<RateLimitResult> {
+    validateKey(key);
     this.validator.validateCost(cost);
     this.validator.validatePriority(priority);
 
+    const correlationId = generateCorrelationId();
+    const startTime = Date.now();
     const fullKey = this.getFullKey(key);
 
     const cached = this.cache.get(fullKey);
@@ -147,6 +315,13 @@ export class RateLimiter {
         waitTime: RateLimiter.DEFAULT_WAIT_TIME,
       };
       this.recordMetrics(fullKey, false, cost, 0);
+      const duration = Date.now() - startTime;
+      structuredLog('warn', RateLimiter.SERVICE_NAME, 'Rate limit check - concurrency exceeded', {
+        correlationId,
+        key: fullKey,
+        cost,
+        durationMs: duration,
+      });
       return result;
     }
 
@@ -193,9 +368,26 @@ export class RateLimiter {
         state.concurrency.current = Math.max(0, state.concurrency.current - 1);
       }
 
+      const duration = Date.now() - startTime;
+      structuredLog('info', RateLimiter.SERVICE_NAME, 'Rate limit check completed', {
+        correlationId,
+        key: fullKey,
+        allowed: result.allowed,
+        remaining: result.remaining,
+        cost,
+        durationMs: duration,
+      });
+
       return result;
     } catch (error) {
       state.concurrency.current = Math.max(0, state.concurrency.current - 1);
+      const duration = Date.now() - startTime;
+      structuredLog('error', RateLimiter.SERVICE_NAME, 'Rate limit check failed', {
+        correlationId,
+        key: fullKey,
+        error: error instanceof Error ? error.message : String(error),
+        durationMs: duration,
+      });
       throw error;
     }
   }
@@ -374,12 +566,29 @@ export class RateLimiter {
     cost: number = 1,
     priority: number = 5,
   ): Promise<boolean> {
+    validateKey(key);
+    this.validator.validateCost(cost);
+    this.validator.validatePriority(priority);
+    if (!Number.isInteger(maxWaitMs) || maxWaitMs <= 0 || maxWaitMs > 600000) {
+      throw new Error('Invalid maxWaitMs: must be an integer between 1 and 600000ms');
+    }
+
+    const correlationId = generateCorrelationId();
     const startTime = Date.now();
     let backoffDelay = RateLimiter.DEFAULT_BACKOFF_DELAY;
+    let attempt = 0;
 
     while (Date.now() - startTime < maxWaitMs) {
+      attempt++;
       const result = await this.checkLimit(key, cost, priority);
       if (result.allowed) {
+        const duration = Date.now() - startTime;
+        structuredLog('info', RateLimiter.SERVICE_NAME, 'Token acquired after waiting', {
+          correlationId,
+          key,
+          attempt,
+          durationMs: duration,
+        });
         return true;
       }
 
@@ -391,10 +600,20 @@ export class RateLimiter {
       }
     }
 
+    const duration = Date.now() - startTime;
+    structuredLog('warn', RateLimiter.SERVICE_NAME, 'Token wait timeout', {
+      correlationId,
+      key,
+      attempt,
+      maxWaitMs,
+      durationMs: duration,
+    });
+
     return false;
   }
 
   async getStatus(key: string): Promise<RateLimitResult> {
+    validateKey(key);
     const fullKey = this.getFullKey(key);
     const state = await this.getOrCreateStateDistributed(fullKey);
     const now = Date.now();
@@ -428,7 +647,23 @@ export class RateLimiter {
   }
 
   getAllMetrics(): ReadonlyMap<string, RateLimitMetrics> {
-    return new Map(this.metrics);
+    const result = new Map<string, RateLimitMetrics>();
+    for (const [key, metrics] of this.metrics.entries()) {
+      result.set(key, {
+        totalRequests: metrics.totalRequests,
+        totalAllowed: metrics.totalAllowed,
+        totalRejected: metrics.totalRejected,
+        rejectionRate: metrics.rejectionRate,
+        averageWaitTime: metrics.averageWaitTime,
+        averageCost: metrics.averageCost,
+        concurrency: {
+          average: metrics.concurrency.average,
+          peak: metrics.concurrency.peak,
+        },
+        history: metrics.history,
+      });
+    }
+    return result;
   }
 
   private recordMetrics(
@@ -464,6 +699,13 @@ export class RateLimiter {
       (metrics.averageWaitTime * (metrics.totalRequests - 1) + waitTime) / metrics.totalRequests;
     metrics.averageCost = (metrics.averageCost * (metrics.totalRequests - 1) + cost) / metrics.totalRequests;
 
+    const state = this.state.get(key);
+    if (state) {
+      metrics.concurrency.peak = Math.max(metrics.concurrency.peak, state.concurrency.current);
+      metrics.concurrency.average =
+        (metrics.concurrency.average * (metrics.totalRequests - 1) + state.concurrency.current) / metrics.totalRequests;
+    }
+
     const now = Date.now();
     metrics.history.push({
       timestamp: now,
@@ -498,10 +740,17 @@ export class RateLimiter {
     if (this.config.distributed) {
       try {
         const stored = await this.config.distributed.get(key);
-        if (stored) {
-          return stored as RateLimitState;
+        if (stored && typeof stored === 'object') {
+          const state = stored as RateLimitState;
+          if (typeof state.tokens === 'number' && typeof state.lastRefill === 'number') {
+            return state;
+          }
         }
-      } catch {
+      } catch (error) {
+        structuredLog('warn', RateLimiter.SERVICE_NAME, 'Failed to get distributed state, using local', {
+          key,
+          error: error instanceof Error ? error.message : String(error),
+        });
       }
     }
 
@@ -512,7 +761,12 @@ export class RateLimiter {
     if (this.config.distributed) {
       try {
         await this.config.distributed.set(key, state, Math.ceil(this.config.windowMs / RateLimiter.MILLISECONDS_PER_SECOND));
-      } catch {
+      } catch (error) {
+        structuredLog('warn', RateLimiter.SERVICE_NAME, 'Failed to save distributed state, using local', {
+          key,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        this.state.set(key, state);
       }
     } else {
       this.state.set(key, state);
@@ -527,21 +781,23 @@ export class RateLimiter {
 class RateLimitValidator {
   private static readonly MIN_PRIORITY = 0;
   private static readonly MAX_PRIORITY = 10;
+  private static readonly MAX_COST = 1000000;
 
   validateCost(cost: number): void {
-    if (cost < 0 || !Number.isFinite(cost)) {
-      throw new Error(`Invalid cost: ${cost}`);
+    if (!Number.isFinite(cost) || cost < 0 || cost > RateLimitValidator.MAX_COST) {
+      throw new Error(`Invalid cost: must be a number between 0 and ${RateLimitValidator.MAX_COST}`);
     }
   }
 
   validatePriority(priority: number): void {
-    if (priority < RateLimitValidator.MIN_PRIORITY || priority > RateLimitValidator.MAX_PRIORITY) {
-      throw new Error(`Invalid priority: ${priority}. Must be between ${RateLimitValidator.MIN_PRIORITY} and ${RateLimitValidator.MAX_PRIORITY}`);
+    if (!Number.isInteger(priority) || priority < RateLimitValidator.MIN_PRIORITY || priority > RateLimitValidator.MAX_PRIORITY) {
+      throw new Error(`Invalid priority: must be an integer between ${RateLimitValidator.MIN_PRIORITY} and ${RateLimitValidator.MAX_PRIORITY}`);
     }
   }
 }
 
 export class ShopifyRateLimiter {
+  private static readonly SERVICE_NAME = 'ShopifyRateLimiter';
   private static readonly DEFAULT_REST_API_LIMIT = 40;
   private static readonly DEFAULT_GRAPHQL_RESTORE_RATE = 50;
   private static readonly DEFAULT_WAIT_TIME = 1000;
@@ -556,17 +812,36 @@ export class ShopifyRateLimiter {
   private readonly restLimiter: RateLimiter;
   private readonly graphqlLimiter: RateLimiter;
   private readonly storefrontLimiter: RateLimiter;
-  private config: ShopifyRateLimitConfig;
+  private readonly config: ShopifyRateLimitConfig;
   private readonly planLimits: ReadonlyMap<ShopifyPlanTier, PlanLimit>;
 
   constructor(config: ShopifyRateLimitConfig) {
+    if (!config || typeof config !== 'object') {
+      throw new Error('Invalid config: must be an object');
+    }
+    if (!isShopifyPlanTier(config.planTier)) {
+      throw new Error(`Invalid planTier: ${config.planTier}`);
+    }
+    if (config.restApiLimit !== undefined && (!Number.isInteger(config.restApiLimit) || config.restApiLimit <= 0 || config.restApiLimit > 10000)) {
+      throw new Error('Invalid restApiLimit: must be an integer between 1 and 10000');
+    }
+    if (config.graphqlLimit !== undefined && (!Number.isInteger(config.graphqlLimit) || config.graphqlLimit <= 0 || config.graphqlLimit > 100000)) {
+      throw new Error('Invalid graphqlLimit: must be an integer between 1 and 100000');
+    }
+    if (config.graphqlRestoreRate !== undefined && (!Number.isFinite(config.graphqlRestoreRate) || config.graphqlRestoreRate <= 0 || config.graphqlRestoreRate > 100000)) {
+      throw new Error('Invalid graphqlRestoreRate: must be a number between 0 and 100000');
+    }
+    if (config.graphqlBucketSize !== undefined && (!Number.isInteger(config.graphqlBucketSize) || config.graphqlBucketSize <= 0 || config.graphqlBucketSize > 1000000)) {
+      throw new Error('Invalid graphqlBucketSize: must be an integer between 1 and 1000000');
+    }
+
     this.config = config;
     this.planLimits = new Map([
       [ShopifyPlanTier.STANDARD, { pointsPerSecond: 100, restoreRate: ShopifyRateLimiter.DEFAULT_GRAPHQL_RESTORE_RATE, bucketSize: 1000 }],
       [ShopifyPlanTier.ADVANCED, { pointsPerSecond: 200, restoreRate: ShopifyRateLimiter.DEFAULT_GRAPHQL_RESTORE_RATE, bucketSize: 2000 }],
       [ShopifyPlanTier.PLUS, { pointsPerSecond: 1000, restoreRate: ShopifyRateLimiter.DEFAULT_GRAPHQL_RESTORE_RATE, bucketSize: 10000 }],
       [ShopifyPlanTier.ENTERPRISE, { pointsPerSecond: 2000, restoreRate: ShopifyRateLimiter.DEFAULT_GRAPHQL_RESTORE_RATE, bucketSize: 20000 }],
-    ]);
+    ] as const);
 
     const planLimit = this.planLimits.get(config.planTier) ?? this.planLimits.get(ShopifyPlanTier.STANDARD)!;
 
@@ -595,7 +870,14 @@ export class ShopifyRateLimiter {
     });
   }
 
+  destroy(): void {
+    this.restLimiter.destroy();
+    this.graphqlLimiter.destroy();
+    this.storefrontLimiter.destroy();
+  }
+
   async checkRestLimit(shopDomain: string): Promise<RateLimitResult> {
+    validateShopDomain(shopDomain);
     return this.restLimiter.checkLimit(shopDomain);
   }
 
@@ -604,7 +886,13 @@ export class ShopifyRateLimiter {
     requestedCost: number,
     actualCost?: number,
   ): Promise<RateLimitResult> {
-    if (requestedCost > RateLimiter.MAX_QUERY_COST) {
+    validateShopDomain(shopDomain);
+    if (!Number.isFinite(requestedCost) || requestedCost < 0 || requestedCost > RateLimiter.MAX_QUERY_COST) {
+      structuredLog('warn', ShopifyRateLimiter.SERVICE_NAME, 'GraphQL query cost exceeds maximum', {
+        shopDomain,
+        requestedCost,
+        maxCost: RateLimiter.MAX_QUERY_COST,
+      });
       return {
         allowed: false,
         remaining: 0,
@@ -618,12 +906,15 @@ export class ShopifyRateLimiter {
 
     if (result.allowed && actualCost !== undefined && actualCost < requestedCost) {
       const refund = requestedCost - actualCost;
-      const state = await this.getGraphQLState(shopDomain);
-      if (state) {
-        state.tokens = Math.min(
-          this.getGraphQLBurst(),
-          state.tokens + refund,
-        );
+      if (refund > 0) {
+        const state = await this.getGraphQLState(shopDomain);
+        if (state) {
+          state.tokens = Math.min(
+            this.getGraphQLBurst(),
+            state.tokens + refund,
+          );
+          await this.saveGraphQLState(shopDomain, state);
+        }
       }
     }
 
@@ -631,13 +922,29 @@ export class ShopifyRateLimiter {
   }
 
   async recordGraphQLCost(shopDomain: string, cost: number): Promise<void> {
+    validateShopDomain(shopDomain);
+    if (!Number.isFinite(cost) || cost < 0 || cost > RateLimiter.MAX_QUERY_COST) {
+      throw new Error(`Invalid cost: must be a number between 0 and ${RateLimiter.MAX_QUERY_COST}`);
+    }
+
+    const state = await this.getGraphQLState(shopDomain);
+    if (state) {
+      const refund = Math.max(0, state.tokens - cost);
+      state.tokens = Math.min(this.getGraphQLBurst(), refund);
+      await this.saveGraphQLState(shopDomain, state);
+    }
   }
 
   async waitForRestToken(shopDomain: string): Promise<boolean> {
+    validateShopDomain(shopDomain);
     return this.restLimiter.waitForToken(shopDomain);
   }
 
   async waitForGraphQLToken(shopDomain: string, cost: number = 1): Promise<boolean> {
+    validateShopDomain(shopDomain);
+    if (!Number.isFinite(cost) || cost < 0 || cost > RateLimiter.MAX_QUERY_COST) {
+      throw new Error(`Invalid cost: must be a number between 0 and ${RateLimiter.MAX_QUERY_COST}`);
+    }
     return this.graphqlLimiter.waitForToken(shopDomain, ShopifyRateLimiter.DEFAULT_MAX_WAIT_MS, cost);
   }
 
@@ -656,10 +963,25 @@ export class ShopifyRateLimiter {
   private async getGraphQLState(shopDomain: string): Promise<RateLimitState | null> {
     try {
       const key = `${ShopifyRateLimiter.GRAPHQL_KEY_PREFIX}${RateLimiter.KEY_SEPARATOR}${shopDomain}`;
-      const state = await (this.graphqlLimiter as unknown as { getOrCreateStateDistributed: (key: string) => Promise<RateLimitState> }).getOrCreateStateDistributed(key);
-      return state;
-    } catch {
+      return await (this.graphqlLimiter as unknown as { getOrCreateStateDistributed: (key: string) => Promise<RateLimitState> }).getOrCreateStateDistributed(key);
+    } catch (error) {
+      structuredLog('warn', ShopifyRateLimiter.SERVICE_NAME, 'Failed to get GraphQL state', {
+        shopDomain,
+        error: error instanceof Error ? error.message : String(error),
+      });
       return null;
+    }
+  }
+
+  private async saveGraphQLState(shopDomain: string, state: RateLimitState): Promise<void> {
+    try {
+      const key = `${ShopifyRateLimiter.GRAPHQL_KEY_PREFIX}${RateLimiter.KEY_SEPARATOR}${shopDomain}`;
+      await (this.graphqlLimiter as unknown as { saveStateDistributed: (key: string, state: RateLimitState) => Promise<void> }).saveStateDistributed(key, state);
+    } catch (error) {
+      structuredLog('warn', ShopifyRateLimiter.SERVICE_NAME, 'Failed to save GraphQL state', {
+        shopDomain,
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 
@@ -669,19 +991,18 @@ export class ShopifyRateLimiter {
   }
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 let shopifyRateLimiterInstance: ShopifyRateLimiter | null = null;
 
 export function getShopifyRateLimiter(
   config?: ShopifyRateLimitConfig,
 ): ShopifyRateLimiter {
-  if (!shopifyRateLimiterInstance) {
-    shopifyRateLimiterInstance = new ShopifyRateLimiter(
-      config ?? { planTier: ShopifyPlanTier.STANDARD },
-    );
+  if (config && (!shopifyRateLimiterInstance || shopifyRateLimiterInstance['config'].planTier !== config.planTier)) {
+    if (shopifyRateLimiterInstance) {
+      shopifyRateLimiterInstance.destroy();
+    }
+    shopifyRateLimiterInstance = new ShopifyRateLimiter(config);
+  } else if (!shopifyRateLimiterInstance) {
+    shopifyRateLimiterInstance = new ShopifyRateLimiter({ planTier: ShopifyPlanTier.STANDARD });
   }
   return shopifyRateLimiterInstance;
 }

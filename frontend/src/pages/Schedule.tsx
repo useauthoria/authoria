@@ -1,104 +1,233 @@
-import { useState, useCallback, useMemo, useEffect } from 'react';
+import { useState, useCallback, useMemo, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { useMutation, useQueryClient, useQuery } from '@tanstack/react-query';
 import { useStore, usePosts, useQuotaStatus, queryKeys } from '../lib/api-cache';
 import { getShopDomain } from '../lib/app-bridge';
-import { supabase, postsApi, queueApi, type BlogPost, type QueuedArticle } from '../lib/api-client';
-import { useMutation, useQueryClient, useQuery } from '@tanstack/react-query';
+import { supabase, postsApi, queueApi, type BlogPost, type QueuedArticle, type Store, type QuotaStatus } from '../lib/api-client';
 import { getPlanFrequencyConfig, validateSelectedDays, getFrequencySettings } from '../utils/plan-frequency';
 import { useAppBridgeToast } from '../hooks/useAppBridge';
 import ArticlesQueue from '../components/ArticlesQueue';
 import { formatAPIErrorMessage } from '../utils/error-messages';
 import { HelpIcon } from '../components/Tooltip';
 
-const REFETCH_INTERVAL = 300000; // 5 minutes
+const REFETCH_INTERVAL = 300000;
+const QUEUE_REFETCH_INTERVAL = 30000;
+const MAX_ATTEMPTS = 200;
+const DEFAULT_PUBLISH_TIME = '14:00';
+const CALENDAR_ROWS = 6;
+const DAYS_IN_WEEK = 7;
+const CALENDAR_CELLS = CALENDAR_ROWS * DAYS_IN_WEEK;
+const MONTHS_IN_YEAR = 12;
+const MAX_TITLE_PREVIEW_LENGTH = 20;
+const JS_DAYS_IN_WEEK = 7;
+const HOURS_IN_DAY = 24;
+const MINUTES_IN_HOUR = 60;
+const DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'] as const;
+const DAY_LABELS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'] as const;
 
 type ViewMode = 'month' | 'week' | 'list';
 
 interface CalendarDay {
-  date: Date;
-  dayOfMonth: number;
-  isCurrentMonth: boolean;
-  isToday: boolean;
-  posts: Array<{
-    id: string;
-    title: string;
-    scheduledAt: Date;
-    status: 'published' | 'scheduled' | 'queued';
-  }>;
+  readonly date: Date;
+  readonly dayOfMonth: number;
+  readonly isCurrentMonth: boolean;
+  readonly isToday: boolean;
+  readonly posts: readonly PostForDate[];
 }
 
 interface WeekDay {
-  date: Date;
-  dayName: string;
-  dayNumber: number;
-  posts: Array<{
-    id: string;
-    title: string;
-    scheduledAt: Date;
-    status: 'published' | 'scheduled' | 'queued';
+  readonly date: Date;
+  readonly dayName: string;
+  readonly dayNumber: number;
+  readonly posts: readonly PostForDate[];
+}
+
+interface PostForDate {
+  readonly id: string;
+  readonly title: string;
+  readonly scheduledAt: Date;
+  readonly status: 'published' | 'scheduled' | 'queued';
+}
+
+interface BlogPostWithQueueMarker extends BlogPost {
+  readonly _isQueueItem?: boolean;
+}
+
+interface ConflictInfo {
+  readonly type: string;
+  readonly severity: string;
+  readonly message: string;
+}
+
+interface ConflictResponse {
+  readonly conflicts: readonly Array<{
+    readonly conflictType: string;
+    readonly severity: string;
+    readonly scheduledAt: string;
+    readonly suggestedAlternative?: string;
   }>;
 }
 
-function formatDate(date: Date): string {
+interface StoreWithInstallDate extends Store {
+  readonly installed_at?: string;
+  readonly created_at?: string;
+}
+
+const formatDate = (date: Date): string => {
   return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-}
+};
 
-// Detect if user's locale uses 12-hour or 24-hour format
-function uses12HourFormat(): boolean {
-  const testDate = new Date(2024, 0, 1, 13, 0); // 1 PM
+const uses12HourFormat = (): boolean => {
+  if (typeof navigator === 'undefined' || !navigator.language) {
+    return true;
+  }
+  const testDate = new Date(2024, 0, 1, 13, 0);
   const formatted = testDate.toLocaleTimeString(navigator.language, { hour: 'numeric' });
-  // If it contains 'PM' or 'AM', it's 12-hour format
   return formatted.includes('PM') || formatted.includes('AM') || formatted.includes('pm') || formatted.includes('am');
-}
+};
 
-function formatTime(date: Date): string {
+const formatTime = (date: Date): string => {
+  if (typeof navigator === 'undefined' || !navigator.language) {
+    return date.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+  }
   const use12Hour = uses12HourFormat();
-  return date.toLocaleTimeString(navigator.language, { 
-    hour: 'numeric', 
-    minute: '2-digit', 
-    hour12: use12Hour 
+  return date.toLocaleTimeString(navigator.language, {
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: use12Hour,
   });
-}
+};
 
-function formatWeekDate(date: Date): string {
-  const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-  return `${days[date.getDay()]}, ${date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`;
-}
+const formatWeekDate = (date: Date): string => {
+  return `${DAY_NAMES[date.getDay()]}, ${date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`;
+};
 
-function getDaysInMonth(year: number, month: number): number {
+const getDaysInMonth = (year: number, month: number): number => {
   return new Date(year, month + 1, 0).getDate();
-}
+};
 
-function getFirstDayOfMonth(year: number, month: number): number {
+const getFirstDayOfMonth = (year: number, month: number): number => {
   const firstDay = new Date(year, month, 1);
   return firstDay.getDay();
-}
+};
 
-function generateMonthCalendar(
-  year: number, 
-  month: number, 
-  posts: readonly BlogPost[],
+const jsDayToIndex = (jsDay: number): number => {
+  return jsDay === 0 ? 6 : jsDay - 1;
+};
+
+const dayIndexToJsDay = (index: number): number => {
+  return index === 6 ? 0 : index + 1;
+};
+
+const validateJsDay = (jsDay: number): boolean => {
+  return Number.isInteger(jsDay) && jsDay >= 0 && jsDay < JS_DAYS_IN_WEEK;
+};
+
+const validateDayIndex = (index: number): boolean => {
+  return Number.isInteger(index) && index >= 0 && index < JS_DAYS_IN_WEEK;
+};
+
+const parseTime = (time: string): { hours: number; minutes: number } | null => {
+  if (!time || typeof time !== 'string') {
+    return null;
+  }
+  const parts = time.split(':');
+  if (parts.length !== 2) {
+    return null;
+  }
+  const hours = Number.parseInt(parts[0], 10);
+  const minutes = Number.parseInt(parts[1], 10);
+  if (
+    !Number.isFinite(hours) ||
+    !Number.isFinite(minutes) ||
+    hours < 0 ||
+    hours >= HOURS_IN_DAY ||
+    minutes < 0 ||
+    minutes >= MINUTES_IN_HOUR
+  ) {
+    return null;
+  }
+  return { hours, minutes };
+};
+
+const formatTimeString = (hours: number, minutes: number): string => {
+  return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`;
+};
+
+const isBlogPostWithQueueMarker = (post: BlogPost | BlogPostWithQueueMarker): post is BlogPostWithQueueMarker => {
+  return post !== null && typeof post === 'object' && '_isQueueItem' in post;
+};
+
+const getPostsForDate = (date: Date, posts: readonly (BlogPost | BlogPostWithQueueMarker)[]): readonly PostForDate[] => {
+  const startOfDay = new Date(date);
+  startOfDay.setHours(0, 0, 0, 0);
+  const endOfDay = new Date(date);
+  endOfDay.setHours(23, 59, 59, 999);
+
+  return posts
+    .filter((post) => {
+      const postDate = post.published_at || post.scheduled_publish_at;
+      if (!postDate) {
+        return false;
+      }
+      const d = new Date(postDate);
+      if (isNaN(d.getTime())) {
+        return false;
+      }
+      return d >= startOfDay && d <= endOfDay;
+    })
+    .map((post) => {
+      if (post.status === 'published' && post.published_at) {
+        return {
+          id: post.id,
+          title: post.title,
+          scheduledAt: new Date(post.published_at),
+          status: 'published' as const,
+        };
+      } else if (isBlogPostWithQueueMarker(post) && post._isQueueItem && post.scheduled_publish_at) {
+        return {
+          id: post.id,
+          title: post.title,
+          scheduledAt: new Date(post.scheduled_publish_at),
+          status: 'queued' as const,
+        };
+      } else if (post.scheduled_publish_at) {
+        return {
+          id: post.id,
+          title: post.title,
+          scheduledAt: new Date(post.scheduled_publish_at),
+          status: 'scheduled' as const,
+        };
+      } else {
+        throw new Error('Post must have a valid date');
+      }
+    })
+    .sort((a, b) => a.scheduledAt.getTime() - b.scheduledAt.getTime());
+};
+
+const generateMonthCalendar = (
+  year: number,
+  month: number,
+  posts: readonly (BlogPost | BlogPostWithQueueMarker)[],
   minDate: Date | null = null,
-  maxDate: Date | null = null
-): CalendarDay[] {
+  maxDate: Date | null = null,
+): readonly CalendarDay[] => {
   const days: CalendarDay[] = [];
   const today = new Date();
   today.setHours(0, 0, 0, 0);
-  
+
   const firstDay = getFirstDayOfMonth(year, month);
   const daysInMonth = getDaysInMonth(year, month);
   const daysInPrevMonth = getDaysInMonth(year, month - 1);
-  
-  // Previous month's trailing days (only show if not before minDate)
+
   for (let i = firstDay - 1; i >= 0; i--) {
     const date = new Date(year, month - 1, daysInPrevMonth - i);
     date.setHours(0, 0, 0, 0);
-    
-    // Skip if before minDate
+
     if (minDate && date < minDate) {
       continue;
     }
-    
+
     const dayPosts = getPostsForDate(date, posts);
     days.push({
       date,
@@ -108,8 +237,7 @@ function generateMonthCalendar(
       posts: dayPosts,
     });
   }
-  
-  // Current month's days
+
   for (let day = 1; day <= daysInMonth; day++) {
     const date = new Date(year, month, day);
     date.setHours(0, 0, 0, 0);
@@ -122,19 +250,17 @@ function generateMonthCalendar(
       posts: dayPosts,
     });
   }
-  
-  // Next month's leading days to fill the grid (only show if not after maxDate)
+
   const totalCells = days.length;
-  const remainingCells = 42 - totalCells; // 6 rows * 7 days
+  const remainingCells = CALENDAR_CELLS - totalCells;
   for (let day = 1; day <= remainingCells; day++) {
     const date = new Date(year, month + 1, day);
     date.setHours(0, 0, 0, 0);
-    
-    // Skip if after maxDate
+
     if (maxDate && date > maxDate) {
       continue;
     }
-    
+
     const dayPosts = getPostsForDate(date, posts);
     days.push({
       date,
@@ -144,137 +270,271 @@ function generateMonthCalendar(
       posts: dayPosts,
     });
   }
-  
+
   return days;
-}
+};
 
-function getPostsForDate(date: Date, posts: readonly (BlogPost | (BlogPost & { _isQueueItem?: boolean }))[]): Array<{
-  id: string;
-  title: string;
-  scheduledAt: Date;
-  status: 'published' | 'scheduled' | 'queued';
-}> {
-  const startOfDay = new Date(date);
-  startOfDay.setHours(0, 0, 0, 0);
-  const endOfDay = new Date(date);
-  endOfDay.setHours(23, 59, 59, 999);
-  
-  return posts
-    .filter((post) => {
-      const postDate = post.published_at || post.scheduled_publish_at;
-      if (!postDate) return false;
-      const d = new Date(postDate);
-      return d >= startOfDay && d <= endOfDay;
-    })
-    .map((post) => {
-      const postWithMarker = post as BlogPost & { _isQueueItem?: boolean };
-      if (post.status === 'published') {
-        return {
-          id: post.id,
-          title: post.title,
-          scheduledAt: new Date(post.published_at!),
-          status: 'published' as const,
-        };
-      } else if (postWithMarker._isQueueItem) {
-        return {
-          id: post.id,
-          title: post.title,
-          scheduledAt: new Date(post.scheduled_publish_at!),
-          status: 'queued' as const,
-        };
-      } else {
-        return {
-          id: post.id,
-          title: post.title,
-          scheduledAt: new Date(post.scheduled_publish_at!),
-          status: 'scheduled' as const,
-        };
-      }
-    })
-    .sort((a, b) => a.scheduledAt.getTime() - b.scheduledAt.getTime());
-}
-
-function generateWeekCalendar(startDate: Date, posts: readonly BlogPost[]): WeekDay[] {
+const generateWeekCalendar = (startDate: Date, posts: readonly (BlogPost | BlogPostWithQueueMarker)[]): readonly WeekDay[] => {
   const week: WeekDay[] = [];
-  const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-  
-  for (let i = 0; i < 7; i++) {
+
+  for (let i = 0; i < DAYS_IN_WEEK; i++) {
     const date = new Date(startDate);
     date.setDate(startDate.getDate() + i);
     date.setHours(0, 0, 0, 0);
-    
+
     const dayPosts = getPostsForDate(date, posts);
     week.push({
       date,
-      dayName: dayNames[date.getDay()],
+      dayName: DAY_NAMES[date.getDay()],
       dayNumber: date.getDate(),
       posts: dayPosts,
     });
   }
-  
-  return week;
-}
 
-function getWeekStart(date: Date): Date {
+  return week;
+};
+
+const getWeekStart = (date: Date): Date => {
   const d = new Date(date);
   const day = d.getDay();
-  const diff = d.getDate() - day + (day === 0 ? -6 : 1); // Monday as start
+  const diff = d.getDate() - day + (day === 0 ? -6 : 1);
   return new Date(d.setDate(diff));
-}
+};
 
-// Map day indices: Monday=0, Tuesday=1, ..., Sunday=6
-// But JavaScript Date.getDay() returns: Sunday=0, Monday=1, ..., Saturday=6
-// So we need to convert: JS day 1 (Mon) -> our index 0, JS day 0 (Sun) -> our index 6
-function jsDayToIndex(jsDay: number): number {
-  return jsDay === 0 ? 6 : jsDay - 1;
-}
+const isQuotaStatus = (quota: unknown): quota is QuotaStatus => {
+  return (
+    quota !== null &&
+    typeof quota === 'object' &&
+    'plan_name' in quota &&
+    typeof (quota as QuotaStatus).plan_name === 'string' &&
+    'articles_used' in quota &&
+    typeof (quota as QuotaStatus).articles_used === 'number'
+  );
+};
 
+const isQuotaWithError = (quota: unknown): quota is { error: unknown } => {
+  return quota !== null && typeof quota === 'object' && 'error' in quota;
+};
 
-export default function Schedule() {
+const isStoreWithInstallDate = (store: Store | null): store is StoreWithInstallDate => {
+  return store !== null && typeof store === 'object';
+};
+
+const isStoreWithFrequencySettings = (store: Store | null): store is Store & { frequency_settings: Store['frequency_settings'] } => {
+  return store !== null && typeof store === 'object' && 'frequency_settings' in store;
+};
+
+const extractInstallDate = (store: Store | null): Date | null => {
+  if (!isStoreWithInstallDate(store)) {
+    return null;
+  }
+  const installDateStr = store.installed_at || store.created_at;
+  if (!installDateStr || typeof installDateStr !== 'string') {
+    return null;
+  }
+  const date = new Date(installDateStr);
+  if (isNaN(date.getTime())) {
+    return null;
+  }
+  return date;
+};
+
+const extractFrequencySettings = (store: Store | null): { selectedDays: Set<number>; publishTime: string } => {
+  if (!isStoreWithFrequencySettings(store)) {
+    return { selectedDays: new Set<number>(), publishTime: DEFAULT_PUBLISH_TIME };
+  }
+
+  const settings = store.frequency_settings;
+  const selectedDays = new Set<number>();
+
+  if (settings?.preferredDays && Array.isArray(settings.preferredDays)) {
+    for (const jsDay of settings.preferredDays) {
+      if (validateJsDay(jsDay)) {
+        const index = jsDayToIndex(jsDay);
+        if (validateDayIndex(index)) {
+          selectedDays.add(index);
+        }
+      }
+    }
+  }
+
+  const publishTime = settings?.preferredTimes?.[0] || DEFAULT_PUBLISH_TIME;
+  const parsed = parseTime(publishTime);
+  if (parsed) {
+    return { selectedDays, publishTime: formatTimeString(parsed.hours, parsed.minutes) };
+  }
+
+  return { selectedDays, publishTime: DEFAULT_PUBLISH_TIME };
+};
+
+const calculateScheduledDates = (
+  queueLength: number,
+  selectedDays: Set<number>,
+  publishTime: string,
+  existingDates: Set<string>,
+): Date[] => {
+  if (selectedDays.size === 0 || queueLength === 0) {
+    return [];
+  }
+
+  const parsed = parseTime(publishTime);
+  if (!parsed) {
+    return [];
+  }
+
+  const dates: Date[] = [];
+  const now = new Date();
+  const jsDays = Array.from(selectedDays)
+    .map(dayIndexToJsDay)
+    .filter(validateJsDay)
+    .sort((a, b) => a - b);
+
+  let currentDate = new Date(now);
+  currentDate.setHours(parsed.hours, parsed.minutes, 0, 0);
+
+  if (currentDate <= now) {
+    currentDate.setDate(currentDate.getDate() + 1);
+  }
+
+  let attempts = 0;
+
+  while (dates.length < queueLength && attempts < MAX_ATTEMPTS) {
+    const currentDay = currentDate.getDay();
+    if (jsDays.includes(currentDay)) {
+      const dateStr = currentDate.toISOString();
+      if (!existingDates.has(dateStr)) {
+        dates.push(new Date(currentDate));
+      }
+    }
+    currentDate.setDate(currentDate.getDate() + 1);
+    attempts++;
+  }
+
+  return dates;
+};
+
+const buildQueuePostsAsBlogPosts = (
+  queue: readonly QueuedArticle[],
+  dates: Date[],
+): readonly BlogPostWithQueueMarker[] => {
+  return queue.slice(0, dates.length).map(
+    (article, index): BlogPostWithQueueMarker => ({
+      id: article.id,
+      store_id: article.store_id,
+      title: article.title,
+      content: article.content || '',
+      status: 'queued' as const,
+      published_at: null,
+      scheduled_publish_at: dates[index].toISOString(),
+      seo_health_score: 0,
+      created_at: article.created_at,
+      _isQueueItem: true,
+    }),
+  );
+};
+
+const buildConflictMap = (conflicts: readonly ConflictResponse['conflicts'], dateKey: string): Map<string, readonly ConflictInfo[]> => {
+  if (conflicts.length === 0) {
+    return new Map();
+  }
+
+  const conflictMap = new Map<string, ConflictInfo[]>();
+  conflictMap.set(
+    dateKey,
+    conflicts.map((c) => ({
+      type: c.conflictType,
+      severity: c.severity,
+      message:
+        c.severity === 'high'
+          ? 'High priority conflict detected. Consider rescheduling.'
+          : c.severity === 'medium'
+            ? 'Potential conflict. Review before scheduling.'
+            : 'Minor conflict detected.',
+    })),
+  );
+
+  return conflictMap;
+};
+
+const getConflictMessage = (severity: string): string => {
+  switch (severity) {
+    case 'high':
+      return 'High priority conflict detected. Consider rescheduling.';
+    case 'medium':
+      return 'Potential conflict. Review before scheduling.';
+    default:
+      return 'Minor conflict detected.';
+  }
+};
+
+const truncateTitle = (title: string, maxLength: number): string => {
+  if (title.length <= maxLength) {
+    return title;
+  }
+  return `${title.substring(0, maxLength)}...`;
+};
+
+export default function Schedule(): JSX.Element {
   const navigate = useNavigate();
   const [viewMode, setViewMode] = useState<ViewMode>('month');
   const [currentMonth, setCurrentMonth] = useState(new Date().getMonth());
   const [currentYear, setCurrentYear] = useState(new Date().getFullYear());
   const [weekStart, setWeekStart] = useState(() => getWeekStart(new Date()));
-  const [selectedDays, setSelectedDays] = useState<Set<number>>(new Set([0, 2, 4])); // Mon=0, Wed=2, Fri=4
-  const [publishTime, setPublishTime] = useState('14:00');
+  const [selectedDays, setSelectedDays] = useState<Set<number>>(new Set([0, 2, 4]));
+  const [publishTime, setPublishTime] = useState(DEFAULT_PUBLISH_TIME);
   const [isSaving, setIsSaving] = useState(false);
   const [selectedDate, setSelectedDate] = useState<Date | null>(null);
   const [showScheduleModal, setShowScheduleModal] = useState(false);
   const [selectedPostForSchedule, setSelectedPostForSchedule] = useState<BlogPost | null>(null);
-  const [modalPublishTime, setModalPublishTime] = useState('14:00');
-  const [conflicts, setConflicts] = useState<Map<string, Array<{ type: string; severity: string; message: string }>>>(new Map());
+  const [modalPublishTime, setModalPublishTime] = useState(DEFAULT_PUBLISH_TIME);
+  const [conflicts, setConflicts] = useState<Map<string, readonly ConflictInfo[]>>(new Map());
   const [checkingConflicts, setCheckingConflicts] = useState(false);
   const [dayValidationError, setDayValidationError] = useState<string | null>(null);
+  const isMountedRef = useRef(true);
   const queryClient = useQueryClient();
   const { showToast } = useAppBridgeToast();
 
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
+
   const schedulePostMutation = useMutation({
-    mutationFn: ({ postId, scheduledAt }: { postId: string; scheduledAt: string }) =>
-      postsApi.schedule(postId, scheduledAt),
+    mutationFn: ({ postId, scheduledAt }: { postId: string; scheduledAt: string }) => postsApi.schedule(postId, scheduledAt),
     onSuccess: () => {
-      // Invalidate all post queries to update Dashboard and Articles pages
+      if (!isMountedRef.current) {
+        return;
+      }
       queryClient.invalidateQueries({ queryKey: ['posts'] });
-      // Also invalidate store cache to update Dashboard schedule display
       if (shopDomain) {
         queryClient.invalidateQueries({ queryKey: queryKeys.store(shopDomain) });
       }
       setShowScheduleModal(false);
       setSelectedPostForSchedule(null);
       setSelectedDate(null);
-      setModalPublishTime(publishTime); // Reset to default
+      setModalPublishTime(publishTime);
       showToast('Article scheduled successfully', { isError: false });
     },
     onError: (error) => {
-      console.error('Failed to schedule article:', error);
+      if (!isMountedRef.current) {
+        return;
+      }
       const errorMessage = formatAPIErrorMessage(error, { action: 'schedule article', resource: 'article' });
       showToast(errorMessage, { isError: true });
     },
   });
 
-  const handleError = useCallback((error: Error) => {
-    console.error('[Schedule] Error:', error);
-  }, []);
+  const handleError = useCallback(
+    (error: unknown) => {
+      if (!isMountedRef.current) {
+        return;
+      }
+      const errorMessage = formatAPIErrorMessage(error, { action: 'load schedule', resource: 'schedule' });
+    },
+    [],
+  );
 
   const shopDomain = useMemo(() => getShopDomain(), []);
 
@@ -285,29 +545,23 @@ export default function Schedule() {
     refetch: refetchStore,
   } = useStore(shopDomain ?? '');
 
-  const storeId = (store as { id?: string } | null)?.id ?? '';
+  const storeId = useMemo(() => store?.id ?? '', [store?.id]);
 
-  // Get install date (installed_at or created_at)
-  const installDate = useMemo(() => {
-    if (!store) return null;
-    const storeData = store as { installed_at?: string; created_at?: string } | null;
-    const installDateStr = storeData?.installed_at || storeData?.created_at;
-    if (!installDateStr) return null;
-    return new Date(installDateStr);
-  }, [store]);
+  const installDate = useMemo(() => extractInstallDate(store), [store]);
 
-  // Calculate min and max dates for calendar
   const minDate = useMemo(() => {
-    if (!installDate) return null;
+    if (!installDate) {
+      return null;
+    }
     const min = new Date(installDate);
-    min.setDate(1); // Start of month
+    min.setDate(1);
     min.setHours(0, 0, 0, 0);
     return min;
   }, [installDate]);
 
   const maxDate = useMemo(() => {
     const now = new Date();
-    const max = new Date(now.getFullYear(), now.getMonth() + 12, 0); // Last day of month +12 months
+    const max = new Date(now.getFullYear(), now.getMonth() + MONTHS_IN_YEAR, 0);
     max.setHours(23, 59, 59, 999);
     return max;
   }, []);
@@ -318,8 +572,10 @@ export default function Schedule() {
   } = useQuotaStatus(storeId);
 
   const planName = useMemo(() => {
-    if (!quota || typeof quota !== 'object' || 'error' in quota) return null;
-    return (quota as { plan_name?: string }).plan_name || null;
+    if (!isQuotaStatus(quota)) {
+      return null;
+    }
+    return quota.plan_name || null;
   }, [quota]);
 
   const planFrequencyConfig = useMemo(() => getPlanFrequencyConfig(planName), [planName]);
@@ -331,15 +587,14 @@ export default function Schedule() {
     refetch: refetchPosts,
   } = usePosts(storeId);
 
-  // Fetch queue articles
   const {
     data: queue = [],
     isLoading: queueLoading,
   } = useQuery({
-    queryKey: ['queue', storeId],
+    queryKey: ['queue', storeId] as const,
     queryFn: () => queueApi.getQueue(storeId),
     enabled: !!storeId,
-    refetchInterval: 30000,
+    refetchInterval: QUEUE_REFETCH_INTERVAL,
   });
 
   const scheduledPosts = useMemo(() => {
@@ -350,68 +605,31 @@ export default function Schedule() {
     return allPosts.filter((p) => p.status === 'published' && p.published_at);
   }, [allPosts]);
 
-  // Convert queue items to BlogPost-like format with calculated scheduled dates
-  const queuePostsAsBlogPosts = useMemo(() => {
-    if (!selectedDays || selectedDays.size === 0 || queue.length === 0) return [];
-    
-    // Convert our day index (Mon=0, ..., Sun=6) to JS Date.getDay() format (Sun=0, Mon=1, ..., Sat=6)
-    const dayIndexToJsDay = (index: number): number => index === 6 ? 0 : index + 1;
-    
-    // Get existing scheduled/published dates to avoid conflicts
-    const existingDates = new Set(
+  const existingDates = useMemo(() => {
+    return new Set(
       [...scheduledPosts, ...publishedPosts]
         .map((p) => {
           const date = p.published_at || p.scheduled_publish_at;
-          if (!date) return null;
+          if (!date) {
+            return null;
+          }
           const d = new Date(date);
+          if (isNaN(d.getTime())) {
+            return null;
+          }
           return d.toISOString();
         })
-        .filter((d): d is string => d !== null)
+        .filter((d): d is string => d !== null),
     );
-    
-    // Calculate scheduled dates for queue items, avoiding conflicts
-    const dates: Date[] = [];
-    const now = new Date();
-    const [hours, minutes] = publishTime.split(':').map(Number);
-    const jsDays = Array.from(selectedDays).map(dayIndexToJsDay).sort((a, b) => a - b);
-    
-    let currentDate = new Date(now);
-    currentDate.setHours(hours, minutes, 0, 0);
-    
-    if (currentDate <= now) {
-      currentDate.setDate(currentDate.getDate() + 1);
-    }
-    
-    let attempts = 0;
-    const maxAttempts = 200; // Increased to allow skipping conflicts
-    
-    while (dates.length < queue.length && attempts < maxAttempts) {
-      const currentDay = currentDate.getDay();
-      if (jsDays.includes(currentDay)) {
-        const dateStr = currentDate.toISOString();
-        // Skip if this time slot is already taken
-        if (!existingDates.has(dateStr)) {
-          dates.push(new Date(currentDate));
-        }
-      }
-      currentDate.setDate(currentDate.getDate() + 1);
-      attempts++;
-    }
-    
-    // Convert queue items to BlogPost format with a special marker
-    return queue.slice(0, dates.length).map((article, index): BlogPost & { _isQueueItem?: boolean } => ({
-      id: article.id,
-      store_id: article.store_id,
-      title: article.title,
-      content: article.content || '',
-      status: 'queued' as const,
-      published_at: null,
-      scheduled_publish_at: dates[index].toISOString(),
-      seo_health_score: 0,
-      created_at: article.created_at,
-      _isQueueItem: true,
-    }));
-  }, [queue, selectedDays, publishTime, scheduledPosts, publishedPosts]);
+  }, [scheduledPosts, publishedPosts]);
+
+  const scheduledDates = useMemo(() => {
+    return calculateScheduledDates(queue.length, selectedDays, publishTime, existingDates);
+  }, [queue.length, selectedDays, publishTime, existingDates]);
+
+  const queuePostsAsBlogPosts = useMemo(() => {
+    return buildQueuePostsAsBlogPosts(queue, scheduledDates);
+  }, [queue, scheduledDates]);
 
   const allRelevantPosts = useMemo(() => {
     return [...scheduledPosts, ...publishedPosts, ...queuePostsAsBlogPosts];
@@ -438,124 +656,125 @@ export default function Schedule() {
       .sort((a, b) => {
         const dateA = new Date(a.published_at || a.scheduled_publish_at!);
         const dateB = new Date(b.published_at || b.scheduled_publish_at!);
-        return dateB.getTime() - dateA.getTime(); // Most recent first
+        return dateB.getTime() - dateA.getTime();
       });
   }, [allRelevantPosts]);
 
-
-  // Initialize calendar to install date if current date is before it
   useEffect(() => {
-    if (minDate) {
-      const currentDate = new Date(currentYear, currentMonth, 1);
-      if (currentDate < minDate) {
-        setCurrentYear(minDate.getFullYear());
-        setCurrentMonth(minDate.getMonth());
-        setWeekStart(getWeekStart(minDate));
-      }
+    if (!minDate) {
+      return;
     }
-  }, [minDate]); // Only run when minDate changes (when store loads)
+    const currentDate = new Date(currentYear, currentMonth, 1);
+    if (currentDate < minDate) {
+      setCurrentYear(minDate.getFullYear());
+      setCurrentMonth(minDate.getMonth());
+      setWeekStart(getWeekStart(minDate));
+    }
+  }, [minDate, currentYear, currentMonth]);
 
-  // Load schedule settings from store
   useEffect(() => {
-    if (!store) return;
-    
-    const settings = (store as { frequency_settings?: unknown }).frequency_settings as {
-      interval?: string;
-      count?: number;
-      preferredDays?: number[];
-      preferredTimes?: string[];
-    } | null | undefined;
-    
-    if (settings) {
-      if (settings.preferredDays) {
-        // Convert JS day format (Sun=0, Mon=1, ..., Sat=6) to our index format (Mon=0, ..., Sun=6)
-        const ourIndices = settings.preferredDays.map((jsDay) => jsDayToIndex(jsDay));
-        const newSelectedDays = new Set(ourIndices);
-        
-        // Validate against plan limits
-        const validation = validateSelectedDays(newSelectedDays, planName);
-        if (validation.valid) {
-          setSelectedDays(newSelectedDays);
-          setDayValidationError(null);
-        } else {
-          // If saved days don't match plan, use plan defaults
-          const defaultDays = new Set<number>();
-          for (let i = 0; i < Math.min(planFrequencyConfig.maxDays, 7); i++) {
-            defaultDays.add(i);
-          }
-          setSelectedDays(defaultDays);
-          setDayValidationError(validation.error || null);
+    if (!store) {
+      return;
+    }
+
+    const { selectedDays: extractedDays, publishTime: extractedTime } = extractFrequencySettings(store);
+
+    if (extractedDays.size > 0) {
+      const validation = validateSelectedDays(extractedDays, planName);
+      if (validation.valid) {
+        setSelectedDays(extractedDays);
+        setDayValidationError(null);
+      } else {
+        const defaultDays = new Set<number>();
+        for (let i = 0; i < Math.min(planFrequencyConfig.maxDays, JS_DAYS_IN_WEEK); i++) {
+          defaultDays.add(i);
         }
-      }
-      
-      if (settings.preferredTimes?.[0]) {
-        const time = settings.preferredTimes[0];
-        const [hours, minutes] = time.split(':').map(Number);
-        setPublishTime(`${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`);
+        setSelectedDays(defaultDays);
+        setDayValidationError(validation.error || null);
       }
     }
-    
-  }, [store, storeId, planName, planFrequencyConfig]);
-  
-  // Check for conflicts when date is selected
+
+    if (extractedTime !== DEFAULT_PUBLISH_TIME) {
+      setPublishTime(extractedTime);
+    }
+  }, [store, planName, planFrequencyConfig]);
+
   useEffect(() => {
-    if (!selectedDate || !storeId || !selectedPostForSchedule) return;
-    
+    if (!selectedDate || !storeId || !selectedPostForSchedule) {
+      return;
+    }
+
+    let cancelled = false;
+
     const checkConflicts = async () => {
+      if (!isMountedRef.current || cancelled) {
+        return;
+      }
+
       setCheckingConflicts(true);
       try {
-        const [hours, minutes] = modalPublishTime.split(':').map(Number);
+        const parsed = parseTime(modalPublishTime);
+        if (!parsed) {
+          if (isMountedRef.current && !cancelled) {
+            setCheckingConflicts(false);
+          }
+          return;
+        }
+
         const scheduledDateTime = new Date(selectedDate);
-        scheduledDateTime.setHours(hours, minutes, 0, 0);
-        
-        // Call conflict detection API
+        scheduledDateTime.setHours(parsed.hours, parsed.minutes, 0, 0);
+
         try {
-          const data = await postsApi.checkScheduleConflicts(
-            storeId,
-            selectedPostForSchedule.id,
-            scheduledDateTime.toISOString()
-          );
-          
+          const data = await postsApi.checkScheduleConflicts(storeId, selectedPostForSchedule.id, scheduledDateTime.toISOString());
+
+          if (!isMountedRef.current || cancelled) {
+            return;
+          }
+
           if (data.conflicts && data.conflicts.length > 0) {
-            const conflictMap = new Map<string, Array<{ type: string; severity: string; message: string }>>();
             const dateKey = selectedDate.toISOString().split('T')[0];
-            conflictMap.set(dateKey, data.conflicts.map((c) => ({
-              type: c.conflictType,
-              severity: c.severity,
-              message: c.severity === 'high' 
-                ? 'High priority conflict detected. Consider rescheduling.'
-                : c.severity === 'medium'
-                ? 'Potential conflict. Review before scheduling.'
-                : 'Minor conflict detected.',
-            })));
+            const conflictMap = buildConflictMap(data.conflicts, dateKey);
             setConflicts(conflictMap);
           } else {
             setConflicts(new Map());
           }
         } catch (error) {
-          console.error('Failed to check conflicts:', error);
+          if (!isMountedRef.current || cancelled) {
+            return;
+          }
+          const errorMessage = formatAPIErrorMessage(error, { action: 'check conflicts', resource: 'schedule' });
+          showToast(errorMessage, { isError: true });
           setConflicts(new Map());
         }
       } catch (error) {
-        console.error('Failed to check conflicts:', error);
+        if (!isMountedRef.current || cancelled) {
+          return;
+        }
+        const errorMessage = formatAPIErrorMessage(error, { action: 'check conflicts', resource: 'schedule' });
+        showToast(errorMessage, { isError: true });
       } finally {
-        setCheckingConflicts(false);
+        if (isMountedRef.current && !cancelled) {
+          setCheckingConflicts(false);
+        }
       }
     };
-    
+
     checkConflicts();
-  }, [selectedDate, modalPublishTime, storeId, selectedPostForSchedule]);
+
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedDate, modalPublishTime, storeId, selectedPostForSchedule, showToast]);
 
   const handlePreviousMonth = useCallback(() => {
     setCurrentMonth((prev) => {
       if (prev === 0) {
         const newYear = currentYear - 1;
         const newMonth = 11;
-        // Check if new date is before min date
         if (minDate) {
           const newDate = new Date(newYear, newMonth, 1);
           if (newDate < minDate) {
-            return prev; // Don't allow going before install date
+            return prev;
           }
         }
         setCurrentYear(newYear);
@@ -570,11 +789,10 @@ export default function Schedule() {
       if (prev === 11) {
         const newYear = currentYear + 1;
         const newMonth = 0;
-        // Check if new date is after max date
         if (maxDate) {
           const newDate = new Date(newYear, newMonth, 1);
           if (newDate > maxDate) {
-            return prev; // Don't allow going beyond +12 months
+            return prev;
           }
         }
         setCurrentYear(newYear);
@@ -594,10 +812,9 @@ export default function Schedule() {
   const handlePreviousWeek = useCallback(() => {
     setWeekStart((prev) => {
       const newDate = new Date(prev);
-      newDate.setDate(newDate.getDate() - 7);
-      // Check if new date is before min date
+      newDate.setDate(newDate.getDate() - DAYS_IN_WEEK);
       if (minDate && newDate < minDate) {
-        return prev; // Don't allow going before install date
+        return prev;
       }
       return newDate;
     });
@@ -606,139 +823,181 @@ export default function Schedule() {
   const handleNextWeek = useCallback(() => {
     setWeekStart((prev) => {
       const newDate = new Date(prev);
-      newDate.setDate(newDate.getDate() + 7);
-      // Check if new date is before min date or after max date
+      newDate.setDate(newDate.getDate() + DAYS_IN_WEEK);
       if (minDate && newDate < minDate) {
-        return prev; // Don't allow going before install date
+        return prev;
       }
       if (maxDate) {
         const weekEnd = new Date(newDate);
         weekEnd.setDate(weekEnd.getDate() + 6);
         if (weekEnd > maxDate) {
-          return prev; // Don't allow going beyond +12 months
+          return prev;
         }
       }
       return newDate;
     });
   }, [maxDate, minDate]);
 
-  const handleDayToggle = useCallback((dayIndex: number) => {
-    setSelectedDays((prev) => {
-      const next = new Set(prev);
-      if (next.has(dayIndex)) {
-        next.delete(dayIndex);
-      } else {
-        // Check if adding this day would exceed the limit
-        if (next.size >= planFrequencyConfig.maxDays) {
-          setDayValidationError(
-            `You can only select up to ${planFrequencyConfig.maxDays} day${planFrequencyConfig.maxDays > 1 ? 's' : ''} for your plan (${planFrequencyConfig.displayName})`
-          );
-          return prev; // Don't add the day
+  const handleDayToggle = useCallback(
+    (dayIndex: number) => {
+      if (!validateDayIndex(dayIndex)) {
+        return;
+      }
+
+      setSelectedDays((prev) => {
+        const next = new Set(prev);
+        if (next.has(dayIndex)) {
+          next.delete(dayIndex);
+        } else {
+          if (next.size >= planFrequencyConfig.maxDays) {
+            setDayValidationError(
+              `You can only select up to ${planFrequencyConfig.maxDays} day${planFrequencyConfig.maxDays > 1 ? 's' : ''} for your plan (${planFrequencyConfig.displayName})`,
+            );
+            return prev;
+          }
+          next.add(dayIndex);
         }
-        next.add(dayIndex);
-      }
-      
-      // Validate the new selection
-      const validation = validateSelectedDays(next, planName);
-      if (validation.valid) {
-        setDayValidationError(null);
-      } else {
-        setDayValidationError(validation.error || null);
-      }
-      
-      return next;
-    });
-  }, [planName, planFrequencyConfig]);
+
+        const validation = validateSelectedDays(next, planName);
+        if (validation.valid) {
+          setDayValidationError(null);
+        } else {
+          setDayValidationError(validation.error || null);
+        }
+
+        return next;
+      });
+    },
+    [planName, planFrequencyConfig],
+  );
 
   const handleSaveSettings = useCallback(async () => {
-    if (!storeId) return;
-    
-    // Validate days before saving
+    if (!storeId) {
+      return;
+    }
+
     const validation = validateSelectedDays(selectedDays, planName);
     if (!validation.valid) {
       setDayValidationError(validation.error || 'Invalid day selection');
       return;
     }
-    
+
+    if (!isMountedRef.current) {
+      return;
+    }
+
     setIsSaving(true);
     setDayValidationError(null);
-    
+
     try {
-      const [hours, minutes] = publishTime.split(':').map(Number);
-      const timeString = `${hours}:${minutes.toString().padStart(2, '0')}`;
-      
-      // Get frequency settings based on plan (without timezone)
+      const parsed = parseTime(publishTime);
+      if (!parsed) {
+        throw new Error('Invalid time format');
+      }
+
+      const timeString = formatTimeString(parsed.hours, parsed.minutes);
       const frequencySettings = getFrequencySettings(planName, selectedDays, [timeString]);
-      
-      // Update store frequency_settings via Supabase
-      const { error: updateError } = await supabase
-        .from('stores')
-        .update({ 
-          frequency_settings: frequencySettings,
-        })
-        .eq('id', storeId);
-      
+
+      const { error: updateError } = await supabase.from('stores').update({ frequency_settings: frequencySettings }).eq('id', storeId);
+
       if (updateError) {
         throw new Error(updateError.message);
       }
-      
-      // Invalidate store cache so Dashboard and other pages get updated data
+
+      if (!isMountedRef.current) {
+        return;
+      }
+
       queryClient.invalidateQueries({ queryKey: queryKeys.store(shopDomain ?? '') });
       await refetchStore();
-      
+
       showToast('Schedule settings saved successfully', { isError: false });
     } catch (error) {
-      console.error('[Schedule] Failed to save settings:', error);
+      if (!isMountedRef.current) {
+        return;
+      }
       const errorMessage = formatAPIErrorMessage(error, { action: 'save schedule settings', resource: 'schedule' });
-      handleError(error instanceof Error ? error : new Error(errorMessage));
       showToast(errorMessage, { isError: true });
     } finally {
-      setIsSaving(false);
+      if (isMountedRef.current) {
+        setIsSaving(false);
+      }
     }
-  }, [storeId, planName, selectedDays, publishTime, refetchStore, handleError, shopDomain, queryClient, showToast]);
+  }, [storeId, planName, selectedDays, publishTime, refetchStore, shopDomain, queryClient, showToast]);
 
   const handlePostClick = useCallback(() => {
     navigate('/posts');
   }, [navigate]);
 
-  const handleDayClick = useCallback((date: Date) => {
-    setSelectedDate(date);
-    setModalPublishTime(publishTime); // Initialize modal time with current publishTime
-    // Find draft posts that can be scheduled
-    const draftPosts = allPosts.filter((p) => p.status === 'draft');
-    if (draftPosts.length > 0) {
-      setSelectedPostForSchedule(draftPosts[0]);
-      setShowScheduleModal(true);
-    } else {
-      // Show message that no draft posts are available
-      showToast('No articles are available to schedule right now. Articles are automatically generated based on your publishing schedule.', { isError: false });
-    }
-  }, [allPosts, showToast, publishTime]);
+  const handleDayClick = useCallback(
+    (date: Date) => {
+      setSelectedDate(date);
+      setModalPublishTime(publishTime);
+      const draftPosts = allPosts.filter((p) => p.status === 'draft');
+      if (draftPosts.length > 0) {
+        setSelectedPostForSchedule(draftPosts[0]);
+        setShowScheduleModal(true);
+      } else {
+        showToast('No articles are available to schedule right now. Articles are automatically generated based on your publishing schedule.', {
+          isError: false,
+        });
+      }
+    },
+    [allPosts, showToast, publishTime],
+  );
 
   const handleSchedulePost = useCallback(async () => {
-    if (!selectedPostForSchedule || !selectedDate) return;
+    if (!selectedPostForSchedule || !selectedDate) {
+      return;
+    }
 
-    const [hours, minutes] = modalPublishTime.split(':').map(Number);
+    const parsed = parseTime(modalPublishTime);
+    if (!parsed) {
+      showToast('Invalid time format', { isError: true });
+      return;
+    }
+
     const scheduledDateTime = new Date(selectedDate);
-    scheduledDateTime.setHours(hours, minutes, 0, 0);
+    scheduledDateTime.setHours(parsed.hours, parsed.minutes, 0, 0);
 
-    // Check for conflicts before scheduling
     const dateKey = selectedDate.toISOString().split('T')[0];
     const dayConflicts = conflicts.get(dateKey);
     const hasHighConflict = dayConflicts?.some((c) => c.severity === 'high');
-    
+
     if (hasHighConflict) {
-      const proceed = confirm(
-        'High priority conflict detected for this time slot. Do you want to schedule anyway?'
-      );
-      if (!proceed) return;
+      const proceed = window.confirm('High priority conflict detected for this time slot. Do you want to schedule anyway?');
+      if (!proceed) {
+        return;
+      }
     }
 
     schedulePostMutation.mutate({
       postId: selectedPostForSchedule.id,
       scheduledAt: scheduledDateTime.toISOString(),
     });
-  }, [selectedPostForSchedule, selectedDate, modalPublishTime, schedulePostMutation, conflicts]);
+  }, [selectedPostForSchedule, selectedDate, modalPublishTime, schedulePostMutation, conflicts, showToast]);
+
+  const handleCloseScheduleModal = useCallback(() => {
+    setShowScheduleModal(false);
+    setSelectedPostForSchedule(null);
+    setSelectedDate(null);
+    setModalPublishTime(publishTime);
+  }, [publishTime]);
+
+  const handleViewModeChange = useCallback((mode: ViewMode) => {
+    setViewMode(mode);
+  }, []);
+
+  const handleReload = useCallback(() => {
+    if (typeof window !== 'undefined') {
+      window.location.reload();
+    }
+  }, []);
+
+  const handleRetry = useCallback(() => {
+    refetchStore();
+    refetchPosts();
+  }, [refetchStore, refetchPosts]);
 
   const monthName = useMemo(() => {
     return new Date(currentYear, currentMonth).toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
@@ -748,10 +1007,6 @@ export default function Schedule() {
     return `Week of ${weekStart.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}`;
   }, [weekStart]);
 
-  const dayNames = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
-  const dayLabels = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
-
-  // Loading state
   if (isLoading) {
     return (
       <div className="h-screen overflow-hidden bg-gray-50">
@@ -785,7 +1040,6 @@ export default function Schedule() {
     );
   }
 
-  // Error state
   if (isError && error && !store) {
     return (
       <div className="h-screen overflow-hidden bg-gray-50">
@@ -793,22 +1047,19 @@ export default function Schedule() {
           <div className="p-4 sm:p-6 lg:p-8">
             <div className="bg-red-50 border border-red-200 rounded-xl p-6 max-w-2xl mx-auto">
               <h2 className="text-lg font-semibold text-red-900 mb-2">Setup Required</h2>
-              <p className="text-sm text-red-700 mb-4">
-                {formatAPIErrorMessage(error, { action: 'load schedule', resource: 'schedule' })}
-              </p>
+              <p className="text-sm text-red-700 mb-4">{formatAPIErrorMessage(error, { action: 'load schedule', resource: 'schedule' })}</p>
               <div className="flex gap-3">
                 <button
-                  onClick={() => window.location.reload()}
+                  onClick={handleReload}
                   className="px-4 py-2 bg-red-600 text-white rounded-lg text-sm font-medium hover:bg-red-700 transition-colors"
+                  type="button"
                 >
                   Refresh Page
                 </button>
                 <button
-                  onClick={() => {
-                    refetchStore();
-                    refetchPosts();
-                  }}
+                  onClick={handleRetry}
                   className="px-4 py-2 border border-red-300 text-red-600 rounded-lg text-sm font-medium hover:bg-red-50 transition-colors"
+                  type="button"
                 >
                   Retry
                 </button>
@@ -829,6 +1080,7 @@ export default function Schedule() {
               onClick={() => navigate('/dashboard')}
               className="text-gray-600 hover:text-gray-900 transition-colors touch-manipulation focus:outline-none focus:ring-2 focus:ring-purple-500 focus:ring-offset-2 rounded"
               aria-label="Back to dashboard"
+              type="button"
             >
               <svg className="w-5 h-5 sm:w-6 sm:h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 19l-7-7 7-7" />
@@ -843,39 +1095,35 @@ export default function Schedule() {
 
         <div className="p-3 sm:p-4 md:p-5 lg:p-6 xl:p-8">
           <div className="grid grid-cols-1 lg:grid-cols-5 gap-3 sm:gap-4 md:gap-5 lg:gap-6">
-            {/* Calendar View */}
             <div className="lg:col-span-3 bg-white rounded-xl border border-gray-200 shadow-sm min-w-0">
               <div className="p-3 sm:p-4 md:p-5 lg:p-6 border-b border-gray-200">
                 <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 sm:gap-3 md:gap-4">
                   <h2 className="text-sm sm:text-base md:text-lg font-semibold text-gray-900">Calendar View</h2>
                   <div className="flex items-center gap-1.5 sm:gap-2">
                     <button
-                      onClick={() => setViewMode('month')}
+                      onClick={() => handleViewModeChange('month')}
                       className={`px-2.5 sm:px-3 py-1 sm:py-1.5 text-[11px] sm:text-xs md:text-sm font-medium rounded-lg touch-manipulation transition-colors ${
-                        viewMode === 'month'
-                          ? 'bg-purple-600 text-white'
-                          : 'text-gray-600 hover:bg-gray-100'
+                        viewMode === 'month' ? 'bg-purple-600 text-white' : 'text-gray-600 hover:bg-gray-100'
                       }`}
+                      type="button"
                     >
                       Month
                     </button>
                     <button
-                      onClick={() => setViewMode('week')}
+                      onClick={() => handleViewModeChange('week')}
                       className={`px-2.5 sm:px-3 py-1 sm:py-1.5 text-[11px] sm:text-xs md:text-sm font-medium rounded-lg touch-manipulation transition-colors ${
-                        viewMode === 'week'
-                          ? 'bg-purple-600 text-white'
-                          : 'text-gray-600 hover:bg-gray-100'
+                        viewMode === 'week' ? 'bg-purple-600 text-white' : 'text-gray-600 hover:bg-gray-100'
                       }`}
+                      type="button"
                     >
                       Week
                     </button>
                     <button
-                      onClick={() => setViewMode('list')}
+                      onClick={() => handleViewModeChange('list')}
                       className={`px-2.5 sm:px-3 py-1 sm:py-1.5 text-[11px] sm:text-xs md:text-sm font-medium rounded-lg touch-manipulation transition-colors ${
-                        viewMode === 'list'
-                          ? 'bg-purple-600 text-white'
-                          : 'text-gray-600 hover:bg-gray-100'
+                        viewMode === 'list' ? 'bg-purple-600 text-white' : 'text-gray-600 hover:bg-gray-100'
                       }`}
+                      type="button"
                     >
                       List
                     </button>
@@ -883,16 +1131,15 @@ export default function Schedule() {
                 </div>
               </div>
               <div className="p-3 sm:p-4 md:p-5 lg:p-6 overflow-x-auto">
-                {/* Month View */}
                 {viewMode === 'month' && (
                   <div>
-                    {/* Month Navigation */}
                     <div className="mb-3 sm:mb-4 flex items-center justify-between gap-2">
                       <button
                         onClick={handlePreviousMonth}
                         disabled={minDate ? new Date(currentYear, currentMonth, 1) <= minDate : false}
                         className="p-1.5 sm:p-2 hover:bg-gray-100 rounded-lg touch-manipulation transition-colors flex-shrink-0 disabled:opacity-50 disabled:cursor-not-allowed"
                         aria-label="Previous month"
+                        type="button"
                       >
                         <svg className="w-4 h-4 sm:w-5 sm:h-5 text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 19l-7-7 7-7" />
@@ -903,6 +1150,7 @@ export default function Schedule() {
                         <button
                           onClick={handleToday}
                           className="px-2 sm:px-3 py-1 text-[10px] sm:text-xs text-gray-600 hover:text-gray-900 hover:bg-gray-100 rounded-lg touch-manipulation transition-colors whitespace-nowrap flex-shrink-0"
+                          type="button"
                         >
                           Today
                         </button>
@@ -912,6 +1160,7 @@ export default function Schedule() {
                         disabled={maxDate ? new Date(currentYear, currentMonth + 1, 1) > maxDate : false}
                         className="p-1.5 sm:p-2 hover:bg-gray-100 rounded-lg touch-manipulation transition-colors flex-shrink-0 disabled:opacity-50 disabled:cursor-not-allowed"
                         aria-label="Next month"
+                        type="button"
                       >
                         <svg className="w-4 h-4 sm:w-5 sm:h-5 text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 5l7 7-7 7" />
@@ -919,7 +1168,6 @@ export default function Schedule() {
                       </button>
                     </div>
 
-                    {/* Legend */}
                     <div className="mb-3 sm:mb-4 flex flex-wrap items-center gap-2 sm:gap-3 md:gap-4 text-[10px] sm:text-xs">
                       <div className="flex items-center gap-2">
                         <div className="w-3 h-3 rounded bg-green-500 border-2 border-green-600"></div>
@@ -935,16 +1183,14 @@ export default function Schedule() {
                       </div>
                     </div>
 
-                    {/* Day Headers */}
                     <div className="grid grid-cols-7 gap-0.5 sm:gap-1 md:gap-2 mb-1 sm:mb-2">
-                      {dayNames.map((day) => (
+                      {DAY_NAMES.map((day) => (
                         <div key={day} className="text-center text-[10px] sm:text-xs font-semibold text-gray-500 py-1 sm:py-2">
                           {day}
                         </div>
                       ))}
                     </div>
 
-                    {/* Calendar Grid */}
                     <div className="grid grid-cols-7 gap-1 sm:gap-1 md:gap-2 min-w-0">
                       {monthCalendar.map((day, index) => {
                         const hasPublished = day.posts.some((p) => p.status === 'published');
@@ -953,32 +1199,32 @@ export default function Schedule() {
                         const borderColor = hasPublished
                           ? 'border-green-500 bg-green-50'
                           : hasScheduled
-                          ? 'border-purple-500 bg-purple-50'
-                          : hasQueued
-                          ? 'border-blue-500 bg-blue-50'
-                          : day.isToday
-                          ? 'border-orange-500 bg-orange-50'
-                          : 'border-gray-200';
+                            ? 'border-purple-500 bg-purple-50'
+                            : hasQueued
+                              ? 'border-blue-500 bg-blue-50'
+                              : day.isToday
+                                ? 'border-orange-500 bg-orange-50'
+                                : 'border-gray-200';
                         const borderStyle = hasQueued ? 'border-dashed' : '';
                         const textColor = hasPublished
                           ? 'text-green-900'
                           : hasScheduled
-                          ? 'text-purple-900'
-                          : hasQueued
-                          ? 'text-blue-900'
-                          : day.isToday
-                          ? 'text-orange-900'
-                          : 'text-gray-900';
+                            ? 'text-purple-900'
+                            : hasQueued
+                              ? 'text-blue-900'
+                              : day.isToday
+                                ? 'text-orange-900'
+                                : 'text-gray-900';
 
                         const dateKey = day.date.toISOString().split('T')[0];
                         const dayConflicts = conflicts.get(dateKey);
                         const hasConflict = dayConflicts && dayConflicts.length > 0;
                         const hasHighConflict = dayConflicts?.some((c) => c.severity === 'high');
-                        const conflictBorder = hasHighConflict 
-                          ? 'border-red-500 border-dashed' 
-                          : hasConflict 
-                          ? 'border-orange-500 border-dashed' 
-                          : '';
+                        const conflictBorder = hasHighConflict
+                          ? 'border-red-500 border-dashed'
+                          : hasConflict
+                            ? 'border-orange-500 border-dashed'
+                            : '';
 
                         return (
                           <div
@@ -1002,10 +1248,10 @@ export default function Schedule() {
                                     hasPublished
                                       ? 'bg-green-600 text-white'
                                       : hasScheduled
-                                      ? 'bg-purple-600 text-white'
-                                      : hasQueued
-                                      ? 'bg-blue-600 text-white'
-                                      : 'bg-gray-600 text-white'
+                                        ? 'bg-purple-600 text-white'
+                                        : hasQueued
+                                          ? 'bg-blue-600 text-white'
+                                          : 'bg-gray-600 text-white'
                                   }`}
                                 >
                                   {day.posts.length}
@@ -1014,9 +1260,11 @@ export default function Schedule() {
                             </div>
                             {day.posts.length > 0 && (
                               <div className="mt-0.5 sm:mt-1">
-                                <div className={`text-[9px] sm:text-[10px] font-medium ${
-                                  hasPublished ? 'text-green-700' : hasScheduled ? 'text-purple-700' : 'text-blue-700'
-                                }`}>
+                                <div
+                                  className={`text-[9px] sm:text-[10px] font-medium ${
+                                    hasPublished ? 'text-green-700' : hasScheduled ? 'text-purple-700' : 'text-blue-700'
+                                  }`}
+                                >
                                   {formatTime(day.posts[0].scheduledAt)}
                                 </div>
                                 <div
@@ -1024,7 +1272,7 @@ export default function Schedule() {
                                     hasPublished ? 'text-green-600' : hasScheduled ? 'text-purple-600' : 'text-blue-600'
                                   }`}
                                 >
-                                  {day.posts[0].title.length > 20 ? `${day.posts[0].title.substring(0, 20)}...` : day.posts[0].title}
+                                  {truncateTitle(day.posts[0].title, MAX_TITLE_PREVIEW_LENGTH)}
                                 </div>
                               </div>
                             )}
@@ -1032,16 +1280,23 @@ export default function Schedule() {
                               <div className="text-[9px] sm:text-[10px] text-orange-700 font-medium mt-0.5">Today</div>
                             )}
                             {hasConflict && (
-                              <div className={`absolute top-1 right-1 w-1.5 h-1.5 sm:w-2 sm:h-2 rounded-full ${
-                                hasHighConflict ? 'bg-red-500' : 'bg-orange-500'
-                              }`} title={dayConflicts?.map((c) => c.message).join(', ')}></div>
+                              <div
+                                className={`absolute top-1 right-1 w-1.5 h-1.5 sm:w-2 sm:h-2 rounded-full ${
+                                  hasHighConflict ? 'bg-red-500' : 'bg-orange-500'
+                                }`}
+                                title={dayConflicts?.map((c) => c.message).join(', ')}
+                              ></div>
                             )}
-                            {/* Tooltip */}
                             {day.posts.length > 0 && (
                               <div className="absolute z-10 hidden group-hover:block bottom-full left-1/2 transform -translate-x-1/2 mb-2 w-40 sm:w-48 p-2 bg-gray-900 text-white text-[10px] sm:text-xs rounded-lg shadow-xl">
                                 <p className="font-semibold">{day.posts[0].title}</p>
                                 <p className="text-gray-300 mt-1">
-                                  {day.posts[0].status === 'published' ? 'Published' : day.posts[0].status === 'queued' ? 'Queued' : 'Scheduled'} for {formatTime(day.posts[0].scheduledAt)}
+                                  {day.posts[0].status === 'published'
+                                    ? 'Published'
+                                    : day.posts[0].status === 'queued'
+                                      ? 'Queued'
+                                      : 'Scheduled'}{' '}
+                                  for {formatTime(day.posts[0].scheduledAt)}
                                 </p>
                                 <div className="absolute bottom-0 left-1/2 transform -translate-x-1/2 translate-y-full w-0 h-0 border-l-4 border-r-4 border-t-4 border-transparent border-t-gray-900"></div>
                               </div>
@@ -1053,7 +1308,6 @@ export default function Schedule() {
                   </div>
                 )}
 
-                {/* Week View */}
                 {viewMode === 'week' && (
                   <div>
                     <div className="mb-4 flex items-center justify-between">
@@ -1062,6 +1316,7 @@ export default function Schedule() {
                         disabled={minDate ? weekStart <= minDate : false}
                         className="p-2 hover:bg-gray-100 rounded-lg touch-manipulation transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                         aria-label="Previous week"
+                        type="button"
                       >
                         <svg className="w-4 h-4 sm:w-5 sm:h-5 text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 19l-7-7 7-7" />
@@ -1072,19 +1327,25 @@ export default function Schedule() {
                         <button
                           onClick={handleToday}
                           className="px-3 py-1 text-xs text-gray-600 hover:text-gray-900 hover:bg-gray-100 rounded-lg touch-manipulation transition-colors"
+                          type="button"
                         >
                           Today
                         </button>
                       </div>
                       <button
                         onClick={handleNextWeek}
-                        disabled={maxDate ? (() => {
-                          const weekEnd = new Date(weekStart);
-                          weekEnd.setDate(weekEnd.getDate() + 6);
-                          return weekEnd >= maxDate;
-                        })() : false}
+                        disabled={
+                          maxDate
+                            ? (() => {
+                                const weekEnd = new Date(weekStart);
+                                weekEnd.setDate(weekEnd.getDate() + 6);
+                                return weekEnd >= maxDate;
+                              })()
+                            : false
+                        }
                         className="p-2 hover:bg-gray-100 rounded-lg touch-manipulation transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                         aria-label="Next week"
+                        type="button"
                       >
                         <svg className="w-4 h-4 sm:w-5 sm:h-5 text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 5l7 7-7 7" />
@@ -1097,9 +1358,7 @@ export default function Schedule() {
                         return (
                           <div key={day.date.toISOString()} className="text-center py-2 border-b border-gray-200">
                             <p className="text-xs font-semibold text-gray-500">{day.dayName}</p>
-                            <p className={`text-sm font-medium mt-1 ${isToday ? 'text-orange-900' : 'text-gray-900'}`}>
-                              {day.dayNumber}
-                            </p>
+                            <p className={`text-sm font-medium mt-1 ${isToday ? 'text-orange-900' : 'text-gray-900'}`}>{day.dayNumber}</p>
                             {isToday && <p className="text-[10px] text-orange-600 mt-0.5">Today</p>}
                           </div>
                         );
@@ -1111,11 +1370,11 @@ export default function Schedule() {
                           <div
                             key={post.id}
                             className={`p-3 border-l-4 ${
-                              post.status === 'published' 
-                                ? 'bg-green-50 border-green-500' 
+                              post.status === 'published'
+                                ? 'bg-green-50 border-green-500'
                                 : post.status === 'queued'
-                                ? 'bg-blue-50 border-blue-500 border-dashed'
-                                : 'bg-purple-50 border-purple-500'
+                                  ? 'bg-blue-50 border-blue-500 border-dashed'
+                                  : 'bg-purple-50 border-purple-500'
                             } rounded-lg cursor-pointer hover:opacity-80 transition-opacity`}
                             onClick={handlePostClick}
                           >
@@ -1130,21 +1389,20 @@ export default function Schedule() {
                                   post.status === 'published'
                                     ? 'bg-green-100 text-green-800'
                                     : post.status === 'queued'
-                                    ? 'bg-blue-100 text-blue-800'
-                                    : 'bg-purple-100 text-purple-800'
+                                      ? 'bg-blue-100 text-blue-800'
+                                      : 'bg-purple-100 text-purple-800'
                                 }`}
                               >
                                 {post.status === 'published' ? 'Published' : post.status === 'queued' ? 'Queued' : 'Scheduled'}
                               </span>
                             </div>
                           </div>
-                        ))
+                        )),
                       )}
                     </div>
                   </div>
                 )}
 
-                {/* List View */}
                 {viewMode === 'list' && (
                   <div>
                     <div className="mb-4 flex items-center justify-between">
@@ -1159,17 +1417,16 @@ export default function Schedule() {
                         listPosts.map((post) => {
                           const postDate = new Date(post.published_at || post.scheduled_publish_at!);
                           const isPublished = post.status === 'published';
-                          const postWithMarker = post as BlogPost & { _isQueueItem?: boolean };
-                          const isQueued = postWithMarker._isQueueItem;
+                          const isQueued = isBlogPostWithQueueMarker(post) && post._isQueueItem;
                           return (
                             <div
                               key={post.id}
                               className={`p-3 border-l-4 ${
-                                isPublished 
-                                  ? 'bg-green-50 border-green-500' 
+                                isPublished
+                                  ? 'bg-green-50 border-green-500'
                                   : isQueued
-                                  ? 'bg-blue-50 border-blue-500 border-dashed'
-                                  : 'bg-purple-50 border-purple-500'
+                                    ? 'bg-blue-50 border-blue-500 border-dashed'
+                                    : 'bg-purple-50 border-purple-500'
                               } rounded-lg cursor-pointer hover:opacity-80 transition-opacity`}
                               onClick={handlePostClick}
                             >
@@ -1183,11 +1440,11 @@ export default function Schedule() {
                                 </div>
                                 <span
                                   className={`px-2 py-1 text-xs font-medium rounded-full ${
-                                    isPublished 
-                                      ? 'bg-green-100 text-green-800' 
+                                    isPublished
+                                      ? 'bg-green-100 text-green-800'
                                       : isQueued
-                                      ? 'bg-blue-100 text-blue-800'
-                                      : 'bg-purple-100 text-purple-800'
+                                        ? 'bg-blue-100 text-blue-800'
+                                        : 'bg-purple-100 text-purple-800'
                                   }`}
                                 >
                                   {isPublished ? 'Published' : isQueued ? 'Queued' : 'Scheduled'}
@@ -1203,23 +1460,15 @@ export default function Schedule() {
               </div>
             </div>
 
-            {/* Sidebar */}
             <div className="lg:col-span-2 space-y-3 sm:space-y-4 md:space-y-5 lg:space-y-6 min-w-0">
-              {/* Articles Queue */}
               {storeId && (
                 <div className="bg-white rounded-xl border border-gray-200 shadow-sm">
                   <div className="p-3 sm:p-4 md:p-5 lg:p-6">
-                    <ArticlesQueue 
-                      storeId={storeId} 
-                      showTitle={true} 
-                      selectedDays={selectedDays}
-                      publishTime={publishTime}
-                    />
+                    <ArticlesQueue storeId={storeId} showTitle={true} selectedDays={selectedDays} publishTime={publishTime} />
                   </div>
                 </div>
               )}
 
-              {/* Schedule Settings */}
               <div className="bg-white rounded-xl border border-gray-200 shadow-sm">
                 <div className="p-3 sm:p-4 md:p-5 lg:p-6 border-b border-gray-200">
                   <h2 className="text-sm sm:text-base md:text-lg font-semibold text-gray-900">Schedule Settings</h2>
@@ -1229,14 +1478,14 @@ export default function Schedule() {
                     <div>
                       <label className="flex items-center gap-2 text-xs sm:text-sm font-medium text-gray-700 mb-2">
                         Publishing Frequency
-                        <HelpIcon content={`Your plan allows ${planFrequencyConfig.maxDays} article${planFrequencyConfig.maxDays > 1 ? 's' : ''} per ${planFrequencyConfig.displayName.toLowerCase()}. You can choose which days to publish within this limit.`} />
+                        <HelpIcon
+                          content={`Your plan allows ${planFrequencyConfig.maxDays} article${planFrequencyConfig.maxDays > 1 ? 's' : ''} per ${planFrequencyConfig.displayName.toLowerCase()}. You can choose which days to publish within this limit.`}
+                        />
                       </label>
                       <div className="w-full px-3 py-2.5 sm:py-2 border border-gray-200 bg-gray-50 rounded-lg text-sm text-gray-700">
                         {planFrequencyConfig.displayName}
                       </div>
-                      <p className="text-xs text-gray-500 mt-1">
-                        Frequency is determined by your plan. You can select which days to publish.
-                      </p>
+                      <p className="text-xs text-gray-500 mt-1">Frequency is determined by your plan. You can select which days to publish.</p>
                     </div>
                     <div>
                       <label className="flex items-center gap-2 text-xs sm:text-sm font-medium text-gray-700 mb-2">
@@ -1244,18 +1493,17 @@ export default function Schedule() {
                         <span className="ml-1 text-gray-500 font-normal">
                           ({selectedDays.size} of {planFrequencyConfig.maxDays} selected)
                         </span>
-                        <HelpIcon content={`Select which days of the week you want articles to publish. Your plan allows up to ${planFrequencyConfig.maxDays} day${planFrequencyConfig.maxDays > 1 ? 's' : ''} per ${planFrequencyConfig.displayName.toLowerCase()}.`} />
+                        <HelpIcon
+                          content={`Select which days of the week you want articles to publish. Your plan allows up to ${planFrequencyConfig.maxDays} day${planFrequencyConfig.maxDays > 1 ? 's' : ''} per ${planFrequencyConfig.displayName.toLowerCase()}.`}
+                        />
                       </label>
                       <div className="space-y-2">
-                        {dayLabels.map((label, index) => {
-                          // index is 0-6 where 0=Monday, 6=Sunday
+                        {DAY_LABELS.map((label, index) => {
                           const isDisabled = !selectedDays.has(index) && selectedDays.size >= planFrequencyConfig.maxDays;
                           return (
-                            <label 
-                              key={index} 
-                              className={`flex items-center touch-manipulation ${
-                                isDisabled ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'
-                              }`}
+                            <label
+                              key={index}
+                              className={`flex items-center touch-manipulation ${isDisabled ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'}`}
                             >
                               <input
                                 type="checkbox"
@@ -1270,9 +1518,7 @@ export default function Schedule() {
                         })}
                       </div>
                       {dayValidationError && (
-                        <div className="mt-2 p-2 bg-red-50 border border-red-200 rounded text-xs text-red-700">
-                          {dayValidationError}
-                        </div>
+                        <div className="mt-2 p-2 bg-red-50 border border-red-200 rounded text-xs text-red-700">{dayValidationError}</div>
                       )}
                       {!dayValidationError && selectedDays.size < planFrequencyConfig.minDays && (
                         <div className="mt-2 p-2 bg-yellow-50 border border-yellow-200 rounded text-xs text-yellow-700">
@@ -1297,18 +1543,17 @@ export default function Schedule() {
                       onClick={handleSaveSettings}
                       disabled={isSaving}
                       className="w-full py-2.5 sm:py-2 bg-purple-600 text-white rounded-lg text-sm sm:text-base font-medium hover:bg-purple-700 transition-colors touch-manipulation disabled:opacity-50 disabled:cursor-not-allowed"
+                      type="button"
                     >
                       {isSaving ? 'Saving...' : 'Save Changes'}
                     </button>
                   </div>
                 </div>
               </div>
-
             </div>
           </div>
         </div>
 
-        {/* Schedule Article Modal */}
         {showScheduleModal && selectedPostForSchedule && selectedDate && (
           <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-2 sm:p-4">
             <div className="bg-white rounded-xl shadow-xl max-w-md w-full max-h-[95vh] sm:max-h-[90vh] overflow-y-auto m-2 sm:m-0 p-4 sm:p-6">
@@ -1336,18 +1581,17 @@ export default function Schedule() {
                     className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-purple-500 focus:border-purple-500 outline-none"
                   />
                 </div>
-                {selectedDate && checkingConflicts && (
-                  <div className="text-xs text-gray-500">Checking for conflicts...</div>
-                )}
+                {selectedDate && checkingConflicts && <div className="text-xs text-gray-500">Checking for conflicts...</div>}
                 {selectedDate && conflicts.has(selectedDate.toISOString().split('T')[0]) && (
                   <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-3">
                     <p className="text-xs font-semibold text-yellow-900 mb-1">Conflict Detected</p>
                     {conflicts.get(selectedDate.toISOString().split('T')[0])?.map((conflict, idx) => (
-                      <p key={idx} className={`text-xs ${
-                        conflict.severity === 'high' ? 'text-red-700' : 
-                        conflict.severity === 'medium' ? 'text-orange-700' : 
-                        'text-yellow-700'
-                      }`}>
+                      <p
+                        key={idx}
+                        className={`text-xs ${
+                          conflict.severity === 'high' ? 'text-red-700' : conflict.severity === 'medium' ? 'text-orange-700' : 'text-yellow-700'
+                        }`}
+                      >
                         {conflict.message}
                       </p>
                     ))}
@@ -1355,13 +1599,9 @@ export default function Schedule() {
                 )}
                 <div className="flex flex-col sm:flex-row gap-2 sm:gap-3 pt-4">
                   <button
-                    onClick={() => {
-                      setShowScheduleModal(false);
-                      setSelectedPostForSchedule(null);
-                      setSelectedDate(null);
-                      setModalPublishTime(publishTime); // Reset to default
-                    }}
+                    onClick={handleCloseScheduleModal}
                     className="flex-1 px-3 sm:px-4 py-2 border border-gray-300 text-gray-700 rounded-lg text-sm font-medium hover:bg-gray-50 transition-colors touch-manipulation"
+                    type="button"
                   >
                     Cancel
                   </button>
@@ -1369,6 +1609,7 @@ export default function Schedule() {
                     onClick={handleSchedulePost}
                     disabled={schedulePostMutation.isPending}
                     className="flex-1 px-3 sm:px-4 py-2 bg-purple-600 text-white rounded-lg text-sm font-medium hover:bg-purple-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed touch-manipulation"
+                    type="button"
                   >
                     {schedulePostMutation.isPending ? 'Scheduling...' : 'Schedule Article'}
                   </button>
@@ -1381,4 +1622,3 @@ export default function Schedule() {
     </div>
   );
 }
-

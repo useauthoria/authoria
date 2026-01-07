@@ -3,106 +3,129 @@ import ReactDOM from 'react-dom/client';
 import App from './App';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import './index.css';
-import type { WebVitalsMetrics } from './lib/webVitals';
 
 interface ShopifyAppBridge {
-  readonly webVitals?: {
-    readonly onReport: (callback: (metrics: WebVitalsMetrics) => void) => void;
-  };
+  readonly loading?: (show: boolean) => void;
 }
 
 interface WindowWithShopify extends Window {
   readonly shopify?: ShopifyAppBridge;
 }
 
-const SERVICE_WORKER_PATH = '/sw.js';
-const ROOT_ELEMENT_ID = 'root';
-const LOAD_EVENT = 'load';
+const SERVICE_WORKER_PATH = '/sw.js' as const;
+const ROOT_ELEMENT_ID = 'root' as const;
+const LOAD_EVENT = 'load' as const;
+const INITIAL_RENDER_DELAY_MS = 100;
+const DISMISS_LOADING_DELAYS_MS = [100, 500] as const;
+const LOADING_SPINNER_SIZE = 40;
+const LOADING_SPINNER_BORDER_WIDTH = 4;
+const LOADING_TEXT_SIZE = 14;
 
-if ('serviceWorker' in navigator) {
-  window.addEventListener(LOAD_EVENT, () => {
+function isWindowWithShopify(window: Window): window is WindowWithShopify {
+  return 'shopify' in window;
+}
+
+function hasLoadingMethod(shopify: unknown): shopify is { loading: (show: boolean) => void } {
+  return (
+    shopify !== null &&
+    typeof shopify === 'object' &&
+    'loading' in shopify &&
+    typeof (shopify as { loading?: unknown }).loading === 'function'
+  );
+}
+
+function createLoadingHTML(): string {
+  return `
+    <div style="display: flex; align-items: center; justify-content: center; height: 100vh; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;">
+      <div style="text-align: center;">
+        <div style="width: ${LOADING_SPINNER_SIZE}px; height: ${LOADING_SPINNER_SIZE}px; border: ${LOADING_SPINNER_BORDER_WIDTH}px solid #f3f3f3; border-top: ${LOADING_SPINNER_BORDER_WIDTH}px solid #3498db; border-radius: 50%; animation: spin 1s linear infinite; margin: 0 auto 16px;"></div>
+        <div style="color: #666; font-size: ${LOADING_TEXT_SIZE}px;">Loading Authoria...</div>
+      </div>
+    </div>
+    <style>
+      @keyframes spin {
+        0% { transform: rotate(0deg); }
+        100% { transform: rotate(360deg); }
+      }
+    </style>
+  `;
+}
+
+function dismissShopifyLoading(): void {
+  if (!isWindowWithShopify(window)) {
+    return;
+  }
+
+  const shopify = window.shopify;
+  if (!shopify || !hasLoadingMethod(shopify)) {
+    return;
+  }
+
+  try {
+    shopify.loading(false);
+  } catch {
+  }
+}
+
+function registerServiceWorker(): void {
+  if (!('serviceWorker' in navigator)) {
+    return;
+  }
+
+  const handleLoad = (): void => {
     navigator.serviceWorker
       .register(SERVICE_WORKER_PATH)
       .catch(() => {});
-  });
+  };
+
+  window.addEventListener(LOAD_EVENT, handleLoad, { once: true });
 }
 
-if (typeof window !== 'undefined') {
-  import('./lib/webVitals')
-    .then(({ initWebVitalsMonitoring }) => {
-      const checkAppBridge = (): void => {
-        const shopify = ((window as unknown) as WindowWithShopify).shopify;
-
-        if (shopify?.webVitals) {
-          initWebVitalsMonitoring(() => {});
-        } else {
-          setTimeout(checkAppBridge, 100);
-        }
-      };
-
-      if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', checkAppBridge);
-      } else {
-        checkAppBridge();
-      }
+function initializePrefetching(): void {
+  import('./utils/prefetch')
+    .then(({ setupLinkPrefetching, prefetchCriticalRoutes }) => {
+      setupLinkPrefetching();
+      prefetchCriticalRoutes();
     })
     .catch(() => {});
 }
 
-import('./utils/prefetch')
-  .then(({ setupLinkPrefetching, prefetchCriticalRoutes }) => {
-    setupLinkPrefetching();
-    prefetchCriticalRoutes();
-  })
-  .catch(() => {});
-
-const rootElement = document.getElementById(ROOT_ELEMENT_ID);
-if (!rootElement) {
-  throw new Error('Root element not found');
+function getRootElement(): HTMLElement {
+  const element = document.getElementById(ROOT_ELEMENT_ID);
+  if (!element) {
+    throw new Error(`Root element with id "${ROOT_ELEMENT_ID}" not found`);
+  }
+  return element;
 }
 
-// Show loading state
-rootElement.innerHTML = `
-  <div style="display: flex; align-items: center; justify-content: center; height: 100vh; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;">
-    <div style="text-align: center;">
-      <div style="width: 40px; height: 40px; border: 4px solid #f3f3f3; border-top: 4px solid #3498db; border-radius: 50%; animation: spin 1s linear infinite; margin: 0 auto 16px;"></div>
-      <div style="color: #666; font-size: 14px;">Loading Authoria...</div>
-    </div>
-  </div>
-  <style>
-    @keyframes spin {
-      0% { transform: rotate(0deg); }
-      100% { transform: rotate(360deg); }
-    }
-  </style>
-`;
-
-// Dismiss App Bridge loading if available
-const dismissLoading = () => {
-  const shopify = ((window as unknown) as WindowWithShopify).shopify;
-  if (shopify && typeof (shopify as { loading?: () => void }).loading === 'function') {
-    try {
-      (shopify as { loading: (show: boolean) => void }).loading(false);
-    } catch (error) {
-      // Ignore errors
-    }
-  }
-};
-
-// Clear loading state and render
-setTimeout(() => {
-  rootElement.innerHTML = '';
-  dismissLoading();
-  
+function renderApp(rootElement: HTMLElement): void {
   ReactDOM.createRoot(rootElement).render(
     <React.StrictMode>
-      <ErrorBoundary onError={() => {}}>
+      <ErrorBoundary>
         <App />
       </ErrorBoundary>
     </React.StrictMode>,
   );
-  
-  // Additional attempts to dismiss loading
-  setTimeout(dismissLoading, 100);
-  setTimeout(dismissLoading, 500);
-}, 100);
+}
+
+function scheduleDismissLoadingAttempts(): void {
+  for (const delay of DISMISS_LOADING_DELAYS_MS) {
+    setTimeout(dismissShopifyLoading, delay);
+  }
+}
+
+function initializeApp(): void {
+  const rootElement = getRootElement();
+  rootElement.innerHTML = createLoadingHTML();
+
+  setTimeout(() => {
+    rootElement.innerHTML = '';
+    dismissShopifyLoading();
+    renderApp(rootElement);
+    scheduleDismissLoadingAttempts();
+  }, INITIAL_RENDER_DELAY_MS);
+}
+
+registerServiceWorker();
+initializePrefetching();
+initializeApp();

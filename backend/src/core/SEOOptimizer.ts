@@ -1,7 +1,9 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 import OpenAI from 'openai';
-import { ContentGraph } from './ContentGraph';
-import type { BrandDNA } from './BrandManager';
+import { ContentGraph } from './ContentGraph.ts';
+import type { BrandDNA } from './BrandManager.ts';
+import { retry } from '../utils/error-handling.ts';
+import { RateLimiter } from '../utils/rate-limiter.ts';
 
 export interface StructuredData {
   readonly '@context': string;
@@ -100,12 +102,6 @@ interface SEOHealthOptions {
   readonly includeEAt?: boolean;
 }
 
-interface DatabasePostRow {
-  readonly id: string;
-  readonly title: string;
-  readonly content?: string;
-}
-
 interface OpenAIResponse {
   readonly output_text?: string;
 }
@@ -121,23 +117,112 @@ interface EmbeddingResponse {
   }>;
 }
 
-interface ValidationResult {
-  readonly valid: boolean;
-  readonly errors: readonly string[];
-  readonly warnings: readonly string[];
+interface EmbeddingCacheEntry {
+  readonly embedding: readonly number[];
+  readonly expiresAt: number;
 }
+
+type LogLevel = 'info' | 'warn' | 'error';
+
+const structuredLog = (
+  level: LogLevel,
+  service: string,
+  message: string,
+  context?: Readonly<Record<string, unknown>>,
+): void => {
+  const payload = JSON.stringify({
+    level,
+    service,
+    message,
+    timestamp: new Date().toISOString(),
+    ...context,
+  });
+
+  if (typeof globalThis === 'undefined' || !('Deno' in globalThis)) {
+    return;
+  }
+
+  const encoder = new TextEncoder();
+  const deno = globalThis as unknown as { Deno: { stderr: { writeSync: (data: Uint8Array) => void }; stdout: { writeSync: (data: Uint8Array) => void } } };
+  
+  if (level === 'error') {
+    deno.Deno.stderr.writeSync(encoder.encode(payload + '\n'));
+    return;
+  }
+
+  deno.Deno.stdout.writeSync(encoder.encode(payload + '\n'));
+};
+
+const truncateText = (text: string, maxLength: number): string => {
+  if (text.length <= maxLength) return text;
+  return text.substring(0, maxLength);
+};
+
+const parseJSONResponse = <T>(jsonString: string, fallback: T): T => {
+  try {
+    const parsed = JSON.parse(jsonString) as unknown;
+    return parsed as T;
+  } catch {
+    return fallback;
+  }
+};
+
+const validateContent = (content: string): void => {
+  if (!content || typeof content !== 'string') {
+    throw new Error('Invalid content: must be a non-empty string');
+  }
+  if (content.length > 10000000) {
+    throw new Error('Invalid content: exceeds maximum length of 10MB');
+  }
+};
+
+const validateTitle = (title: string): void => {
+  if (!title || typeof title !== 'string' || title.trim().length === 0) {
+    throw new Error('Invalid title: must be a non-empty string');
+  }
+  if (title.length > 500) {
+    throw new Error('Invalid title: exceeds maximum length of 500 characters');
+  }
+};
+
+const validateKeywords = (keywords: readonly string[]): void => {
+  if (!Array.isArray(keywords)) {
+    throw new Error('Invalid keywords: must be an array');
+  }
+  if (keywords.length > 100) {
+    throw new Error('Invalid keywords: exceeds maximum count of 100');
+  }
+  for (const keyword of keywords) {
+    if (typeof keyword !== 'string' || keyword.length > 200) {
+      throw new Error('Invalid keyword: must be a string with max length 200');
+    }
+  }
+};
+
+const validateWordCount = (wordCount: number): void => {
+  if (!Number.isInteger(wordCount) || wordCount < 0 || wordCount > 1000000) {
+    throw new Error('Invalid wordCount: must be an integer between 0 and 1000000');
+  }
+};
 
 export class SEOOptimizer {
   private readonly openai: OpenAI;
   private readonly supabase?: SupabaseClient;
   private readonly contentGraph?: ContentGraph;
   private readonly shopDomain?: string;
-  private readonly embeddingCache: Map<string, readonly number[]>;
+  private readonly embeddingCache: Map<string, EmbeddingCacheEntry>;
+  private readonly limiter: RateLimiter;
+  private readonly inflightRequests: Map<string, Promise<unknown>>;
+  private cacheCleanupInterval?: number;
+
+  private static readonly SERVICE_NAME = 'SEOOptimizer';
   private static readonly EMBEDDING_MODEL = 'text-embedding-3-small';
   private static readonly EMBEDDING_DIMENSION = 1536;
   private static readonly EMBEDDING_TEXT_LIMIT = 8000;
   private static readonly EMBEDDING_CACHE_KEY_LENGTH = 100;
   private static readonly EMBEDDING_CACHE_MAX_SIZE = 1000;
+  private static readonly EMBEDDING_CACHE_TTL_MS = 30 * 60 * 1000;
+  private static readonly CACHE_CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
   private static readonly CACHE_KEY_PREFIX = 'embedding:';
   private static readonly DEFAULT_DOMAIN = 'example.myshopify.com';
   private static readonly DEFAULT_BLOG_HANDLE = 'blog';
@@ -174,8 +259,6 @@ export class SEOOptimizer {
   private static readonly LSI_KEYWORD_COUNT_MIN = 8;
   private static readonly LSI_KEYWORD_COUNT_MAX = 10;
   private static readonly LSI_KEYWORD_CACHE_LENGTH = 20;
-  private static readonly DEFAULT_CONFIDENCE = 0.5;
-  private static readonly DEFAULT_INTENT = 'informational';
   private static readonly ON_PAGE_WEIGHT = 0.25;
   private static readonly TECHNICAL_WEIGHT = 0.15;
   private static readonly CONTENT_WEIGHT = 0.20;
@@ -217,11 +300,19 @@ export class SEOOptimizer {
   private static readonly EAT_BASE_SCORE = 100;
   private static readonly EAT_AUTHOR_PENALTY = 20;
   private static readonly EAT_BRAND_PENALTY = 10;
+  private static readonly OPENAI_MAX_WAIT_MS = 60000;
+  private static readonly DEFAULT_RETRY_OPTIONS = {
+    maxAttempts: 3,
+    initialDelay: 1000,
+    backoffMultiplier: 2,
+    retryableErrors: ['rate limit', 'timeout', 'server_error'] as const,
+  } as const;
+
   private static readonly PRIORITY_ORDER: Readonly<Record<'high' | 'medium' | 'low', number>> = {
     high: 3,
     medium: 2,
     low: 1,
-  };
+  } as const;
 
   constructor(
     apiKey: string,
@@ -229,14 +320,52 @@ export class SEOOptimizer {
     contentGraph?: ContentGraph,
     shopDomain?: string,
   ) {
+    if (!apiKey || typeof apiKey !== 'string' || apiKey.trim().length === 0) {
+      throw new Error('Invalid OpenAI API key');
+    }
     this.openai = new OpenAI({ apiKey });
     this.supabase = supabase;
     this.contentGraph = contentGraph;
     this.shopDomain = shopDomain;
     this.embeddingCache = new Map();
+    this.inflightRequests = new Map();
+    this.limiter = new RateLimiter({
+      maxRequests: 50,
+      windowMs: 60000,
+      burst: 50,
+      algorithm: 'token-bucket',
+    });
+    this.startCacheCleanup();
+  }
+
+  destroy(): void {
+    if (this.cacheCleanupInterval !== undefined) {
+      clearInterval(this.cacheCleanupInterval);
+      this.cacheCleanupInterval = undefined;
+    }
+    this.embeddingCache.clear();
+    this.inflightRequests.clear();
+  }
+
+  private startCacheCleanup(): void {
+    this.cacheCleanupInterval = setInterval(() => {
+      const now = Date.now();
+      for (const [key, entry] of this.embeddingCache.entries()) {
+        if (entry.expiresAt < now) {
+          this.embeddingCache.delete(key);
+        }
+      }
+    }, SEOOptimizer.CACHE_CLEANUP_INTERVAL_MS) as unknown as number;
   }
 
   generateBlogPostingSchema(post: PostInput): StructuredData {
+    validateTitle(post.title);
+    validateContent(post.content);
+    if (post.excerpt && typeof post.excerpt !== 'string') {
+      throw new Error('Invalid excerpt: must be a string');
+    }
+    validateKeywords(post.keywords);
+
     const url = this.generateBlogUrl(post.handle, post.shopDomain, post.blogHandle);
     const schema: MutableStructuredData = {
       '@context': SEOOptimizer.SCHEMA_CONTEXT,
@@ -278,6 +407,13 @@ export class SEOOptimizer {
     readonly excerpt: string;
     readonly keywords: readonly string[];
   }): Promise<StructuredData> {
+    validateTitle(input.title);
+    validateContent(input.content);
+    if (!input.excerpt || typeof input.excerpt !== 'string') {
+      throw new Error('Invalid excerpt: must be a non-empty string');
+    }
+    validateKeywords(input.keywords);
+
     return this.generateBlogPostingSchema({
       title: input.title,
       content: input.content,
@@ -294,31 +430,61 @@ export class SEOOptimizer {
     title: string,
     primaryKeywords: readonly string[],
   ): Promise<KeywordAnalysis> {
+    const startTime = Date.now();
+    validateContent(content);
+    validateTitle(title);
+    validateKeywords(primaryKeywords);
+
     if (!this.openai || primaryKeywords.length === 0) {
       return this.getDefaultKeywordAnalysis();
     }
 
-    const [lsiKeywords, semanticDensity, distribution, proximity, prominence] = await Promise.all([
-      this.generateLSIKeywords(primaryKeywords[0], content),
-      this.calculateSemanticDensity(content, primaryKeywords),
-      Promise.resolve(this.calculateKeywordDistribution(content, title, primaryKeywords)),
-      Promise.resolve(this.calculateKeywordProximity(content, primaryKeywords)),
-      Promise.resolve(this.calculateKeywordProminence(content, title, primaryKeywords)),
-    ]);
+    try {
+      const [lsiKeywords, semanticDensity, distribution, proximity, prominence] = await Promise.all([
+        this.generateLSIKeywords(primaryKeywords[0], content),
+        this.calculateSemanticDensity(content, primaryKeywords),
+        Promise.resolve(this.calculateKeywordDistribution(content, title, primaryKeywords)),
+        Promise.resolve(this.calculateKeywordProximity(content, primaryKeywords)),
+        Promise.resolve(this.calculateKeywordProminence(content, title, primaryKeywords)),
+      ]);
 
-    return {
-      semanticDensity,
-      lsiKeywords,
-      keywordProximity: proximity,
-      keywordProminence: prominence,
-      keywordDistribution: distribution,
-    };
+      const duration = Date.now() - startTime;
+      structuredLog('info', SEOOptimizer.SERVICE_NAME, 'Keywords analyzed', {
+        keywordsCount: primaryKeywords.length,
+        durationMs: duration,
+      });
+
+      return {
+        semanticDensity,
+        lsiKeywords,
+        keywordProximity: proximity,
+        keywordProminence: prominence,
+        keywordDistribution: distribution,
+      };
+    } catch (error) {
+      const duration = Date.now() - startTime;
+      structuredLog('error', SEOOptimizer.SERVICE_NAME, 'Keyword analysis failed', {
+        error: error instanceof Error ? error.message : String(error),
+        durationMs: duration,
+      });
+      return this.getDefaultKeywordAnalysis();
+    }
   }
 
   async calculateSEOHealthScore(
     post: SEOHealthPostInput,
     options?: SEOHealthOptions,
   ): Promise<SEOHealthScore> {
+    const startTime = Date.now();
+    validateTitle(post.title);
+    validateContent(post.content);
+    validateTitle(post.seoTitle);
+    if (!post.seoDescription || typeof post.seoDescription !== 'string') {
+      throw new Error('Invalid seoDescription: must be a non-empty string');
+    }
+    validateKeywords(post.keywords);
+    validateWordCount(post.wordCount);
+
     const recommendations: SEORecommendation[] = [];
     const issues: Array<{
       type: string;
@@ -326,23 +492,21 @@ export class SEOOptimizer {
       message: string;
     }> = [];
 
-    const onPageScore = this.calculateOnPageScore(post, recommendations, issues);
-    const technicalScore = options?.includeTechnical
-      ? await this.calculateTechnicalScore(post, recommendations, issues)
-      : SEOOptimizer.MAX_SCORE;
-    const contentScore = this.calculateContentScore(post, recommendations, issues);
-    const structuredDataScore = await this.calculateStructuredDataScore(
-      post,
-      recommendations,
-      issues,
-    );
-    const mobileScore = this.calculateMobileScore(post, recommendations, issues);
-    const performanceScore = options?.includePerformance
-      ? await this.calculatePerformanceScore(post, recommendations, issues)
-      : SEOOptimizer.MAX_SCORE;
-    const eAtScore = options?.includeEAt
-      ? await this.calculateEAtScore(post, recommendations, issues)
-      : SEOOptimizer.MAX_SCORE;
+    const [onPageScore, technicalScore, contentScore, structuredDataScore, mobileScore, performanceScore, eAtScore] = await Promise.all([
+      Promise.resolve(this.calculateOnPageScore(post, recommendations, issues)),
+      options?.includeTechnical
+        ? this.calculateTechnicalScore(post, recommendations, issues)
+        : Promise.resolve(SEOOptimizer.MAX_SCORE),
+      Promise.resolve(this.calculateContentScore(post, recommendations, issues)),
+      this.calculateStructuredDataScore(post, recommendations, issues),
+      Promise.resolve(this.calculateMobileScore(post, recommendations, issues)),
+      options?.includePerformance
+        ? this.calculatePerformanceScore(post, recommendations, issues)
+        : Promise.resolve(SEOOptimizer.MAX_SCORE),
+      options?.includeEAt
+        ? this.calculateEAtScore(post, recommendations, issues)
+        : Promise.resolve(SEOOptimizer.MAX_SCORE),
+    ]);
 
     const overall =
       onPageScore * SEOOptimizer.ON_PAGE_WEIGHT +
@@ -352,6 +516,12 @@ export class SEOOptimizer {
       mobileScore * SEOOptimizer.MOBILE_WEIGHT +
       performanceScore * SEOOptimizer.PERFORMANCE_WEIGHT +
       eAtScore * SEOOptimizer.EAT_WEIGHT;
+
+    const duration = Date.now() - startTime;
+    structuredLog('info', SEOOptimizer.SERVICE_NAME, 'SEO health score calculated', {
+      overall: Math.round(overall),
+      durationMs: duration,
+    });
 
     return {
       overall: Math.round(overall),
@@ -371,7 +541,6 @@ export class SEOOptimizer {
     };
   }
 
-
   private generateBlogUrl(handle: string | undefined, shopDomain?: string, blogHandle?: string): string {
     const domain = shopDomain || this.shopDomain || SEOOptimizer.DEFAULT_DOMAIN;
     const blog = blogHandle || SEOOptimizer.DEFAULT_BLOG_HANDLE;
@@ -384,9 +553,13 @@ export class SEOOptimizer {
 
     try {
       const response = await this.callOpenAI(prompt, this.buildLSICacheKey(primaryKeyword), true);
-      const result = JSON.parse(response.output_text || '{}') as OpenAILSIResponse;
+      const result = parseJSONResponse<OpenAILSIResponse>(response.output_text || '{}', { keywords: [] });
       return result.keywords || result.lsiKeywords || [];
-    } catch {
+    } catch (error) {
+      structuredLog('warn', SEOOptimizer.SERVICE_NAME, 'Failed to generate LSI keywords', {
+        primaryKeyword,
+        error: error instanceof Error ? error.message : String(error),
+      });
       return [];
     }
   }
@@ -896,7 +1069,7 @@ export class SEOOptimizer {
     }
 
     const contentLower = content.toLowerCase();
-    const occurrences = (contentLower.match(new RegExp(keywordLower, 'g')) || []).length;
+    const occurrences = (contentLower.match(new RegExp(keywordLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) || []).length;
 
     return (occurrences / totalWords) * SEOOptimizer.MAX_SCORE;
   }
@@ -904,27 +1077,66 @@ export class SEOOptimizer {
   private async createEmbedding(text: string): Promise<readonly number[]> {
     const cacheKey = `${SEOOptimizer.CACHE_KEY_PREFIX}${text.substring(0, SEOOptimizer.EMBEDDING_CACHE_KEY_LENGTH)}`;
     const cached = this.embeddingCache.get(cacheKey);
-    if (cached) {
-      return cached;
+    if (cached && cached.expiresAt > Date.now()) {
+      return cached.embedding;
     }
 
     if (!this.openai) {
       return new Array(SEOOptimizer.EMBEDDING_DIMENSION).fill(0);
     }
 
-    try {
-      const response = await this.openai.embeddings.create({
-        model: SEOOptimizer.EMBEDDING_MODEL,
-        input: text.substring(0, SEOOptimizer.EMBEDDING_TEXT_LIMIT),
-      }) as unknown as EmbeddingResponse;
+    const requestKey = `embedding:${cacheKey}`;
+    const inflight = this.inflightRequests.get(requestKey);
+    if (inflight) {
+      return (await inflight) as readonly number[];
+    }
 
-      const embedding = response.data[0]?.embedding || [];
-      if (this.embeddingCache.size < SEOOptimizer.EMBEDDING_CACHE_MAX_SIZE) {
-        this.embeddingCache.set(cacheKey, embedding);
-      }
+    const embeddingPromise = retry(
+      async () => {
+        const allowed = await this.limiter.waitForToken('openai-embeddings', SEOOptimizer.OPENAI_MAX_WAIT_MS);
+        if (!allowed) {
+          throw new Error('OpenAI rate limit wait exceeded');
+        }
+
+        const start = Date.now();
+        const response = await this.openai.embeddings.create({
+          model: SEOOptimizer.EMBEDDING_MODEL,
+          input: truncateText(text, SEOOptimizer.EMBEDDING_TEXT_LIMIT),
+        }) as unknown as EmbeddingResponse;
+
+        structuredLog('info', SEOOptimizer.SERVICE_NAME, 'Embedding created', {
+          latencyMs: Date.now() - start,
+        });
+
+        return response.data[0]?.embedding || [];
+      },
+      {
+        ...SEOOptimizer.DEFAULT_RETRY_OPTIONS,
+        onRetry: (attempt, err) => {
+          structuredLog('warn', SEOOptimizer.SERVICE_NAME, 'Retrying embedding creation', {
+            attempt,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        },
+      },
+    );
+
+    this.inflightRequests.set(requestKey, embeddingPromise);
+
+    try {
+      const embedding = await embeddingPromise;
+      this.embeddingCache.set(cacheKey, {
+        embedding,
+        expiresAt: Date.now() + SEOOptimizer.EMBEDDING_CACHE_TTL_MS,
+      });
       return embedding;
-    } catch {
+    } catch (error) {
+      structuredLog('error', SEOOptimizer.SERVICE_NAME, 'Failed to create embedding', {
+        error: error instanceof Error ? error.message : String(error),
+      });
       return new Array(SEOOptimizer.EMBEDDING_DIMENSION).fill(0);
+    } finally {
+      this.inflightRequests.delete(requestKey);
     }
   }
 
@@ -945,51 +1157,6 @@ export class SEOOptimizer {
 
     const denominator = Math.sqrt(normA) * Math.sqrt(normB);
     return denominator === 0 ? 0 : dotProduct / denominator;
-  }
-
-  private mapHowToStep(
-    step: HowToPostInput['steps'][number],
-    index: number,
-  ): Readonly<Record<string, unknown>> {
-    const stepData: Record<string, unknown> = {
-      '@type': 'HowToStep',
-      position: index + 1,
-      name: step.name,
-      text: step.text,
-    };
-
-    if (step.image) {
-      stepData.image = {
-        '@type': 'ImageObject',
-        url: step.image,
-      };
-    }
-
-    if (step.url) {
-      stepData.url = step.url;
-    }
-
-    return stepData;
-  }
-
-  private mapRecipeStep(
-    step: RecipeInput['recipeInstructions'][number],
-    index: number,
-  ): Readonly<Record<string, unknown>> {
-    const stepData: Record<string, unknown> = {
-      '@type': 'HowToStep',
-      position: index + 1,
-      text: step.text,
-    };
-
-    if (step.image) {
-      stepData.image = {
-        '@type': 'ImageObject',
-        url: step.image,
-      };
-    }
-
-    return stepData;
   }
 
   private buildLSIKeywordsPrompt(primaryKeyword: string): string {
@@ -1027,15 +1194,56 @@ Return ONLY valid JSON array:
     cacheKey: string,
     useJsonFormat: boolean = false,
   ): Promise<OpenAIResponse> {
-    return await this.openai.responses.create({
-      model: 'gpt-5-mini',
-      reasoning: { effort: 'low' },
-      text: { verbosity: useJsonFormat ? 'medium' : 'low' },
-      input: prompt,
-      response_format: useJsonFormat ? { type: 'json_object' } : undefined,
-      prompt_cache_key: cacheKey,
-      prompt_cache_retention: '24h',
-    }) as OpenAIResponse;
+    const requestKey = `openai:${cacheKey}:${prompt.substring(0, 50)}`;
+    const inflight = this.inflightRequests.get(requestKey);
+    if (inflight) {
+      return (await inflight) as OpenAIResponse;
+    }
+
+    const requestPromise = retry(
+      async () => {
+        const allowed = await this.limiter.waitForToken('openai-responses', SEOOptimizer.OPENAI_MAX_WAIT_MS);
+        if (!allowed) {
+          throw new Error('OpenAI rate limit wait exceeded');
+        }
+
+        const start = Date.now();
+        const response = await this.openai.responses.create({
+          model: 'gpt-5-mini',
+          reasoning: { effort: 'low' },
+          text: { verbosity: useJsonFormat ? 'medium' : 'low' },
+          input: prompt,
+          response_format: useJsonFormat ? { type: 'json_object' } : undefined,
+          prompt_cache_key: cacheKey,
+          prompt_cache_retention: '24h',
+        }) as OpenAIResponse;
+
+        structuredLog('info', SEOOptimizer.SERVICE_NAME, 'OpenAI call completed', {
+          cacheKey,
+          latencyMs: Date.now() - start,
+        });
+
+        return response;
+      },
+      {
+        ...SEOOptimizer.DEFAULT_RETRY_OPTIONS,
+        onRetry: (attempt, err) => {
+          structuredLog('warn', SEOOptimizer.SERVICE_NAME, 'Retrying OpenAI call', {
+            attempt,
+            cacheKey,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        },
+      },
+    );
+
+    this.inflightRequests.set(requestKey, requestPromise);
+
+    try {
+      return await requestPromise;
+    } finally {
+      this.inflightRequests.delete(requestKey);
+    }
   }
 
   private getDefaultKeywordAnalysis(): KeywordAnalysis {

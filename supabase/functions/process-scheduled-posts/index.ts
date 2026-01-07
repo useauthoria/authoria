@@ -6,6 +6,7 @@ import {
   logger,
   UtilsError,
   SupabaseClientError,
+  createCORSHeaders,
 } from '../_shared/utils.ts';
 
 interface DenoEnv {
@@ -33,7 +34,7 @@ interface ProcessScheduledPostsResponse {
 
 interface RequestContext {
   readonly req: ProcessScheduledPostsRequest;
-  readonly supabase: ReturnType<typeof getSupabaseClient>;
+  readonly supabase: Awaited<ReturnType<typeof getSupabaseClient>>;
   readonly correlationId: string;
   readonly startTime: number;
 }
@@ -44,52 +45,61 @@ interface EndpointConfig {
   readonly timeout?: number;
 }
 
-const ENV_SUPABASE_URL = 'SUPABASE_URL';
-const ENV_SUPABASE_SERVICE_ROLE_KEY = 'SUPABASE_SERVICE_ROLE_KEY';
-const ENV_OPENAI_API_KEY = 'OPENAI_API_KEY';
-const ENV_ADMIN_API_KEY = 'ADMIN_API_KEY';
+interface ProcessingResult {
+  readonly processed: number;
+  readonly successful: number;
+  readonly failed: number;
+  readonly total: number;
+}
+
+interface ScheduleRow {
+  readonly id: string;
+  readonly [key: string]: unknown;
+}
+
+const ENV_SUPABASE_URL = 'SUPABASE_URL' as const;
+const ENV_SUPABASE_SERVICE_ROLE_KEY = 'SUPABASE_SERVICE_ROLE_KEY' as const;
+const ENV_OPENAI_API_KEY = 'OPENAI_API_KEY' as const;
+const ENV_ADMIN_API_KEY = 'ADMIN_API_KEY' as const;
+const ENV_PROCESS_SCHEDULED_POSTS_TIMEOUT = 'PROCESS_SCHEDULED_POSTS_TIMEOUT' as const;
+const ENV_CORS_ORIGINS = 'CORS_ORIGINS' as const;
 const DEFAULT_TIMEOUT = 300000;
 const MIN_TOKEN_LENGTH = 20;
-const BEARER_PREFIX = 'Bearer ';
+const BEARER_PREFIX = 'Bearer ' as const;
 const BEARER_PREFIX_LENGTH = 7;
 const ID_RADIX = 36;
 const ID_LENGTH = 9;
-const CORRELATION_PREFIX = 'process-scheduled-';
-const METHOD_POST = 'POST';
-const METHOD_OPTIONS = 'OPTIONS';
+const CORRELATION_PREFIX = 'process-scheduled-' as const;
+const METHOD_POST = 'POST' as const;
+const METHOD_OPTIONS = 'OPTIONS' as const;
 const STATUS_OK = 200;
 const STATUS_UNAUTHORIZED = 401;
 const STATUS_REQUEST_TIMEOUT = 408;
 const STATUS_INTERNAL_ERROR = 500;
-const HEADER_AUTHORIZATION = 'Authorization';
-const HEADER_X_CORRELATION_ID = 'x-correlation-id';
-const HEADER_X_RESPONSE_TIME = 'x-response-time';
-const HEADER_CONTENT_TYPE = 'Content-Type';
-const HEADER_CONTENT_TYPE_JSON = 'application/json';
-const HEADER_ACCESS_CONTROL_ALLOW_ORIGIN = 'Access-Control-Allow-Origin';
-const HEADER_ACCESS_CONTROL_ALLOW_HEADERS = 'Access-Control-Allow-Headers';
-const HEADER_ACCESS_CONTROL_ALLOW_METHODS = 'Access-Control-Allow-Methods';
-const HEADER_ACCESS_CONTROL_MAX_AGE = 'Access-Control-Max-Age';
-const CORS_HEADERS_VALUE = 'authorization, x-client-info, apikey, content-type, x-correlation-id, x-request-id';
-const CORS_METHODS_VALUE = 'POST, OPTIONS';
-const CORS_MAX_AGE_VALUE = '86400';
-const ENCODING_NONE = 'none';
-const ERROR_UNAUTHORIZED = 'Unauthorized';
-const ERROR_MISSING_ENV = 'Missing environment variables';
-const ERROR_MISSING_AUTHORIZATION = 'Missing authorization header';
-const ERROR_INVALID_AUTHORIZATION = 'Invalid authorization';
-const ERROR_REQUEST_TIMEOUT = 'Request timeout';
-const ERROR_INTERNAL_SERVER = 'Internal server error';
-const ERROR_CODE_UNAUTHORIZED = 'UNAUTHORIZED';
-const ERROR_CODE_CONFIG_ERROR = 'CONFIG_ERROR';
-const ERROR_CODE_INTERNAL_ERROR = 'INTERNAL_ERROR';
-const TABLE_POSTS_SCHEDULE = 'posts_schedule';
-const COLUMN_ID = 'id';
-const COLUMN_STATUS = 'status';
-const COLUMN_SCHEDULED_AT = 'scheduled_at';
-const STATUS_PENDING = 'pending';
-const STATUS_PROCESSING = 'processing';
-const STATUS_FAILED = 'failed';
+const HEADER_AUTHORIZATION = 'Authorization' as const;
+const HEADER_X_CORRELATION_ID = 'x-correlation-id' as const;
+const HEADER_X_RESPONSE_TIME = 'x-response-time' as const;
+const HEADER_CONTENT_TYPE = 'Content-Type' as const;
+const HEADER_CONTENT_TYPE_JSON = 'application/json' as const;
+const ENCODING_NONE = 'none' as const;
+const ERROR_UNAUTHORIZED = 'Unauthorized' as const;
+const ERROR_MISSING_ENV = 'Missing environment variables' as const;
+const ERROR_MISSING_AUTHORIZATION = 'Missing authorization header' as const;
+const ERROR_INVALID_AUTHORIZATION = 'Invalid authorization' as const;
+const ERROR_REQUEST_TIMEOUT = 'Request timeout' as const;
+const ERROR_INTERNAL_SERVER = 'Internal server error' as const;
+const ERROR_CODE_UNAUTHORIZED = 'UNAUTHORIZED' as const;
+const ERROR_CODE_CONFIG_ERROR = 'CONFIG_ERROR' as const;
+const ERROR_CODE_INTERNAL_ERROR = 'INTERNAL_ERROR' as const;
+const TABLE_POSTS_SCHEDULE = 'posts_schedule' as const;
+const COLUMN_ID = 'id' as const;
+const COLUMN_STATUS = 'status' as const;
+const COLUMN_SCHEDULED_AT = 'scheduled_at' as const;
+const COLUMN_PRIORITY = 'priority' as const;
+const COLUMN_ERROR_MESSAGE = 'error_message' as const;
+const STATUS_PENDING = 'pending' as const;
+const STATUS_PROCESSING = 'processing' as const;
+const STATUS_FAILED = 'failed' as const;
 const PROCESSING_BATCH_SIZE = 50;
 const PROCESSING_CONCURRENCY = 3;
 
@@ -107,15 +117,9 @@ const CONFIG = {
   SUPABASE_SERVICE_ROLE_KEY: getEnv(ENV_SUPABASE_SERVICE_ROLE_KEY, ''),
   OPENAI_API_KEY: getEnv(ENV_OPENAI_API_KEY, ''),
   ADMIN_API_KEY: getEnv(ENV_ADMIN_API_KEY, ''),
-  DEFAULT_TIMEOUT: parseInt(getEnv('PROCESS_SCHEDULED_POSTS_TIMEOUT', String(DEFAULT_TIMEOUT))),
-};
-
-const corsHeaders: Readonly<Record<string, string>> = {
-  [HEADER_ACCESS_CONTROL_ALLOW_ORIGIN]: '*',
-  [HEADER_ACCESS_CONTROL_ALLOW_HEADERS]: CORS_HEADERS_VALUE,
-  [HEADER_ACCESS_CONTROL_ALLOW_METHODS]: CORS_METHODS_VALUE,
-  [HEADER_ACCESS_CONTROL_MAX_AGE]: CORS_MAX_AGE_VALUE,
-};
+  DEFAULT_TIMEOUT: parseInt(getEnv(ENV_PROCESS_SCHEDULED_POSTS_TIMEOUT, String(DEFAULT_TIMEOUT)), 10),
+  CORS_ORIGINS: getEnv(ENV_CORS_ORIGINS, '*').split(','),
+} as const;
 
 async function validateAuth(authHeader: string | null): Promise<{ readonly valid: boolean; readonly error?: string }> {
   if (!authHeader) {
@@ -146,11 +150,11 @@ async function createRequestContext(req: Request): Promise<RequestContext> {
   const authResult = await validateAuth(authHeader);
 
   if (!authResult.valid) {
-    throw new UtilsError(authResult.error ?? ERROR_UNAUTHORIZED, ERROR_CODE_UNAUTHORIZED, STATUS_UNAUTHORIZED);
+    throw new UtilsError(authResult.error ?? ERROR_UNAUTHORIZED, ERROR_CODE_UNAUTHORIZED as string, STATUS_UNAUTHORIZED);
   }
 
   if (!CONFIG.SUPABASE_URL || !CONFIG.SUPABASE_SERVICE_ROLE_KEY) {
-    throw new UtilsError(ERROR_MISSING_ENV, ERROR_CODE_CONFIG_ERROR, STATUS_INTERNAL_ERROR);
+    throw new UtilsError(ERROR_MISSING_ENV, ERROR_CODE_CONFIG_ERROR as string, STATUS_INTERNAL_ERROR);
   }
 
   const supabase = await getSupabaseClient({ clientType: 'service' });
@@ -178,7 +182,7 @@ async function handleRequest(
     const timeout = config.timeout ?? CONFIG.DEFAULT_TIMEOUT;
     const timeoutPromise = new Promise<Response>((resolve) => {
       setTimeout(() => {
-        resolve(createErrorResponse(ERROR_REQUEST_TIMEOUT, STATUS_REQUEST_TIMEOUT, correlationId));
+        resolve(createErrorResponse(ERROR_REQUEST_TIMEOUT, STATUS_REQUEST_TIMEOUT, correlationId, undefined, req));
       }, timeout);
     });
 
@@ -213,7 +217,8 @@ async function handleRequest(
       error instanceof Error ? error.message : ERROR_INTERNAL_SERVER,
       error instanceof UtilsError ? error.statusCode : STATUS_INTERNAL_ERROR,
       correlationId,
-      { errorCode: error instanceof UtilsError ? error.code : ERROR_CODE_INTERNAL_ERROR },
+      { errorCode: error instanceof UtilsError ? error.code : ERROR_CODE_INTERNAL_ERROR as string },
+      req,
     );
   }
 }
@@ -221,7 +226,7 @@ async function handleRequest(
 async function createSuccessResponse(
   data: unknown,
   correlationId: string,
-  metadata?: Readonly<Record<string, unknown>>,
+  metadata: Readonly<Record<string, unknown>> | undefined,
   options: { readonly compression?: boolean; readonly request?: Request } = {},
 ): Promise<Response> {
   const response: ProcessScheduledPostsResponse = {
@@ -235,10 +240,14 @@ async function createSuccessResponse(
     if (compression !== ENCODING_NONE) {
       return createCompressedResponse(response, {
         encoding: compression,
-        headers: corsHeaders,
+        headers: createCORSHeaders(options.request, CONFIG.CORS_ORIGINS),
       });
     }
   }
+
+  const corsHeaders = options.request
+    ? createCORSHeaders(options.request, CONFIG.CORS_ORIGINS)
+    : createCORSHeaders({ headers: new Headers() } as Request, CONFIG.CORS_ORIGINS);
 
   return new Response(JSON.stringify(response), {
     status: STATUS_OK,
@@ -254,13 +263,18 @@ function createErrorResponse(
   error: string,
   status: number,
   correlationId: string,
-  metadata?: Readonly<Record<string, unknown>>,
+  metadata: Readonly<Record<string, unknown>> | undefined,
+  request?: Request,
 ): Response {
   const response: ProcessScheduledPostsResponse = {
     error,
     correlationId,
     ...(metadata && { metadata }),
   };
+
+  const corsHeaders = request
+    ? createCORSHeaders(request, CONFIG.CORS_ORIGINS)
+    : createCORSHeaders({ headers: new Headers() } as Request, CONFIG.CORS_ORIGINS);
 
   return new Response(JSON.stringify(response), {
     status,
@@ -272,19 +286,53 @@ function createErrorResponse(
   });
 }
 
+async function processScheduleRow(
+  scheduleRow: ScheduleRow,
+  supabase: Awaited<ReturnType<typeof getSupabaseClient>>,
+  scheduler: { processScheduledPosts: () => Promise<void> },
+  correlationId: string,
+): Promise<{ success: boolean; error?: string }> {
+  try {
+    await supabase
+      .from(TABLE_POSTS_SCHEDULE)
+      .update({ [COLUMN_STATUS]: STATUS_PROCESSING })
+      .eq(COLUMN_ID, scheduleRow.id);
+
+    await scheduler.processScheduledPosts();
+
+    return { success: true };
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    await supabase
+      .from(TABLE_POSTS_SCHEDULE)
+      .update({
+        [COLUMN_STATUS]: STATUS_FAILED,
+        [COLUMN_ERROR_MESSAGE]: errorMessage,
+      })
+      .eq(COLUMN_ID, scheduleRow.id);
+
+    logger.warn('Failed to process scheduled post', {
+      correlationId,
+      scheduleId: scheduleRow.id,
+      error: errorMessage,
+    });
+
+    return { success: false, error: errorMessage };
+  }
+}
+
 async function handleProcessScheduledPosts(ctx: RequestContext): Promise<Response> {
   const { supabase, correlationId } = ctx;
 
   try {
     const now = new Date();
-    
-    // Fetch due posts
+
     const { data: duePosts, error: fetchError } = await supabase
       .from(TABLE_POSTS_SCHEDULE)
       .select('*, blog_posts(*), stores(*)')
       .eq(COLUMN_STATUS, STATUS_PENDING)
       .lte(COLUMN_SCHEDULED_AT, now.toISOString())
-      .order('priority', { ascending: false })
+      .order(COLUMN_PRIORITY, { ascending: false })
       .order(COLUMN_SCHEDULED_AT, { ascending: true })
       .limit(PROCESSING_BATCH_SIZE);
 
@@ -294,14 +342,13 @@ async function handleProcessScheduledPosts(ctx: RequestContext): Promise<Respons
 
     if (!duePosts || duePosts.length === 0) {
       return createSuccessResponse(
-        { processed: 0, successful: 0, failed: 0 },
+        { processed: 0, successful: 0, failed: 0, total: 0 },
         correlationId,
         {},
         { compression: true, request: ctx.req },
       );
     }
 
-    // Import Scheduler
     const { Scheduler } = await import('../backend/src/core/Scheduler.ts');
     const scheduler = new Scheduler(
       CONFIG.SUPABASE_URL,
@@ -309,51 +356,29 @@ async function handleProcessScheduledPosts(ctx: RequestContext): Promise<Respons
       CONFIG.OPENAI_API_KEY,
     );
 
-    // Process posts in batches
     let processed = 0;
     let successful = 0;
     let failed = 0;
 
     for (let i = 0; i < duePosts.length; i += PROCESSING_CONCURRENCY) {
-      const batch = duePosts.slice(i, i + PROCESSING_CONCURRENCY);
-      
+      const batch = duePosts.slice(i, i + PROCESSING_CONCURRENCY) as ReadonlyArray<ScheduleRow>;
+
       const results = await Promise.allSettled(
-        batch.map(async (scheduleRow) => {
-          try {
-            // Mark as processing
-            await supabase
-              .from(TABLE_POSTS_SCHEDULE)
-              .update({ [COLUMN_STATUS]: STATUS_PROCESSING })
-              .eq(COLUMN_ID, scheduleRow.id);
-
-            // Process the post
-            await scheduler.processScheduledPosts();
-
-            processed++;
-            successful++;
-          } catch (error) {
-            // Mark as failed
-            await supabase
-              .from(TABLE_POSTS_SCHEDULE)
-              .update({
-                [COLUMN_STATUS]: STATUS_FAILED,
-                error_message: error instanceof Error ? error.message : String(error),
-              })
-              .eq(COLUMN_ID, scheduleRow.id);
-
-            processed++;
-            failed++;
-            throw error;
-          }
-        }),
+        batch.map((scheduleRow) => processScheduleRow(scheduleRow, supabase, scheduler, correlationId)),
       );
 
-      // Count results
-      results.forEach((result) => {
-        if (result.status === 'rejected') {
+      for (const result of results) {
+        processed++;
+        if (result.status === 'fulfilled') {
+          if (result.value.success) {
+            successful++;
+          } else {
+            failed++;
+          }
+        } else {
           failed++;
         }
-      });
+      }
     }
 
     logger.info('Scheduled posts processed', {
@@ -364,12 +389,14 @@ async function handleProcessScheduledPosts(ctx: RequestContext): Promise<Respons
       failed,
     });
 
-    return createSuccessResponse(
-      { processed, successful, failed, total: duePosts.length },
-      correlationId,
-      {},
-      { compression: true, request: ctx.req },
-    );
+    const result: ProcessingResult = {
+      processed,
+      successful,
+      failed,
+      total: duePosts.length,
+    };
+
+    return createSuccessResponse(result, correlationId, {}, { compression: true, request: ctx.req });
   } catch (error) {
     logger.error('Failed to process scheduled posts', {
       correlationId,
@@ -382,7 +409,10 @@ async function handleProcessScheduledPosts(ctx: RequestContext): Promise<Respons
 
 serve(async (req: Request) => {
   if (req.method === METHOD_OPTIONS) {
-    return new Response('ok', { headers: corsHeaders });
+    return new Response(null, {
+      status: 204,
+      headers: createCORSHeaders(req, CONFIG.CORS_ORIGINS),
+    });
   }
 
   const config: EndpointConfig = {
@@ -405,8 +435,8 @@ serve(async (req: Request) => {
       error instanceof Error ? error.message : ERROR_INTERNAL_SERVER,
       error instanceof UtilsError ? error.statusCode : STATUS_INTERNAL_ERROR,
       correlationId,
-      { errorCode: error instanceof UtilsError ? error.code : ERROR_CODE_INTERNAL_ERROR },
+      { errorCode: error instanceof UtilsError ? error.code : ERROR_CODE_INTERNAL_ERROR as string },
+      req,
     );
   }
 });
-

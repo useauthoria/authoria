@@ -13,6 +13,7 @@ import {
   getMemoryStats,
   UtilsError,
   SupabaseClientError,
+  createCORSHeaders,
 } from '../_shared/utils.ts';
 
 interface DenoEnv {
@@ -40,7 +41,7 @@ interface MaintenanceResponse {
 
 interface RequestContext {
   readonly req: MaintenanceRequest;
-  readonly supabase: ReturnType<typeof getSupabaseClient>;
+  readonly supabase: Awaited<ReturnType<typeof getSupabaseClient>>;
   readonly correlationId: string;
   readonly startTime: number;
 }
@@ -128,89 +129,81 @@ interface RouteConfig {
   readonly config: EndpointConfig;
 }
 
-const ENV_SUPABASE_URL = 'SUPABASE_URL';
-const ENV_SUPABASE_ANON_KEY = 'SUPABASE_ANON_KEY';
-const ENV_SUPABASE_SERVICE_ROLE_KEY = 'SUPABASE_SERVICE_ROLE_KEY';
-const ENV_ADMIN_API_KEY = 'ADMIN_API_KEY';
-const ENV_MAINTENANCE_TIMEOUT = 'MAINTENANCE_TIMEOUT';
-const ENV_CORS_ORIGINS = 'CORS_ORIGINS';
-const ENV_WARM_UP_TIMEOUT = 'WARM_UP_TIMEOUT';
-const ENV_WARM_UP_ENDPOINTS = 'WARM_UP_ENDPOINTS';
-const ENV_ENABLE_PARALLEL_WARM_UP = 'ENABLE_PARALLEL_WARM_UP';
-const ENV_MAX_RETRIES = 'MAX_RETRIES';
-const ENV_RETRY_DELAY_MS = 'RETRY_DELAY_MS';
-const ENV_CACHE_REFRESH_TIMEOUT = 'CACHE_REFRESH_TIMEOUT';
+const ENV_SUPABASE_URL = 'SUPABASE_URL' as const;
+const ENV_SUPABASE_ANON_KEY = 'SUPABASE_ANON_KEY' as const;
+const ENV_SUPABASE_SERVICE_ROLE_KEY = 'SUPABASE_SERVICE_ROLE_KEY' as const;
+const ENV_ADMIN_API_KEY = 'ADMIN_API_KEY' as const;
+const ENV_MAINTENANCE_TIMEOUT = 'MAINTENANCE_TIMEOUT' as const;
+const ENV_CORS_ORIGINS = 'CORS_ORIGINS' as const;
+const ENV_WARM_UP_TIMEOUT = 'WARM_UP_TIMEOUT' as const;
+const ENV_WARM_UP_ENDPOINTS = 'WARM_UP_ENDPOINTS' as const;
+const ENV_ENABLE_PARALLEL_WARM_UP = 'ENABLE_PARALLEL_WARM_UP' as const;
+const ENV_MAX_RETRIES = 'MAX_RETRIES' as const;
+const ENV_RETRY_DELAY_MS = 'RETRY_DELAY_MS' as const;
+const ENV_CACHE_REFRESH_TIMEOUT = 'CACHE_REFRESH_TIMEOUT' as const;
 const DEFAULT_TIMEOUT = 60000;
 const DEFAULT_WARM_UP_TIMEOUT = 30000;
 const DEFAULT_MAX_RETRIES = 2;
 const DEFAULT_RETRY_DELAY_MS = 1000;
 const DEFAULT_CACHE_REFRESH_TIMEOUT = 300000;
-const DEFAULT_WARM_UP_ENDPOINTS = '/functions/v1/create-post,/functions/v1/admin-api,/functions/v1/api-router';
+const DEFAULT_WARM_UP_ENDPOINTS = '/functions/v1/api-router,/functions/v1/admin-api' as const;
 const MIN_TOKEN_LENGTH = 20;
-const BEARER_PREFIX = 'Bearer ';
+const BEARER_PREFIX = 'Bearer ' as const;
 const BEARER_PREFIX_LENGTH = 7;
 const ID_RADIX = 36;
 const ID_LENGTH = 9;
-const CORRELATION_PREFIX = 'maintenance-';
-const METHOD_GET = 'GET';
-const METHOD_POST = 'POST';
-const METHOD_OPTIONS = 'OPTIONS';
+const CORRELATION_PREFIX = 'maintenance-' as const;
+const METHOD_GET = 'GET' as const;
+const METHOD_POST = 'POST' as const;
+const METHOD_OPTIONS = 'OPTIONS' as const;
 const STATUS_OK = 200;
-const STATUS_BAD_REQUEST = 400;
 const STATUS_UNAUTHORIZED = 401;
 const STATUS_NOT_FOUND = 404;
 const STATUS_REQUEST_TIMEOUT = 408;
 const STATUS_TOO_MANY_REQUESTS = 429;
 const STATUS_INTERNAL_ERROR = 500;
-const HEADER_AUTHORIZATION = 'Authorization';
-const HEADER_X_CORRELATION_ID = 'x-correlation-id';
-const HEADER_X_RESPONSE_TIME = 'x-response-time';
-const HEADER_CONTENT_TYPE = 'Content-Type';
-const HEADER_CONTENT_TYPE_JSON = 'application/json';
-const HEADER_ACCESS_CONTROL_ALLOW_ORIGIN = 'Access-Control-Allow-Origin';
-const HEADER_ACCESS_CONTROL_ALLOW_HEADERS = 'Access-Control-Allow-Headers';
-const HEADER_ACCESS_CONTROL_ALLOW_METHODS = 'Access-Control-Allow-Methods';
-const HEADER_ACCESS_CONTROL_MAX_AGE = 'Access-Control-Max-Age';
-const CORS_HEADERS_VALUE = 'authorization, x-client-info, apikey, content-type, x-correlation-id, x-request-id';
-const CORS_METHODS_VALUE = 'POST, GET, OPTIONS';
-const CORS_MAX_AGE_VALUE = '86400';
-const ENCODING_NONE = 'none';
-const ERROR_UNAUTHORIZED = 'Unauthorized';
-const ERROR_MISSING_ENV = 'Missing environment variables';
-const ERROR_MISSING_AUTHORIZATION = 'Missing authorization header';
-const ERROR_INVALID_AUTHORIZATION = 'Invalid authorization';
-const ERROR_RATE_LIMIT_EXCEEDED = 'Rate limit exceeded';
-const ERROR_REQUEST_TIMEOUT = 'Request timeout';
-const ERROR_INTERNAL_SERVER = 'Internal server error';
-const ERROR_NOT_FOUND = 'Not Found';
-const ERROR_SUPABASE_URL_NOT_CONFIGURED = 'SUPABASE_URL not configured';
-const ERROR_WARM_UP_TIMEOUT = 'Warm-up timeout';
-const ERROR_CODE_UNAUTHORIZED = 'UNAUTHORIZED';
-const ERROR_CODE_CONFIG_ERROR = 'CONFIG_ERROR';
-const ERROR_CODE_TIMEOUT = 'TIMEOUT';
-const ERROR_CODE_INTERNAL_ERROR = 'INTERNAL_ERROR';
+const HEADER_AUTHORIZATION = 'Authorization' as const;
+const HEADER_X_CORRELATION_ID = 'x-correlation-id' as const;
+const HEADER_X_RESPONSE_TIME = 'x-response-time' as const;
+const HEADER_CONTENT_TYPE = 'Content-Type' as const;
+const HEADER_CONTENT_TYPE_JSON = 'application/json' as const;
+const ENCODING_NONE = 'none' as const;
+const ERROR_UNAUTHORIZED = 'Unauthorized' as const;
+const ERROR_MISSING_ENV = 'Missing environment variables' as const;
+const ERROR_MISSING_AUTHORIZATION = 'Missing authorization header' as const;
+const ERROR_INVALID_AUTHORIZATION = 'Invalid authorization' as const;
+const ERROR_RATE_LIMIT_EXCEEDED = 'Rate limit exceeded' as const;
+const ERROR_REQUEST_TIMEOUT = 'Request timeout' as const;
+const ERROR_INTERNAL_SERVER = 'Internal server error' as const;
+const ERROR_NOT_FOUND = 'Not Found' as const;
+const ERROR_SUPABASE_URL_NOT_CONFIGURED = 'SUPABASE_URL not configured' as const;
+const ERROR_WARM_UP_TIMEOUT = 'Warm-up timeout' as const;
+const ERROR_CODE_UNAUTHORIZED = 'UNAUTHORIZED' as const;
+const ERROR_CODE_CONFIG_ERROR = 'CONFIG_ERROR' as const;
+const ERROR_CODE_TIMEOUT = 'TIMEOUT' as const;
+const ERROR_CODE_INTERNAL_ERROR = 'INTERNAL_ERROR' as const;
 const RETRY_BACKOFF_BASE = 2;
 const RATE_LIMIT_WINDOW_MS = 60000;
 const RATE_LIMIT_WARM_UP_MAX = 10;
 const RATE_LIMIT_CACHE_REFRESH_MAX = 5;
 const RATE_LIMIT_HEALTH_MAX = 100;
 const HEALTH_CHECK_TIMEOUT_MS = 5000;
-const TABLE_STORES = 'stores';
-const COLUMN_ID = 'id';
-const RPC_REFRESH_MATERIALIZED_VIEW = 'refresh_materialized_view';
-const RPC_REFRESH_MATERIALIZED_VIEWS = 'refresh_materialized_views';
-const PARAM_VIEW_NAME = 'view_name';
-const QUERY_PARAM_ENDPOINTS = 'endpoints';
-const QUERY_PARAM_PARALLEL = 'parallel';
-const QUERY_PARAM_VIEW = 'view';
-const PATH_WARM_UP = 'warm-up';
-const PATH_REFRESH_CACHE = 'refresh-cache';
-const PATH_HEALTH = 'health';
-const PATH_ROOT = '/';
-const HEALTH_STATUS_HEALTHY = 'healthy';
-const HEALTH_STATUS_ERROR = 'error';
-const UNKNOWN_ENDPOINT = 'unknown';
-const UNKNOWN_ERROR = 'Unknown error';
+const TABLE_STORES = 'stores' as const;
+const COLUMN_ID = 'id' as const;
+const RPC_REFRESH_MATERIALIZED_VIEW = 'refresh_materialized_view' as const;
+const RPC_REFRESH_MATERIALIZED_VIEWS = 'refresh_materialized_views' as const;
+const PARAM_VIEW_NAME = 'view_name' as const;
+const QUERY_PARAM_ENDPOINTS = 'endpoints' as const;
+const QUERY_PARAM_PARALLEL = 'parallel' as const;
+const QUERY_PARAM_VIEW = 'view' as const;
+const PATH_WARM_UP = 'warm-up' as const;
+const PATH_REFRESH_CACHE = 'refresh-cache' as const;
+const PATH_HEALTH = 'health' as const;
+const PATH_ROOT = '/' as const;
+const HEALTH_STATUS_HEALTHY = 'healthy' as const;
+const HEALTH_STATUS_ERROR = 'error' as const;
+const UNKNOWN_ENDPOINT = 'unknown' as const;
+const UNKNOWN_ERROR = 'Unknown error' as const;
 
 function getEnv(key: string, defaultValue = ''): string {
   try {
@@ -226,24 +219,17 @@ const CONFIG = {
   SUPABASE_ANON_KEY: getEnv(ENV_SUPABASE_ANON_KEY, ''),
   SUPABASE_SERVICE_ROLE_KEY: getEnv(ENV_SUPABASE_SERVICE_ROLE_KEY, ''),
   ADMIN_API_KEY: getEnv(ENV_ADMIN_API_KEY, ''),
-  DEFAULT_TIMEOUT: parseInt(getEnv(ENV_MAINTENANCE_TIMEOUT, String(DEFAULT_TIMEOUT))),
+  DEFAULT_TIMEOUT: parseInt(getEnv(ENV_MAINTENANCE_TIMEOUT, String(DEFAULT_TIMEOUT)), 10),
   ENABLE_AUDIT_LOGGING: true,
   ENABLE_METRICS: true,
   CORS_ORIGINS: getEnv(ENV_CORS_ORIGINS, '*').split(','),
-  WARM_UP_TIMEOUT: parseInt(getEnv(ENV_WARM_UP_TIMEOUT, String(DEFAULT_WARM_UP_TIMEOUT))),
+  WARM_UP_TIMEOUT: parseInt(getEnv(ENV_WARM_UP_TIMEOUT, String(DEFAULT_WARM_UP_TIMEOUT)), 10),
   WARM_UP_ENDPOINTS: getEnv(ENV_WARM_UP_ENDPOINTS, DEFAULT_WARM_UP_ENDPOINTS).split(','),
   ENABLE_PARALLEL_WARM_UP: getEnv(ENV_ENABLE_PARALLEL_WARM_UP, 'true') !== 'false',
-  MAX_RETRIES: parseInt(getEnv(ENV_MAX_RETRIES, String(DEFAULT_MAX_RETRIES))),
-  RETRY_DELAY_MS: parseInt(getEnv(ENV_RETRY_DELAY_MS, String(DEFAULT_RETRY_DELAY_MS))),
-  CACHE_REFRESH_TIMEOUT: parseInt(getEnv(ENV_CACHE_REFRESH_TIMEOUT, String(DEFAULT_CACHE_REFRESH_TIMEOUT))),
-};
-
-const corsHeaders: Readonly<Record<string, string>> = {
-  [HEADER_ACCESS_CONTROL_ALLOW_ORIGIN]: CONFIG.CORS_ORIGINS[0] === '*' ? '*' : CONFIG.CORS_ORIGINS.join(','),
-  [HEADER_ACCESS_CONTROL_ALLOW_HEADERS]: CORS_HEADERS_VALUE,
-  [HEADER_ACCESS_CONTROL_ALLOW_METHODS]: CORS_METHODS_VALUE,
-  [HEADER_ACCESS_CONTROL_MAX_AGE]: CORS_MAX_AGE_VALUE,
-};
+  MAX_RETRIES: parseInt(getEnv(ENV_MAX_RETRIES, String(DEFAULT_MAX_RETRIES)), 10),
+  RETRY_DELAY_MS: parseInt(getEnv(ENV_RETRY_DELAY_MS, String(DEFAULT_RETRY_DELAY_MS)), 10),
+  CACHE_REFRESH_TIMEOUT: parseInt(getEnv(ENV_CACHE_REFRESH_TIMEOUT, String(DEFAULT_CACHE_REFRESH_TIMEOUT)), 10),
+} as const;
 
 async function validateAuth(authHeader: string | null, requiresAuth = false): Promise<AuthResult> {
   if (!requiresAuth) {
@@ -278,11 +264,11 @@ async function createRequestContext(req: Request, requiresAuth = false): Promise
   const authResult = await validateAuth(authHeader, requiresAuth);
 
   if (!authResult.valid) {
-    throw new UtilsError(authResult.error ?? ERROR_UNAUTHORIZED, ERROR_CODE_UNAUTHORIZED, STATUS_UNAUTHORIZED);
+    throw new UtilsError(authResult.error ?? ERROR_UNAUTHORIZED, ERROR_CODE_UNAUTHORIZED as string, STATUS_UNAUTHORIZED);
   }
 
   if (!CONFIG.SUPABASE_URL || !CONFIG.SUPABASE_SERVICE_ROLE_KEY) {
-    throw new UtilsError(ERROR_MISSING_ENV, ERROR_CODE_CONFIG_ERROR, STATUS_INTERNAL_ERROR);
+    throw new UtilsError(ERROR_MISSING_ENV, ERROR_CODE_CONFIG_ERROR as string, STATUS_INTERNAL_ERROR);
   }
 
   const supabase = await getSupabaseClient({ clientType: 'service' });
@@ -317,15 +303,14 @@ async function handleRequest(
         logger.warn('Rate limit exceeded', { correlationId, rateLimitKey, remaining: rateLimit.remaining });
         return createErrorResponse(ERROR_RATE_LIMIT_EXCEEDED, STATUS_TOO_MANY_REQUESTS, correlationId, {
           retryAfter: Math.ceil((rateLimit.resetAt - Date.now()) / 1000),
-        });
+        }, req);
       }
     }
-
 
     const timeout = config.timeout ?? CONFIG.DEFAULT_TIMEOUT;
     const timeoutPromise = new Promise<Response>((resolve) => {
       setTimeout(() => {
-        resolve(createErrorResponse(ERROR_REQUEST_TIMEOUT, STATUS_REQUEST_TIMEOUT, correlationId));
+        resolve(createErrorResponse(ERROR_REQUEST_TIMEOUT, STATUS_REQUEST_TIMEOUT, correlationId, undefined, req));
       }, timeout);
     });
 
@@ -369,7 +354,8 @@ async function handleRequest(
       error instanceof Error ? error.message : ERROR_INTERNAL_SERVER,
       error instanceof UtilsError ? error.statusCode : STATUS_INTERNAL_ERROR,
       correlationId,
-      { errorCode: error instanceof UtilsError ? error.code : ERROR_CODE_INTERNAL_ERROR },
+      { errorCode: error instanceof UtilsError ? error.code : ERROR_CODE_INTERNAL_ERROR as string },
+      req,
     );
   }
 }
@@ -391,10 +377,14 @@ async function createSuccessResponse(
     if (compression !== ENCODING_NONE) {
       return createCompressedResponse(response, {
         encoding: compression,
-        headers: corsHeaders,
+        headers: createCORSHeaders(options.request, CONFIG.CORS_ORIGINS),
       });
     }
   }
+
+  const corsHeaders = options.request
+    ? createCORSHeaders(options.request, CONFIG.CORS_ORIGINS)
+    : createCORSHeaders({ headers: new Headers() } as Request, CONFIG.CORS_ORIGINS);
 
   return new Response(JSON.stringify(response), {
     status: STATUS_OK,
@@ -411,12 +401,17 @@ function createErrorResponse(
   status: number,
   correlationId: string,
   metadata?: Readonly<Record<string, unknown>>,
+  request?: Request,
 ): Response {
   const response: MaintenanceResponse = {
     error,
     correlationId,
     ...(metadata && { metadata }),
   };
+
+  const corsHeaders = request
+    ? createCORSHeaders(request, CONFIG.CORS_ORIGINS)
+    : createCORSHeaders({ headers: new Headers() } as Request, CONFIG.CORS_ORIGINS);
 
   return new Response(JSON.stringify(response), {
     status,
@@ -459,6 +454,48 @@ async function retryOperation<T>(
   throw lastError ?? new Error(`Operation ${operationName ?? 'unknown'} failed after retries`);
 }
 
+async function warmUpEndpoint(endpoint: string): Promise<WarmUpResult> {
+  const startTime = performance.now();
+  try {
+    const endpointUrl = `${CONFIG.SUPABASE_URL}${endpoint}`;
+    const timeoutPromise = new Promise<Response>((_, reject) => {
+      setTimeout(
+        () => reject(new UtilsError(ERROR_WARM_UP_TIMEOUT, ERROR_CODE_TIMEOUT as string, STATUS_REQUEST_TIMEOUT)),
+        CONFIG.WARM_UP_TIMEOUT,
+      );
+    });
+
+    const response = await Promise.race([
+      fetch(endpointUrl, {
+        method: METHOD_GET,
+        headers: {
+          [HEADER_AUTHORIZATION]: `${BEARER_PREFIX}${CONFIG.SUPABASE_ANON_KEY ?? ''}`,
+        },
+      }),
+      timeoutPromise,
+    ]);
+
+    const duration = performance.now() - startTime;
+    return {
+      endpoint,
+      status: response.status,
+      success: response.ok,
+      duration,
+      timestamp: new Date().toISOString(),
+    };
+  } catch (error) {
+    const duration = performance.now() - startTime;
+    return {
+      endpoint,
+      status: 0,
+      success: false,
+      duration,
+      error: error instanceof Error ? error.message : String(error),
+      timestamp: new Date().toISOString(),
+    };
+  }
+}
+
 async function handleWarmUp(ctx: RequestContext): Promise<Response> {
   const { correlationId } = ctx;
   const url = new URL(ctx.req.url);
@@ -468,103 +505,32 @@ async function handleWarmUp(ctx: RequestContext): Promise<Response> {
   const endpoints = endpointsParam ? endpointsParam.split(',') : CONFIG.WARM_UP_ENDPOINTS;
 
   if (!CONFIG.SUPABASE_URL) {
-    throw new UtilsError(ERROR_SUPABASE_URL_NOT_CONFIGURED, ERROR_CODE_CONFIG_ERROR, STATUS_INTERNAL_ERROR);
+    throw new UtilsError(ERROR_SUPABASE_URL_NOT_CONFIGURED, ERROR_CODE_CONFIG_ERROR as string, STATUS_INTERNAL_ERROR);
   }
 
-  const results: WarmUpResult[] = [];
+  let results: ReadonlyArray<WarmUpResult>;
 
   if (enableParallel && endpoints.length > 1) {
-    const warmUpPromises = endpoints.map(async (endpoint): Promise<WarmUpResult> => {
-      const startTime = performance.now();
-      try {
-        const endpointUrl = `${CONFIG.SUPABASE_URL}${endpoint}`;
-        const timeoutPromise = new Promise<Response>((_, reject) => {
-          setTimeout(() => reject(new UtilsError(ERROR_WARM_UP_TIMEOUT, ERROR_CODE_TIMEOUT, STATUS_REQUEST_TIMEOUT)), CONFIG.WARM_UP_TIMEOUT);
-        });
-
-        const response = await Promise.race([
-          fetch(endpointUrl, {
-            method: METHOD_GET,
-            headers: {
-              [HEADER_AUTHORIZATION]: `${BEARER_PREFIX}${CONFIG.SUPABASE_ANON_KEY ?? ''}`,
-            },
-          }),
-          timeoutPromise,
-        ]);
-
-        const duration = performance.now() - startTime;
-        return {
-          endpoint,
-          status: response.status,
-          success: response.ok,
-          duration,
-          timestamp: new Date().toISOString(),
-        };
-      } catch (error) {
-        const duration = performance.now() - startTime;
-        return {
-          endpoint,
-          status: 0,
-          success: false,
-          duration,
-          error: error instanceof Error ? error.message : String(error),
-          timestamp: new Date().toISOString(),
-        };
-      }
-    });
-
+    const warmUpPromises = endpoints.map((endpoint) => warmUpEndpoint(endpoint));
     const parallelResults = await Promise.allSettled(warmUpPromises);
-    results.push(
-      ...parallelResults.map((result) =>
-        result.status === 'fulfilled' ? result.value : {
-          endpoint: UNKNOWN_ENDPOINT,
-          status: 0,
-          success: false,
-          duration: 0,
-          error: result.reason?.message ?? UNKNOWN_ERROR,
-          timestamp: new Date().toISOString(),
-        },
-      ),
+    results = parallelResults.map((result) =>
+      result.status === 'fulfilled'
+        ? result.value
+        : {
+            endpoint: UNKNOWN_ENDPOINT,
+            status: 0,
+            success: false,
+            duration: 0,
+            error: result.reason instanceof Error ? result.reason.message : UNKNOWN_ERROR,
+            timestamp: new Date().toISOString(),
+          },
     );
   } else {
+    const sequentialResults: WarmUpResult[] = [];
     for (const endpoint of endpoints) {
-      const startTime = performance.now();
-      try {
-        const endpointUrl = `${CONFIG.SUPABASE_URL}${endpoint}`;
-        const timeoutPromise = new Promise<Response>((_, reject) => {
-          setTimeout(() => reject(new UtilsError(ERROR_WARM_UP_TIMEOUT, ERROR_CODE_TIMEOUT, STATUS_REQUEST_TIMEOUT)), CONFIG.WARM_UP_TIMEOUT);
-        });
-
-        const response = await Promise.race([
-          fetch(endpointUrl, {
-            method: METHOD_GET,
-            headers: {
-              [HEADER_AUTHORIZATION]: `${BEARER_PREFIX}${CONFIG.SUPABASE_ANON_KEY ?? ''}`,
-            },
-          }),
-          timeoutPromise,
-        ]);
-
-        const duration = performance.now() - startTime;
-        results.push({
-          endpoint,
-          status: response.status,
-          success: response.ok,
-          duration,
-          timestamp: new Date().toISOString(),
-        });
-      } catch (error) {
-        const duration = performance.now() - startTime;
-        results.push({
-          endpoint,
-          status: 0,
-          success: false,
-          duration,
-          error: error instanceof Error ? error.message : String(error),
-          timestamp: new Date().toISOString(),
-        });
-      }
+      sequentialResults.push(await warmUpEndpoint(endpoint));
     }
+    results = sequentialResults;
   }
 
   const successful = results.filter((r) => r.success).length;
@@ -637,7 +603,7 @@ async function handleRefreshCache(ctx: RequestContext): Promise<Response> {
           success: !error,
           duration,
           timestamp: new Date().toISOString(),
-          ...(error && { error: error.message }),
+          ...(error && { error: error instanceof Error ? error.message : String(error) }),
         });
       } catch (error) {
         const duration = performance.now() - viewStartTime;
@@ -668,7 +634,7 @@ async function handleRefreshCache(ctx: RequestContext): Promise<Response> {
         success: !error,
         duration,
         timestamp: new Date().toISOString(),
-        ...(error && { error: error.message }),
+        ...(error && { error: error instanceof Error ? error.message : String(error) }),
       });
     }
 
@@ -838,7 +804,7 @@ async function routeRequest(ctx: RequestContext): Promise<Response> {
   const matchedRoute = routes[routeKey];
 
   if (!matchedRoute) {
-    return createErrorResponse(ERROR_NOT_FOUND, STATUS_NOT_FOUND, ctx.correlationId);
+    return createErrorResponse(ERROR_NOT_FOUND, STATUS_NOT_FOUND, ctx.correlationId, undefined, ctx.req);
   }
 
   return handleRequest(ctx.req, matchedRoute.handler, matchedRoute.config);
@@ -846,7 +812,7 @@ async function routeRequest(ctx: RequestContext): Promise<Response> {
 
 serve(async (req: Request) => {
   if (req.method === METHOD_OPTIONS) {
-    return new Response('ok', { headers: corsHeaders });
+    return new Response('ok', { headers: createCORSHeaders(req, CONFIG.CORS_ORIGINS) });
   }
 
   try {
@@ -870,7 +836,8 @@ serve(async (req: Request) => {
       error instanceof Error ? error.message : ERROR_INTERNAL_SERVER,
       error instanceof UtilsError ? error.statusCode : STATUS_INTERNAL_ERROR,
       correlationId,
-      { errorCode: error instanceof UtilsError ? error.code : ERROR_CODE_INTERNAL_ERROR },
+      { errorCode: error instanceof UtilsError ? error.code : ERROR_CODE_INTERNAL_ERROR as string },
+      req,
     );
   }
 });

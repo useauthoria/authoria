@@ -1,9 +1,3 @@
-/**
- * Shopify App Bridge utilities
- * Provides access to App Bridge APIs for navigation, modals, toasts, etc.
- */
-
-
 interface ShopifyAppBridge {
   readonly app?: {
     readonly navigate?: (path: string) => void;
@@ -24,13 +18,63 @@ interface WindowWithShopify extends Window {
   readonly shopify?: ShopifyAppBridge;
 }
 
+interface ImportMetaEnv {
+  readonly DEV?: boolean;
+}
+
+interface ImportMeta {
+  readonly env?: ImportMetaEnv;
+}
+
+const POLL_INTERVAL_MS = 100;
+const WAIT_TIMEOUT_MS = 5000;
+const SHOPIFY_DOMAIN_SUFFIX = 'myshopify.com';
+const DEV_SHOP_DOMAIN = 'example.myshopify.com';
+const URL_PARAM_SHOP = 'shop';
+const MAX_PATH_LENGTH = 2048;
+const MAX_SHOP_DOMAIN_LENGTH = 255;
+
 let appBridgeInstance: ShopifyAppBridge | null = null;
 
-/**
- * Get the App Bridge instance
- */
+const hasWindow = (): boolean => {
+  return typeof window !== 'undefined';
+};
+
+const hasShopify = (window: Window): window is WindowWithShopify => {
+  return 'shopify' in window;
+};
+
+const validatePath = (path: string | undefined | null): string | null => {
+  if (!path || typeof path !== 'string') {
+    return null;
+  }
+  const trimmed = path.trim();
+  if (trimmed.length === 0 || trimmed.length > MAX_PATH_LENGTH) {
+    return null;
+  }
+  return trimmed;
+};
+
+const validateShopDomain = (shopDomain: string | undefined | null): string | null => {
+  if (!shopDomain || typeof shopDomain !== 'string') {
+    return null;
+  }
+  const trimmed = shopDomain.trim();
+  if (trimmed.length === 0 || trimmed.length > MAX_SHOP_DOMAIN_LENGTH) {
+    return null;
+  }
+  if (!trimmed.includes('.')) {
+    return null;
+  }
+  return trimmed;
+};
+
+const isShopifyDomain = (hostname: string): boolean => {
+  return typeof hostname === 'string' && hostname.includes(SHOPIFY_DOMAIN_SUFFIX);
+};
+
 function getAppBridge(): ShopifyAppBridge | null {
-  if (typeof window === 'undefined') {
+  if (!hasWindow()) {
     return null;
   }
 
@@ -38,113 +82,173 @@ function getAppBridge(): ShopifyAppBridge | null {
     return appBridgeInstance;
   }
 
-  const shopify = (window as WindowWithShopify).shopify;
-  if (shopify) {
-    appBridgeInstance = shopify;
-    return shopify;
+  if (hasShopify(window)) {
+    const shopify = window.shopify;
+    if (shopify) {
+      appBridgeInstance = shopify;
+      return shopify;
+    }
   }
 
   return null;
 }
 
-/**
- * Wait for App Bridge to be ready
- */
 export async function waitForAppBridge(): Promise<ShopifyAppBridge | null> {
   const appBridge = getAppBridge();
   if (appBridge?.ready) {
-    await appBridge.ready;
-    return appBridge;
+    try {
+      await appBridge.ready;
+      return appBridge;
+    } catch {
+      return appBridge;
+    }
   }
 
-  // Poll for App Bridge
-  return new Promise((resolve) => {
-    const checkInterval = setInterval(() => {
+  return new Promise<ShopifyAppBridge | null>((resolve) => {
+    let checkIntervalId: ReturnType<typeof setInterval> | null = null;
+    let timeoutId: ReturnType<typeof setTimeout> | null = null;
+
+    const cleanup = () => {
+      if (checkIntervalId !== null) {
+        clearInterval(checkIntervalId);
+        checkIntervalId = null;
+      }
+      if (timeoutId !== null) {
+        clearTimeout(timeoutId);
+        timeoutId = null;
+      }
+    };
+
+    checkIntervalId = setInterval(() => {
       const bridge = getAppBridge();
       if (bridge) {
-        clearInterval(checkInterval);
+        cleanup();
         if (bridge.ready) {
-          bridge.ready.then(() => resolve(bridge)).catch(() => resolve(bridge));
+          bridge.ready
+            .then(() => {
+              resolve(bridge);
+            })
+            .catch(() => {
+              resolve(bridge);
+            });
         } else {
           resolve(bridge);
         }
       }
-    }, 100);
+    }, POLL_INTERVAL_MS);
 
-    // Timeout after 5 seconds
-    setTimeout(() => {
-      clearInterval(checkInterval);
+    timeoutId = setTimeout(() => {
+      cleanup();
       resolve(getAppBridge());
-    }, 5000);
+    }, WAIT_TIMEOUT_MS);
   });
 }
 
-/**
- * Navigate using App Bridge
- */
 export async function navigate(path: string): Promise<void> {
-  const appBridge = await waitForAppBridge();
-  if (appBridge?.app?.navigate) {
-    appBridge.app.navigate(path);
-  } else if (appBridge?.intents?.navigate) {
-    appBridge.intents.navigate(path);
-  } else {
-    // Fallback to regular navigation
-    window.location.href = path;
+  const validatedPath = validatePath(path);
+  if (!validatedPath) {
+    throw new Error('Invalid path');
+  }
+
+  if (!hasWindow()) {
+    throw new Error('Window is not available');
+  }
+
+  try {
+    const appBridge = await waitForAppBridge();
+    if (appBridge?.app?.navigate && typeof appBridge.app.navigate === 'function') {
+      appBridge.app.navigate(validatedPath);
+      return;
+    }
+
+    if (appBridge?.intents?.navigate && typeof appBridge.intents.navigate === 'function') {
+      appBridge.intents.navigate(validatedPath);
+      return;
+    }
+  } catch {
+  }
+
+  try {
+    window.location.href = validatedPath;
+  } catch {
+    throw new Error('Failed to navigate');
   }
 }
 
-/**
- * Check if app is embedded
- */
 export function isEmbedded(): boolean {
   const appBridge = getAppBridge();
-  return appBridge?.environment?.embedded ?? false;
+  if (!appBridge?.environment) {
+    return false;
+  }
+  return appBridge.environment.embedded === true;
 }
-
-/**
- * Shop context utilities
- */
-
-const SHOPIFY_DOMAIN_SUFFIX = 'myshopify.com';
-const DEV_SHOP_DOMAIN = 'example.myshopify.com';
-const URL_PARAM_SHOP = 'shop';
 
 function getShopFromAppBridge(): string | null {
-  if (typeof window === 'undefined') {
+  if (!hasWindow()) {
     return null;
   }
 
-  const shopify = (window as WindowWithShopify).shopify;
-  return shopify?.config?.shop ?? null;
-}
-
-function getShopFromUrl(): string | null {
-  if (typeof window === 'undefined') {
-    return null;
-  }
-
-  const urlParams = new URLSearchParams(window.location.search);
-  return urlParams.get(URL_PARAM_SHOP);
-}
-
-function getShopFromHostname(): string | null {
-  if (typeof window === 'undefined') {
-    return null;
-  }
-
-  const hostname = window.location.hostname;
-  if (hostname.includes(SHOPIFY_DOMAIN_SUFFIX)) {
-    return hostname;
+  if (hasShopify(window)) {
+    const shopify = window.shopify;
+    if (shopify?.config?.shop) {
+      const validated = validateShopDomain(shopify.config.shop);
+      if (validated) {
+        return validated;
+      }
+    }
   }
 
   return null;
 }
 
-/**
- * Get the shop domain from App Bridge, URL, or hostname
- * Returns null if shop domain cannot be determined (e.g., when not in Shopify context)
- */
+function getShopFromUrl(): string | null {
+  if (!hasWindow()) {
+    return null;
+  }
+
+  try {
+    const urlParams = new URLSearchParams(window.location.search);
+    const shop = urlParams.get(URL_PARAM_SHOP);
+    if (shop) {
+      const validated = validateShopDomain(shop);
+      if (validated) {
+        return validated;
+      }
+    }
+  } catch {
+  }
+
+  return null;
+}
+
+function getShopFromHostname(): string | null {
+  if (!hasWindow()) {
+    return null;
+  }
+
+  try {
+    const hostname = window.location.hostname;
+    if (isShopifyDomain(hostname)) {
+      const validated = validateShopDomain(hostname);
+      if (validated) {
+        return validated;
+      }
+    }
+  } catch {
+  }
+
+  return null;
+}
+
+const isDevMode = (): boolean => {
+  try {
+    const meta = import.meta as ImportMeta;
+    return meta.env?.DEV === true;
+  } catch {
+    return false;
+  }
+};
+
 export function getShopDomain(): string | null {
   const appBridgeShop = getShopFromAppBridge();
   if (appBridgeShop) {
@@ -161,11 +265,9 @@ export function getShopDomain(): string | null {
     return hostnameShop;
   }
 
-  if ((import.meta as { env?: { DEV?: boolean } }).env?.DEV) {
+  if (isDevMode()) {
     return DEV_SHOP_DOMAIN;
   }
 
-  // Return null instead of throwing - allows app to handle missing shop domain gracefully
   return null;
 }
-

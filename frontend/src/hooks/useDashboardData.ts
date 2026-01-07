@@ -1,4 +1,4 @@
-import { useMemo, useEffect, useCallback } from 'react';
+import { useMemo, useEffect, useCallback, useRef } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { useStore, useQuotaStatus, usePosts, queryKeys } from '../lib/api-cache';
 import { getShopDomain } from '../lib/app-bridge';
@@ -23,50 +23,110 @@ export interface DashboardData {
   readonly refetch: () => void;
 }
 
-export function useDashboardData(options: UseDashboardDataOptions = {}): DashboardData {
-  const {
-    onError,
-  } = options;
+const BATCH_STALE_TIME = 60000;
+const BATCH_GC_TIME = 5 * 60 * 1000;
+const BATCH_REFETCH_INTERVAL = 2 * 60 * 1000;
+const ANALYTICS_STALE_TIME = 5 * 60 * 1000;
+const ANALYTICS_GC_TIME = 10 * 60 * 1000;
+const MAX_STORE_ID_LENGTH = 200;
+const MAX_SHOP_DOMAIN_LENGTH = 200;
 
+const validateStoreId = (storeId: string | undefined): string => {
+  if (!storeId || typeof storeId !== 'string') {
+    return '';
+  }
+  const trimmed = storeId.trim();
+  if (trimmed.length === 0 || trimmed.length > MAX_STORE_ID_LENGTH) {
+    return '';
+  }
+  return trimmed;
+};
+
+const validateShopDomain = (shopDomain: string | null | undefined): string | null => {
+  if (!shopDomain || typeof shopDomain !== 'string') {
+    return null;
+  }
+  const trimmed = shopDomain.trim();
+  if (trimmed.length === 0 || trimmed.length > MAX_SHOP_DOMAIN_LENGTH) {
+    return null;
+  }
+  return trimmed;
+};
+
+const normalizeError = (error: unknown): Error => {
+  if (error instanceof Error) {
+    return error;
+  }
+  if (error !== null && typeof error === 'object' && 'message' in error) {
+    const message = String(error.message);
+    return new Error(message.length > 0 ? message : 'Unknown error');
+  }
+  return new Error(String(error));
+};
+
+export function useDashboardData(
+  options: UseDashboardDataOptions = {},
+): DashboardData {
+  const isMountedRef = useRef(true);
+  const { onError } = options;
   const { isOnline } = useNetworkStatus();
 
   const shopDomain = useMemo(() => {
     const domain = getShopDomain();
-    if (!domain && onError) {
-      onError(new Error('Shop domain not available'));
+    const validated = validateShopDomain(domain);
+    if (!validated && onError && isMountedRef.current) {
+      try {
+        onError(new Error('Shop domain not available'));
+      } catch {
+      }
     }
-    return domain;
+    return validated;
   }, [onError]);
+
+  const validatedShopDomain = useMemo(() => shopDomain ?? '', [shopDomain]);
 
   const {
     data: store,
     isLoading: storeLoading,
     error: storeError,
     refetch: refetchStore,
-  } = useStore(shopDomain ?? '');
+  } = useStore(validatedShopDomain);
 
-  const storeId = store?.id ?? '';
-  const hasStoreId = !!storeId;
+  const storeId = useMemo(() => {
+    const id = store?.id;
+    return validateStoreId(id);
+  }, [store?.id]);
 
-  // Use batch endpoint to reduce Edge Function invocations from 5-6 calls to 1 call
+  const hasStoreId = useMemo(() => storeId.length > 0, [storeId]);
+
   const {
     data: batchData,
     isLoading: batchLoading,
     error: batchError,
     refetch: refetchBatch,
   } = useQuery({
-    queryKey: ['dashboard-batch', storeId, shopDomain],
+    queryKey: ['dashboard-batch', storeId, shopDomain] as const,
     queryFn: async () => {
-      if (!storeId && !shopDomain) return null;
-      return dashboardApi.getBatch(storeId || '', shopDomain || '');
+      if (!storeId && !shopDomain) {
+        return null;
+      }
+      const validatedStoreId = validateStoreId(storeId);
+      const validatedDomain = validateShopDomain(shopDomain);
+      if (!validatedStoreId && !validatedDomain) {
+        return null;
+      }
+      try {
+        return await dashboardApi.getBatch(validatedStoreId, validatedDomain || '');
+      } catch {
+        return null;
+      }
     },
-    enabled: (!!storeId || !!shopDomain) && isOnline,
-    staleTime: 60000, // 1 minute
-    gcTime: 5 * 60 * 1000, // 5 minutes
-    refetchInterval: 2 * 60 * 1000, // Refetch every 2 minutes (reduced from individual polling)
+    enabled: (hasStoreId || !!shopDomain) && isOnline,
+    staleTime: BATCH_STALE_TIME,
+    gcTime: BATCH_GC_TIME,
+    refetchInterval: BATCH_REFETCH_INTERVAL,
   });
 
-  // Fallback to individual queries if batch fails or storeId not available yet
   const {
     data: quota,
     isLoading: quotaLoading,
@@ -102,58 +162,201 @@ export function useDashboardData(options: UseDashboardDataOptions = {}): Dashboa
   } = useQuery({
     queryKey: queryKeys.analytics(storeId),
     queryFn: async () => {
-      if (!storeId) return null;
-      return analyticsApi.getMetrics(storeId);
+      if (!storeId) {
+        return null;
+      }
+      try {
+        return await analyticsApi.getMetrics(storeId);
+      } catch {
+        return null;
+      }
     },
-    enabled: !!storeId && isOnline && !batchData, // Only fetch if batch didn't provide analytics
-    staleTime: 5 * 60 * 1000,
-    gcTime: 10 * 60 * 1000,
+    enabled: hasStoreId && isOnline && !batchData,
+    staleTime: ANALYTICS_STALE_TIME,
+    gcTime: ANALYTICS_GC_TIME,
   });
 
-  // Use batch data if available, otherwise fall back to individual queries
-  const finalQuota = batchData?.quota ?? quota ?? null;
-  const finalPosts = batchData?.posts ?? posts ?? [];
-  const finalScheduledPosts = batchData?.scheduledPosts ?? scheduledPosts ?? [];
-  const finalDraftPosts = batchData?.draftPosts ?? draftPosts ?? [];
-  const finalAnalytics = batchData?.analytics ?? analytics ?? null;
+  const finalQuota = useMemo(
+    () => batchData?.quota ?? quota ?? null,
+    [batchData?.quota, quota],
+  );
 
-  // Only consider loading for queries that are actually enabled
-  const isLoading = shopDomain 
-    ? storeLoading || (hasStoreId && (batchLoading || (!batchData && (quotaLoading || postsLoading || scheduledPostsLoading || draftPostsLoading))))
-    : false;
-  const isError = !!storeError || !!batchError || (!batchData && (!!quotaError || !!postsError || !!scheduledPostsError || !!draftPostsError || !!analyticsError));
-  const error = storeError || batchError || (!batchData && (quotaError || postsError || scheduledPostsError || draftPostsError || analyticsError)) || null;
+  const finalPosts = useMemo(
+    () => (batchData?.posts ?? posts ?? []) as readonly BlogPost[],
+    [batchData?.posts, posts],
+  );
+
+  const finalScheduledPosts = useMemo(
+    () => (batchData?.scheduledPosts ?? scheduledPosts ?? []) as readonly BlogPost[],
+    [batchData?.scheduledPosts, scheduledPosts],
+  );
+
+  const finalDraftPosts = useMemo(
+    () => (batchData?.draftPosts ?? draftPosts ?? []) as readonly BlogPost[],
+    [batchData?.draftPosts, draftPosts],
+  );
+
+  const finalAnalytics = useMemo(
+    () => batchData?.analytics ?? analytics ?? null,
+    [batchData?.analytics, analytics],
+  );
+
+  const isLoading = useMemo(() => {
+    if (!shopDomain) {
+      return false;
+    }
+    if (storeLoading) {
+      return true;
+    }
+    if (!hasStoreId) {
+      return false;
+    }
+    if (batchLoading) {
+      return true;
+    }
+    if (batchData) {
+      return false;
+    }
+    return (
+      quotaLoading ||
+      postsLoading ||
+      scheduledPostsLoading ||
+      draftPostsLoading
+    );
+  }, [
+    shopDomain,
+    storeLoading,
+    hasStoreId,
+    batchLoading,
+    batchData,
+    quotaLoading,
+    postsLoading,
+    scheduledPostsLoading,
+    draftPostsLoading,
+  ]);
+
+  const isError = useMemo(() => {
+    if (storeError || batchError) {
+      return true;
+    }
+    if (batchData) {
+      return false;
+    }
+    return !!(
+      quotaError ||
+      postsError ||
+      scheduledPostsError ||
+      draftPostsError ||
+      analyticsError
+    );
+  }, [
+    storeError,
+    batchError,
+    batchData,
+    quotaError,
+    postsError,
+    scheduledPostsError,
+    draftPostsError,
+    analyticsError,
+  ]);
+
+  const error = useMemo(() => {
+    if (storeError) {
+      return normalizeError(storeError);
+    }
+    if (batchError) {
+      return normalizeError(batchError);
+    }
+    if (batchData) {
+      return null;
+    }
+    const individualError =
+      quotaError ||
+      postsError ||
+      scheduledPostsError ||
+      draftPostsError ||
+      analyticsError;
+    return individualError ? normalizeError(individualError) : null;
+  }, [
+    storeError,
+    batchError,
+    batchData,
+    quotaError,
+    postsError,
+    scheduledPostsError,
+    draftPostsError,
+    analyticsError,
+  ]);
 
   const refetch = useCallback(() => {
-    refetchStore();
-    if (batchData) {
-      refetchBatch(); // Use batch refetch if available
-    } else {
-      // Fallback to individual refetches
-      refetchQuota();
-      refetchPosts();
-      refetchScheduledPosts();
-      refetchDraftPosts();
-      refetchAnalytics();
+    if (!isMountedRef.current) {
+      return;
     }
-  }, [refetchStore, refetchBatch, refetchQuota, refetchPosts, refetchScheduledPosts, refetchDraftPosts, refetchAnalytics, batchData]);
+    try {
+      refetchStore();
+      if (batchData) {
+        refetchBatch();
+      } else {
+        refetchQuota();
+        refetchPosts();
+        refetchScheduledPosts();
+        refetchDraftPosts();
+        refetchAnalytics();
+      }
+    } catch {
+    }
+  }, [
+    refetchStore,
+    refetchBatch,
+    refetchQuota,
+    refetchPosts,
+    refetchScheduledPosts,
+    refetchDraftPosts,
+    refetchAnalytics,
+    batchData,
+  ]);
 
   useEffect(() => {
-    if (error && onError) {
-      onError(error instanceof Error ? error : new Error(String(error)));
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!error || !onError || !isMountedRef.current) {
+      return;
+    }
+    try {
+      onError(error);
+    } catch {
     }
   }, [error, onError]);
 
-  return {
-    store: store ?? null,
-    quota: finalQuota,
-    posts: finalPosts,
-    scheduledPosts: finalScheduledPosts,
-    draftPosts: finalDraftPosts,
-    analytics: finalAnalytics,
-    isLoading,
-    isError,
-    error,
-    refetch,
-  };
+  return useMemo(
+    () => ({
+      store: store ?? null,
+      quota: finalQuota,
+      posts: finalPosts,
+      scheduledPosts: finalScheduledPosts,
+      draftPosts: finalDraftPosts,
+      analytics: finalAnalytics,
+      isLoading,
+      isError,
+      error,
+      refetch,
+    }),
+    [
+      store,
+      finalQuota,
+      finalPosts,
+      finalScheduledPosts,
+      finalDraftPosts,
+      finalAnalytics,
+      isLoading,
+      isError,
+      error,
+      refetch,
+    ],
+  );
 }

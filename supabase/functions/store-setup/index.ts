@@ -11,8 +11,8 @@ import {
   executeErrorInterceptors,
   UtilsError,
   SupabaseClientError,
+  createCORSHeaders,
 } from '../_shared/utils.ts';
-import type { BrandAnalysis } from '../backend/src/core/BrandManager.ts';
 
 interface DenoEnv {
   readonly get?: (key: string) => string | undefined;
@@ -45,7 +45,7 @@ interface StoreSetupResponse {
 
 interface RequestContext {
   readonly req: StoreSetupRequest;
-  readonly supabase: ReturnType<typeof getSupabaseClient>;
+  readonly supabase: Awaited<ReturnType<typeof getSupabaseClient>>;
   readonly correlationId: string;
   readonly userId?: string;
   storeId?: string;
@@ -84,11 +84,6 @@ interface DatabaseStore {
   readonly [key: string]: unknown;
 }
 
-interface DatabaseProduct {
-  readonly title: string;
-  readonly description: string | null;
-}
-
 interface SetupRequestBody {
   readonly storeId?: string;
 }
@@ -103,28 +98,91 @@ interface SetupResult {
   readonly warnings?: ReadonlyArray<string>;
 }
 
-const ENV_SUPABASE_URL = 'SUPABASE_URL';
-const ENV_SUPABASE_ANON_KEY = 'SUPABASE_ANON_KEY';
-const ENV_OPENAI_API_KEY = 'OPENAI_API_KEY';
-const ENV_STORE_SETUP_TIMEOUT = 'STORE_SETUP_TIMEOUT';
-const ENV_CORS_ORIGINS = 'CORS_ORIGINS';
-const ENV_MAX_REQUEST_SIZE = 'MAX_REQUEST_SIZE';
-const ENV_MAX_RETRIES = 'MAX_RETRIES';
-const ENV_RETRY_DELAY_MS = 'RETRY_DELAY_MS';
-const ENV_MAX_PRODUCTS_TO_ANALYZE = 'MAX_PRODUCTS_TO_ANALYZE';
+interface StoreAssets {
+  readonly shop?: { readonly name?: string; readonly description?: string } | null;
+  readonly products?: ReadonlyArray<{ readonly title?: string; readonly body_html?: string; readonly product_type?: string; readonly tags?: string }> | null;
+  readonly collections?: ReadonlyArray<{ readonly body_html?: string; readonly title?: string; readonly handle?: string }> | null;
+  readonly pages?: ReadonlyArray<{ readonly body_html?: string; readonly title?: string; readonly handle?: string }> | null;
+  readonly blogArticles?: ReadonlyArray<{ readonly title?: string; readonly body_html?: string }> | null;
+}
+
+interface ExtractedContent {
+  readonly shopDescription: string;
+  readonly productText: readonly string[];
+  readonly collectionText: readonly string[];
+  readonly pageText: readonly string[];
+  readonly aboutPageText: string;
+  readonly articleText: readonly string[];
+}
+
+interface BrandDNAResponse {
+  readonly brandName?: string;
+  readonly brandValues?: readonly string[];
+  readonly productCategories?: readonly string[];
+  readonly priceRange?: string;
+  readonly toneKeywords?: readonly string[];
+  readonly messagingThemes?: readonly string[];
+  readonly uniqueSellingPoints?: readonly string[];
+  readonly brandMission?: string;
+  readonly brandVision?: string;
+  readonly brandPersonality?: readonly string[];
+  readonly brandArchetype?: string;
+}
+
+interface ToneAnalysisResponse {
+  readonly [key: string]: number;
+}
+
+interface PersonaResponse {
+  readonly personas?: ReadonlyArray<{
+    readonly name: string;
+    readonly type: 'primary' | 'secondary' | 'tertiary';
+    readonly demographics?: {
+      readonly ageRange?: string;
+      readonly gender?: string;
+      readonly location?: string;
+      readonly income?: string;
+      readonly education?: string;
+    };
+    readonly psychographics?: {
+      readonly interests?: readonly string[];
+      readonly values?: readonly string[];
+      readonly lifestyle?: readonly string[];
+      readonly motivations?: readonly string[];
+    };
+    readonly painPoints?: readonly string[];
+    readonly buyingBehavior?: {
+      readonly preferredChannels?: readonly string[];
+      readonly decisionFactors?: readonly string[];
+      readonly priceSensitivity?: 'low' | 'medium' | 'high';
+      readonly frequency?: string;
+    };
+    readonly contentPreferences?: readonly string[];
+  }>;
+}
+
+const ENV_SUPABASE_URL = 'SUPABASE_URL' as const;
+const ENV_SUPABASE_ANON_KEY = 'SUPABASE_ANON_KEY' as const;
+const ENV_OPENAI_API_KEY = 'OPENAI_API_KEY' as const;
+const ENV_STORE_SETUP_TIMEOUT = 'STORE_SETUP_TIMEOUT' as const;
+const ENV_CORS_ORIGINS = 'CORS_ORIGINS' as const;
+const ENV_MAX_REQUEST_SIZE = 'MAX_REQUEST_SIZE' as const;
+const ENV_MAX_RETRIES = 'MAX_RETRIES' as const;
+const ENV_RETRY_DELAY_MS = 'RETRY_DELAY_MS' as const;
+const ENV_MAX_PRODUCTS_TO_ANALYZE = 'MAX_PRODUCTS_TO_ANALYZE' as const;
 const DEFAULT_TIMEOUT = 900000;
 const DEFAULT_MAX_REQUEST_SIZE = 1048576;
 const DEFAULT_MAX_RETRIES = 3;
 const DEFAULT_RETRY_DELAY_MS = 2000;
 const DEFAULT_MAX_PRODUCTS = 50;
 const MIN_TOKEN_LENGTH = 10;
-const BEARER_PREFIX = 'Bearer ';
+const BEARER_PREFIX = 'Bearer ' as const;
 const BEARER_PREFIX_LENGTH = 7;
 const ID_RADIX = 36;
 const ID_LENGTH = 9;
-const CORRELATION_PREFIX = 'store-setup-';
-const METHOD_POST = 'POST';
-const METHOD_OPTIONS = 'OPTIONS';
+const CORRELATION_PREFIX = 'store-setup-' as const;
+const METHOD_POST = 'POST' as const;
+const METHOD_OPTIONS = 'OPTIONS' as const;
 const STATUS_OK = 200;
 const STATUS_BAD_REQUEST = 400;
 const STATUS_UNAUTHORIZED = 401;
@@ -133,85 +191,105 @@ const STATUS_REQUEST_TIMEOUT = 408;
 const STATUS_PAYLOAD_TOO_LARGE = 413;
 const STATUS_TOO_MANY_REQUESTS = 429;
 const STATUS_INTERNAL_ERROR = 500;
-const HEADER_AUTHORIZATION = 'Authorization';
-const HEADER_X_CORRELATION_ID = 'x-correlation-id';
-const HEADER_X_RESPONSE_TIME = 'x-response-time';
-const HEADER_CONTENT_LENGTH = 'content-length';
-const HEADER_CONTENT_TYPE = 'Content-Type';
-const HEADER_CONTENT_TYPE_JSON = 'application/json';
-const HEADER_ACCESS_CONTROL_ALLOW_ORIGIN = 'Access-Control-Allow-Origin';
-const HEADER_ACCESS_CONTROL_ALLOW_HEADERS = 'Access-Control-Allow-Headers';
-const HEADER_ACCESS_CONTROL_ALLOW_METHODS = 'Access-Control-Allow-Methods';
-const HEADER_ACCESS_CONTROL_MAX_AGE = 'Access-Control-Max-Age';
-const CORS_HEADERS_VALUE = 'authorization, x-client-info, apikey, content-type, x-correlation-id, x-request-id';
-const CORS_METHODS_VALUE = 'POST, OPTIONS';
-const CORS_MAX_AGE_VALUE = '86400';
-const ENCODING_NONE = 'none';
-const ERROR_UNAUTHORIZED = 'Unauthorized';
-const ERROR_MISSING_ENV = 'Missing environment variables';
-const ERROR_MISSING_AUTHORIZATION = 'Missing authorization header';
-const ERROR_INVALID_AUTHORIZATION = 'Invalid authorization';
-const ERROR_REQUEST_TOO_LARGE = 'Request too large';
-const ERROR_RATE_LIMIT_EXCEEDED = 'Rate limit exceeded';
-const ERROR_REQUEST_TIMEOUT = 'Request timeout';
-const ERROR_INVALID_INPUT = 'Invalid input';
-const ERROR_INVALID_JSON = 'Invalid JSON in request body';
-const ERROR_INTERNAL_SERVER = 'Internal server error';
-const ERROR_NOT_FOUND = 'Not Found';
-const ERROR_STORE_NOT_FOUND = 'Store not found';
-const ERROR_STORE_NOT_FOUND_OR_ACCESS_DENIED = 'Store not found or access denied';
-const ERROR_OPENAI_NOT_CONFIGURED = 'OPENAI_API_KEY not configured';
-const ERROR_STORE_MISSING_CREDENTIALS = 'Store missing Shopify credentials';
-const ERROR_BRAND_ANALYSIS_FAILED = 'Brand analysis failed to produce results';
-const ERROR_STORE_ID_REQUIRED = 'storeId is required and must be a string';
-const ERROR_STORE_ID_EMPTY = 'storeId must be a non-empty string';
-const ERROR_CODE_UNAUTHORIZED = 'UNAUTHORIZED';
-const ERROR_CODE_CONFIG_ERROR = 'CONFIG_ERROR';
-const ERROR_CODE_STORE_NOT_FOUND = 'STORE_NOT_FOUND';
-const ERROR_CODE_STORE_CONFIG_ERROR = 'STORE_CONFIG_ERROR';
-const ERROR_CODE_ANALYSIS_ERROR = 'ANALYSIS_ERROR';
-const ERROR_CODE_INTERNAL_ERROR = 'INTERNAL_ERROR';
+const STATUS_NO_CONTENT = 204;
+const HEADER_AUTHORIZATION = 'Authorization' as const;
+const HEADER_X_CORRELATION_ID = 'x-correlation-id' as const;
+const HEADER_X_RESPONSE_TIME = 'x-response-time' as const;
+const HEADER_CONTENT_LENGTH = 'content-length' as const;
+const HEADER_CONTENT_TYPE = 'Content-Type' as const;
+const HEADER_CONTENT_TYPE_JSON = 'application/json' as const;
+const ENCODING_NONE = 'none' as const;
+const ERROR_UNAUTHORIZED = 'Unauthorized' as const;
+const ERROR_MISSING_ENV = 'Missing environment variables' as const;
+const ERROR_MISSING_AUTHORIZATION = 'Missing authorization header' as const;
+const ERROR_INVALID_AUTHORIZATION = 'Invalid authorization' as const;
+const ERROR_REQUEST_TOO_LARGE = 'Request too large' as const;
+const ERROR_RATE_LIMIT_EXCEEDED = 'Rate limit exceeded' as const;
+const ERROR_REQUEST_TIMEOUT = 'Request timeout' as const;
+const ERROR_INVALID_INPUT = 'Invalid input' as const;
+const ERROR_INVALID_JSON = 'Invalid JSON in request body' as const;
+const ERROR_INTERNAL_SERVER = 'Internal server error' as const;
+const ERROR_NOT_FOUND = 'Not Found' as const;
+const ERROR_STORE_NOT_FOUND = 'Store not found' as const;
+const ERROR_STORE_NOT_FOUND_OR_ACCESS_DENIED = 'Store not found or access denied' as const;
+const ERROR_OPENAI_NOT_CONFIGURED = 'OPENAI_API_KEY not configured' as const;
+const ERROR_STORE_MISSING_CREDENTIALS = 'Store missing Shopify credentials' as const;
+const ERROR_BRAND_ANALYSIS_FAILED = 'Brand analysis failed to produce results' as const;
+const ERROR_STORE_ID_REQUIRED = 'storeId is required and must be a string' as const;
+const ERROR_STORE_ID_EMPTY = 'storeId must be a non-empty string' as const;
+const ERROR_CODE_UNAUTHORIZED = 'UNAUTHORIZED' as const;
+const ERROR_CODE_CONFIG_ERROR = 'CONFIG_ERROR' as const;
+const ERROR_CODE_STORE_NOT_FOUND = 'STORE_NOT_FOUND' as const;
+const ERROR_CODE_STORE_CONFIG_ERROR = 'STORE_CONFIG_ERROR' as const;
+const ERROR_CODE_ANALYSIS_ERROR = 'ANALYSIS_ERROR' as const;
+const ERROR_CODE_INTERNAL_ERROR = 'INTERNAL_ERROR' as const;
 const RETRY_BACKOFF_BASE = 2;
 const RATE_LIMIT_WINDOW_MS = 60000;
 const RATE_LIMIT_MAX_REQUESTS = 5;
-const STAGE_FETCHING_STORE = 'fetching_store';
-const STAGE_FETCHING_STORE_CONTENT = 'fetching_store_content';
-const STAGE_FETCHING_PRODUCTS = 'fetching_products';
-const STAGE_ANALYZING_BRAND = 'analyzing_brand';
-const STAGE_SAVING_RESULTS = 'saving_results';
-const STAGE_COMPLETED = 'completed';
+const STAGE_FETCHING_STORE = 'fetching_store' as const;
+const STAGE_FETCHING_STORE_CONTENT = 'fetching_store_content' as const;
+const STAGE_ANALYZING_BRAND = 'analyzing_brand' as const;
+const STAGE_SAVING_RESULTS = 'saving_results' as const;
+const STAGE_COMPLETED = 'completed' as const;
 const PERCENTAGE_FETCHING_STORE = 10;
 const PERCENTAGE_FETCHING_STORE_CONTENT = 15;
-const PERCENTAGE_FETCHING_PRODUCTS = 20;
 const PERCENTAGE_ANALYZING_BRAND = 50;
 const PERCENTAGE_SAVING_RESULTS = 95;
 const PERCENTAGE_COMPLETED = 100;
-const TABLE_STORES = 'stores';
-const TABLE_PRODUCTS_CACHE = 'products_cache';
-const TABLE_BRAND_DNA_CACHE = 'brand_dna_cache';
-const COLUMN_ID = 'id';
-const COLUMN_SHOP_DOMAIN = 'shop_domain';
-const COLUMN_ACCESS_TOKEN = 'access_token';
-const COLUMN_BRAND_DNA = 'brand_dna';
-const COLUMN_TONE_MATRIX = 'tone_matrix';
-const COLUMN_AUDIENCE_PERSONAS = 'audience_personas';
-const COLUMN_BRAND_CONSISTENCY_SCORE = 'brand_consistency_score';
-const COLUMN_BRAND_SETUP_COMPLETED_AT = 'brand_setup_completed_at';
-const COLUMN_UPDATED_AT = 'updated_at';
-const COLUMN_STORE_ID = 'store_id';
-const COLUMN_TITLE = 'title';
-const COLUMN_DESCRIPTION = 'description';
-const COLUMN_EXTRACTED_DNA = 'extracted_dna';
-const COLUMN_TONE_ANALYSIS = 'tone_analysis';
-const COLUMN_AUDIENCE_MODEL = 'audience_model';
-const COLUMN_CONSISTENCY_SCORE = 'consistency_score';
-const PATH_ROOT = '/';
-const ANONYMOUS_USER = 'anonymous';
-const NO_STORE = 'no-store';
-const AUTHENTICATED_USER = 'authenticated';
-const WARNING_PRODUCT_SAMPLES_NOT_AVAILABLE = 'Product samples not available, using limited analysis';
-const WARNING_NO_PRODUCT_SAMPLES = 'No product text samples available, analysis may be less accurate';
-const WARNING_BRAND_DNA_CACHING_FAILED = 'Brand DNA caching failed, but setup completed';
+const TABLE_STORES = 'stores' as const;
+const TABLE_BRAND_DNA_CACHE = 'brand_dna_cache' as const;
+const COLUMN_ID = 'id' as const;
+const COLUMN_SHOP_DOMAIN = 'shop_domain' as const;
+const COLUMN_ACCESS_TOKEN = 'access_token' as const;
+const COLUMN_BRAND_DNA = 'brand_dna' as const;
+const COLUMN_TONE_MATRIX = 'tone_matrix' as const;
+const COLUMN_AUDIENCE_PERSONAS = 'audience_personas' as const;
+const COLUMN_BRAND_CONSISTENCY_SCORE = 'brand_consistency_score' as const;
+const COLUMN_BRAND_SETUP_COMPLETED_AT = 'brand_setup_completed_at' as const;
+const COLUMN_UPDATED_AT = 'updated_at' as const;
+const COLUMN_STORE_ID = 'store_id' as const;
+const COLUMN_EXTRACTED_DNA = 'extracted_dna' as const;
+const COLUMN_TONE_ANALYSIS = 'tone_analysis' as const;
+const COLUMN_AUDIENCE_MODEL = 'audience_model' as const;
+const COLUMN_CONSISTENCY_SCORE = 'consistency_score' as const;
+const PATH_ROOT = '/' as const;
+const ANONYMOUS_USER = 'anonymous' as const;
+const NO_STORE = 'no-store' as const;
+const AUTHENTICATED_USER = 'authenticated' as const;
+const WARNING_NO_PRODUCT_SAMPLES = 'No product text samples available, analysis may be less accurate' as const;
+const WARNING_BRAND_DNA_CACHING_FAILED = 'Brand DNA caching failed, but setup completed' as const;
+const WARNING_CONTENT_FETCH_FAILED = 'Some store content could not be fetched, analysis may be limited' as const;
+const OPENAI_API_URL = 'https://api.openai.com/v1/chat/completions' as const;
+const OPENAI_MODEL = 'gpt-4o-mini' as const;
+const OPENAI_TIMEOUT_MS = 25000;
+const OPENAI_MAX_TOKENS = 2000;
+const OPENAI_TEMPERATURE = 0.7;
+const TEXT_LIMIT_BRAND_DNA = 50000;
+const TEXT_LIMIT_TONE = 50000;
+const TEXT_LIMIT_PERSONAS = 40000;
+const PRODUCT_SAMPLE_LIMIT = 30;
+const ARTICLE_SAMPLE_LIMIT = 10;
+const PAGE_SAMPLE_LIMIT = 5;
+const DEFAULT_CONSISTENCY_SCORE = 75;
+const ABOUT_PAGE_HANDLES = ['about', 'about-us', 'our-story', 'who-we-are', 'about-our-company'] as const;
+const TONE_DIMENSIONS = [
+  'expert',
+  'conversational',
+  'aspirational',
+  'friendly',
+  'professional',
+  'casual',
+  'authoritative',
+  'empathetic',
+] as const;
+const DEFAULT_STORE_BRAND_NAME = 'Store Brand' as const;
+const DEFAULT_PRICE_RANGE = 'medium' as const;
+const DEFAULT_PRIMARY_CUSTOMER_NAME = 'Primary Customer' as const;
+const DEFAULT_AGE_RANGE = '25-45' as const;
+const DEFAULT_FREQUENCY = 'monthly' as const;
+const DEFAULT_PRICE_SENSITIVITY = 'medium' as const;
+const DEFAULT_CHANNEL = 'online' as const;
+const MAX_PERSONAS = 3;
 
 function getEnv(key: string, defaultValue = ''): string {
   try {
@@ -226,20 +304,13 @@ const CONFIG = {
   SUPABASE_URL: getEnv(ENV_SUPABASE_URL, ''),
   SUPABASE_ANON_KEY: getEnv(ENV_SUPABASE_ANON_KEY, ''),
   OPENAI_API_KEY: getEnv(ENV_OPENAI_API_KEY, ''),
-  DEFAULT_TIMEOUT: parseInt(getEnv(ENV_STORE_SETUP_TIMEOUT, String(DEFAULT_TIMEOUT))),
+  DEFAULT_TIMEOUT: parseInt(getEnv(ENV_STORE_SETUP_TIMEOUT, String(DEFAULT_TIMEOUT)), 10),
   CORS_ORIGINS: getEnv(ENV_CORS_ORIGINS, '*').split(','),
-  MAX_REQUEST_SIZE: parseInt(getEnv(ENV_MAX_REQUEST_SIZE, String(DEFAULT_MAX_REQUEST_SIZE))),
-  MAX_RETRIES: parseInt(getEnv(ENV_MAX_RETRIES, String(DEFAULT_MAX_RETRIES))),
-  RETRY_DELAY_MS: parseInt(getEnv(ENV_RETRY_DELAY_MS, String(DEFAULT_RETRY_DELAY_MS))),
-  MAX_PRODUCTS_TO_ANALYZE: parseInt(getEnv(ENV_MAX_PRODUCTS_TO_ANALYZE, String(DEFAULT_MAX_PRODUCTS))),
-};
-
-const corsHeaders: Readonly<Record<string, string>> = {
-  [HEADER_ACCESS_CONTROL_ALLOW_ORIGIN]: CONFIG.CORS_ORIGINS[0] === '*' ? '*' : CONFIG.CORS_ORIGINS.join(','),
-  [HEADER_ACCESS_CONTROL_ALLOW_HEADERS]: CORS_HEADERS_VALUE,
-  [HEADER_ACCESS_CONTROL_ALLOW_METHODS]: CORS_METHODS_VALUE,
-  [HEADER_ACCESS_CONTROL_MAX_AGE]: CORS_MAX_AGE_VALUE,
-};
+  MAX_REQUEST_SIZE: parseInt(getEnv(ENV_MAX_REQUEST_SIZE, String(DEFAULT_MAX_REQUEST_SIZE)), 10),
+  MAX_RETRIES: parseInt(getEnv(ENV_MAX_RETRIES, String(DEFAULT_MAX_RETRIES)), 10),
+  RETRY_DELAY_MS: parseInt(getEnv(ENV_RETRY_DELAY_MS, String(DEFAULT_RETRY_DELAY_MS)), 10),
+  MAX_PRODUCTS_TO_ANALYZE: parseInt(getEnv(ENV_MAX_PRODUCTS_TO_ANALYZE, String(DEFAULT_MAX_PRODUCTS)), 10),
+} as const;
 
 async function validateAuth(authHeader: string | null): Promise<AuthResult> {
   if (!authHeader) {
@@ -257,16 +328,13 @@ async function validateAuth(authHeader: string | null): Promise<AuthResult> {
 }
 
 async function validateStoreOwnership(
-  _supabase: ReturnType<typeof getSupabaseClient>,
+  _supabase: Awaited<ReturnType<typeof getSupabaseClient>>,
   storeId: string,
   _userId?: string,
 ): Promise<OwnershipValidationResult> {
   try {
-    // Use service role client to bypass RLS - stores table doesn't have user_id column
-    // so we can't do proper ownership validation at the database level
-    // In Shopify apps, store access is managed by Shopify OAuth, not user ownership
     const serviceSupabase = await getSupabaseClient({ clientType: 'service' });
-    
+
     const { data: store, error } = await serviceSupabase
       .from(TABLE_STORES)
       .select(COLUMN_ID)
@@ -283,7 +351,7 @@ async function validateStoreOwnership(
   }
 }
 
-function validateSetupParams(params: Readonly<Record<string, unknown>>): ValidationResult {
+function validateSetupParams(params: SetupRequestBody | Readonly<Record<string, unknown>>): ValidationResult {
   if (!params.storeId || typeof params.storeId !== 'string') {
     return { valid: false, error: ERROR_STORE_ID_REQUIRED };
   }
@@ -305,11 +373,11 @@ async function createRequestContext(req: Request): Promise<RequestContext> {
   const authResult = await validateAuth(authHeader);
 
   if (!authResult.valid) {
-    throw new UtilsError(authResult.error ?? ERROR_UNAUTHORIZED, ERROR_CODE_UNAUTHORIZED, STATUS_UNAUTHORIZED);
+    throw new UtilsError(authResult.error ?? ERROR_UNAUTHORIZED, ERROR_CODE_UNAUTHORIZED as string, STATUS_UNAUTHORIZED);
   }
 
   if (!CONFIG.SUPABASE_URL || !CONFIG.SUPABASE_ANON_KEY) {
-    throw new UtilsError(ERROR_MISSING_ENV, ERROR_CODE_CONFIG_ERROR, STATUS_INTERNAL_ERROR);
+    throw new UtilsError(ERROR_MISSING_ENV, ERROR_CODE_CONFIG_ERROR as string, STATUS_INTERNAL_ERROR);
   }
 
   const supabase = authHeader ? await createAuthenticatedClient(authHeader) : await getSupabaseClient({ clientType: 'anon' });
@@ -333,8 +401,8 @@ async function handleRequest(
 
   try {
     const contentLength = req.headers.get(HEADER_CONTENT_LENGTH);
-    if (contentLength && parseInt(contentLength) > (config.maxRequestSize ?? CONFIG.MAX_REQUEST_SIZE)) {
-      return createErrorResponse(ERROR_REQUEST_TOO_LARGE, STATUS_PAYLOAD_TOO_LARGE, correlationId);
+    if (contentLength && parseInt(contentLength, 10) > (config.maxRequestSize ?? CONFIG.MAX_REQUEST_SIZE)) {
+      return createErrorResponse(ERROR_REQUEST_TOO_LARGE, STATUS_PAYLOAD_TOO_LARGE, correlationId, undefined, req);
     }
 
     const processedReq = await executeRequestInterceptors(req);
@@ -350,7 +418,7 @@ async function handleRequest(
         logger.warn('Rate limit exceeded', { correlationId, rateLimitKey, remaining: rateLimit.remaining });
         return createErrorResponse(ERROR_RATE_LIMIT_EXCEEDED, STATUS_TOO_MANY_REQUESTS, correlationId, {
           retryAfter: Math.ceil((rateLimit.resetAt - Date.now()) / 1000),
-        });
+        }, req);
       }
     }
 
@@ -359,17 +427,17 @@ async function handleRequest(
         const body = await req.clone().json() as Readonly<Record<string, unknown>>;
         const validation = config.validateInput(body);
         if (!validation.valid) {
-          return createErrorResponse(validation.error ?? ERROR_INVALID_INPUT, STATUS_BAD_REQUEST, correlationId);
+          return createErrorResponse(validation.error ?? ERROR_INVALID_INPUT, STATUS_BAD_REQUEST, correlationId, undefined, req);
         }
       } catch {
-        return createErrorResponse(ERROR_INVALID_JSON, STATUS_BAD_REQUEST, correlationId);
+        return createErrorResponse(ERROR_INVALID_JSON, STATUS_BAD_REQUEST, correlationId, undefined, req);
       }
     }
 
     const timeout = config.timeout ?? CONFIG.DEFAULT_TIMEOUT;
     const timeoutPromise = new Promise<Response>((resolve) => {
       setTimeout(() => {
-        resolve(createErrorResponse(ERROR_REQUEST_TIMEOUT, STATUS_REQUEST_TIMEOUT, correlationId));
+        resolve(createErrorResponse(ERROR_REQUEST_TIMEOUT, STATUS_REQUEST_TIMEOUT, correlationId, undefined, req));
       }, timeout);
     });
 
@@ -412,7 +480,8 @@ async function handleRequest(
       error instanceof Error ? error.message : ERROR_INTERNAL_SERVER,
       error instanceof UtilsError ? error.statusCode : STATUS_INTERNAL_ERROR,
       correlationId,
-      { errorCode: error instanceof UtilsError ? error.code : ERROR_CODE_INTERNAL_ERROR },
+      { errorCode: error instanceof UtilsError ? error.code : ERROR_CODE_INTERNAL_ERROR as string },
+      req,
     );
   }
 }
@@ -420,7 +489,7 @@ async function handleRequest(
 async function createSuccessResponse(
   data: unknown,
   correlationId: string,
-  metadata?: Readonly<Record<string, unknown>>,
+  metadata: Readonly<Record<string, unknown>> | undefined,
   options: { readonly compression?: boolean; readonly request?: Request; readonly progress?: { readonly stage: string; readonly percentage: number } } = {},
 ): Promise<Response> {
   const response: StoreSetupResponse = {
@@ -435,10 +504,14 @@ async function createSuccessResponse(
     if (compression !== ENCODING_NONE) {
       return createCompressedResponse(response, {
         encoding: compression,
-        headers: corsHeaders,
+        headers: createCORSHeaders(options.request, CONFIG.CORS_ORIGINS),
       });
     }
   }
+
+  const corsHeaders = options.request
+    ? createCORSHeaders(options.request, CONFIG.CORS_ORIGINS)
+    : createCORSHeaders({ headers: new Headers() } as Request, CONFIG.CORS_ORIGINS);
 
   return new Response(JSON.stringify(response), {
     status: STATUS_OK,
@@ -454,13 +527,18 @@ function createErrorResponse(
   error: string,
   status: number,
   correlationId: string,
-  metadata?: Readonly<Record<string, unknown>>,
+  metadata: Readonly<Record<string, unknown>> | undefined,
+  request?: Request,
 ): Response {
   const response: StoreSetupResponse = {
     error,
     correlationId,
     ...(metadata && { metadata }),
   };
+
+  const corsHeaders = request
+    ? createCORSHeaders(request, CONFIG.CORS_ORIGINS)
+    : createCORSHeaders({ headers: new Headers() } as Request, CONFIG.CORS_ORIGINS);
 
   return new Response(JSON.stringify(response), {
     status,
@@ -517,48 +595,29 @@ function logProgress(
   });
 }
 
-interface StoreAssets {
-  shop?: { name?: string; description?: string } | null;
-  products?: ReadonlyArray<{ title?: string; body_html?: string; product_type?: string; tags?: string }> | null;
-  collections?: ReadonlyArray<{ body_html?: string; title?: string; handle?: string }> | null;
-  pages?: ReadonlyArray<{ body_html?: string; title?: string; handle?: string }> | null;
-  blogArticles?: ReadonlyArray<{ title?: string; body_html?: string }> | null;
-}
-
-interface ExtractedContent {
-  shopDescription: string;
-  productText: readonly string[];
-  collectionText: readonly string[];
-  pageText: readonly string[];
-  aboutPageText: string;
-  articleText: readonly string[];
-}
-
 function stripHtmlTags(html: string): string {
   return html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
-function findAboutPage(pages: unknown[]): unknown | null {
-  const aboutHandles = ['about', 'about-us', 'our-story', 'who-we-are', 'about-our-company'];
-  return pages.find((page: { handle?: string }) => 
-    aboutHandles.includes((page.handle || '').toLowerCase())
+function findAboutPage(pages: ReadonlyArray<{ readonly handle?: string }>): { readonly handle?: string; readonly title?: string; readonly body_html?: string } | null {
+  return pages.find((page) =>
+    ABOUT_PAGE_HANDLES.includes((page.handle || '').toLowerCase() as typeof ABOUT_PAGE_HANDLES[number])
   ) || null;
 }
 
-function extractAboutPageText(aboutPage: unknown): string {
+function extractAboutPageText(aboutPage: { readonly title?: string; readonly body_html?: string } | null): string {
   if (!aboutPage) return '';
-  
-  const page = aboutPage as { title?: string; body_html?: string };
-  const htmlContent = page.body_html || '';
+
+  const htmlContent = aboutPage.body_html || '';
   const textContent = stripHtmlTags(htmlContent);
-  const title = page.title || '';
-  
+  const title = aboutPage.title || '';
+
   return `${title} ${textContent}`.trim();
 }
 
 function extractStoreContent(assets: StoreAssets): ExtractedContent {
-  const aboutPage = findAboutPage((assets.pages || []) as unknown[]);
-  
+  const aboutPage = findAboutPage(assets.pages || []);
+
   const productText = (assets.products || [])
     .map((p) => {
       const title = p.title || '';
@@ -566,7 +625,7 @@ function extractStoreContent(assets: StoreAssets): ExtractedContent {
       return `${title} ${desc}`.trim();
     })
     .filter((t) => t.length > 0);
-  
+
   const collectionText = (assets.collections || [])
     .map((c) => {
       const title = c.title || '';
@@ -574,7 +633,7 @@ function extractStoreContent(assets: StoreAssets): ExtractedContent {
       return `${title} ${desc}`.trim();
     })
     .filter((t) => t.length > 0);
-  
+
   const pageText = (assets.pages || [])
     .map((p) => {
       const title = p.title || '';
@@ -582,7 +641,7 @@ function extractStoreContent(assets: StoreAssets): ExtractedContent {
       return `${title} ${content}`.trim();
     })
     .filter((t) => t.length > 0);
-  
+
   const articleText = (assets.blogArticles || [])
     .map((a) => {
       const title = a.title || '';
@@ -590,9 +649,9 @@ function extractStoreContent(assets: StoreAssets): ExtractedContent {
       return `${title} ${content}`.trim();
     })
     .filter((t) => t.length > 0);
-  
+
   return {
-    shopDescription: stripHtmlTags((assets.shop?.description || '')),
+    shopDescription: stripHtmlTags(assets.shop?.description || ''),
     productText,
     collectionText,
     pageText,
@@ -603,93 +662,38 @@ function extractStoreContent(assets: StoreAssets): ExtractedContent {
 
 function buildTextSamples(contentData: ExtractedContent): readonly string[] {
   const samples: string[] = [];
-  
-  // Prioritize About page
+
   if (contentData.aboutPageText) {
     samples.push(`[ABOUT PAGE] ${contentData.aboutPageText}`);
   }
-  
-  // Shop description
+
   if (contentData.shopDescription) {
     samples.push(`[SHOP DESCRIPTION] ${contentData.shopDescription}`);
   }
-  
-  // Collection descriptions (often contain brand messaging)
-  samples.push(...contentData.collectionText.map(t => `[COLLECTION] ${t}`));
-  
-  // Product samples (limit to avoid token limits)
-  samples.push(...contentData.productText.slice(0, 30).map(t => `[PRODUCT] ${t}`));
-  
-  // Blog articles (sample recent ones)
-  samples.push(...contentData.articleText.slice(0, 10).map(t => `[ARTICLE] ${t}`));
-  
-  // Other pages
-  samples.push(...contentData.pageText.slice(0, 5).map(t => `[PAGE] ${t}`));
-  
-  return samples.filter(s => s.trim().length > 0);
-}
 
-interface BrandDNAResponse {
-  brandName?: string;
-  brandValues?: readonly string[];
-  productCategories?: readonly string[];
-  priceRange?: string;
-  toneKeywords?: readonly string[];
-  messagingThemes?: readonly string[];
-  uniqueSellingPoints?: readonly string[];
-  brandMission?: string;
-  brandVision?: string;
-  brandPersonality?: readonly string[];
-  brandArchetype?: string;
-}
+  samples.push(...contentData.collectionText.map((t) => `[COLLECTION] ${t}`));
+  samples.push(...contentData.productText.slice(0, PRODUCT_SAMPLE_LIMIT).map((t) => `[PRODUCT] ${t}`));
+  samples.push(...contentData.articleText.slice(0, ARTICLE_SAMPLE_LIMIT).map((t) => `[ARTICLE] ${t}`));
+  samples.push(...contentData.pageText.slice(0, PAGE_SAMPLE_LIMIT).map((t) => `[PAGE] ${t}`));
 
-interface ToneAnalysisResponse {
-  readonly [key: string]: number;
-}
-
-interface PersonaResponse {
-  personas?: ReadonlyArray<{
-    name: string;
-    type: 'primary' | 'secondary' | 'tertiary';
-    demographics?: {
-      ageRange?: string;
-      gender?: string;
-      location?: string;
-      income?: string;
-      education?: string;
-    };
-    psychographics?: {
-      interests?: readonly string[];
-      values?: readonly string[];
-      lifestyle?: readonly string[];
-      motivations?: readonly string[];
-    };
-    painPoints?: readonly string[];
-    buyingBehavior?: {
-      preferredChannels?: readonly string[];
-      decisionFactors?: readonly string[];
-      priceSensitivity?: 'low' | 'medium' | 'high';
-      frequency?: string;
-    };
-    contentPreferences?: readonly string[];
-  }>;
+  return samples.filter((s) => s.trim().length > 0);
 }
 
 async function callOpenAIViaFetch(
   prompt: string,
   openaiApiKey: string,
-  model: string = 'gpt-4o-mini',
-  timeoutMs: number = 25000, // 25 second timeout per call
+  model: string = OPENAI_MODEL,
+  timeoutMs: number = OPENAI_TIMEOUT_MS,
 ): Promise<string> {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-  
+
   try {
-    const response = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
+    const response = await fetch(OPENAI_API_URL, {
+      method: METHOD_POST,
       headers: {
-        'Authorization': `Bearer ${openaiApiKey}`,
-        'Content-Type': 'application/json',
+        Authorization: `Bearer ${openaiApiKey}`,
+        [HEADER_CONTENT_TYPE]: HEADER_CONTENT_TYPE_JSON,
       },
       body: JSON.stringify({
         model,
@@ -700,19 +704,19 @@ async function callOpenAIViaFetch(
           },
         ],
         response_format: { type: 'json_object' },
-        temperature: 0.7,
-        max_tokens: 2000, // Limit response size
+        temperature: OPENAI_TEMPERATURE,
+        max_tokens: OPENAI_MAX_TOKENS,
       }),
       signal: controller.signal,
     });
-    
+
     clearTimeout(timeoutId);
-    
+
     if (!response.ok) {
       const errorText = await response.text();
       throw new Error(`OpenAI API error: ${response.status} ${errorText}`);
     }
-    
+
     const data = await response.json() as { choices?: ReadonlyArray<{ message?: { content?: string } }> };
     return data.choices?.[0]?.message?.content || '';
   } catch (error) {
@@ -729,8 +733,8 @@ async function analyzeBrandDNAViaFetch(
   openaiApiKey: string,
   shopName?: string,
 ): Promise<BrandDNAResponse> {
-  const combinedText = textSamples.join('\n\n').substring(0, 50000);
-  
+  const combinedText = textSamples.join('\n\n').substring(0, TEXT_LIMIT_BRAND_DNA);
+
   const prompt = `You are a brand intelligence expert. Analyze the following brand content and extract comprehensive brand DNA.
 Return a JSON object with the following structure:
 {
@@ -748,16 +752,16 @@ Return a JSON object with the following structure:
 }
 
 Content to analyze: ${combinedText}`;
-  
+
   try {
     const responseText = await callOpenAIViaFetch(prompt, openaiApiKey);
     const result = JSON.parse(responseText) as BrandDNAResponse;
-    
+
     return {
-      brandName: result.brandName || shopName || 'Store Brand',
+      brandName: result.brandName || shopName || DEFAULT_STORE_BRAND_NAME,
       brandValues: result.brandValues || [],
       productCategories: result.productCategories || [],
-      priceRange: result.priceRange || 'medium',
+      priceRange: result.priceRange || DEFAULT_PRICE_RANGE,
       toneKeywords: result.toneKeywords || [],
       messagingThemes: result.messagingThemes || [],
       uniqueSellingPoints: result.uniqueSellingPoints || [],
@@ -770,13 +774,12 @@ Content to analyze: ${combinedText}`;
     logger.warn('Brand DNA analysis failed, using fallback', {
       error: error instanceof Error ? error.message : String(error),
     });
-    
-    // Fallback to basic extraction
+
     return {
-      brandName: shopName || 'Store Brand',
+      brandName: shopName || DEFAULT_STORE_BRAND_NAME,
       brandValues: [],
       productCategories: [],
-      priceRange: 'medium',
+      priceRange: DEFAULT_PRICE_RANGE,
       toneKeywords: [],
       messagingThemes: [],
       uniqueSellingPoints: [],
@@ -788,62 +791,49 @@ async function analyzeToneViaFetch(
   textSamples: readonly string[],
   openaiApiKey: string,
 ): Promise<Readonly<Record<string, number>>> {
-  const defaultDimensions = [
-    'expert',
-    'conversational',
-    'aspirational',
-    'friendly',
-    'professional',
-    'casual',
-    'authoritative',
-    'empathetic',
-  ];
-  
-  const combinedText = textSamples.join('\n\n').substring(0, 50000);
-  
+  const combinedText = textSamples.join('\n\n').substring(0, TEXT_LIMIT_TONE);
+
   const prompt = `You are a tone analysis expert. Return only valid JSON with tone weights.
 Analyze the tone of the following brand content and return a weighted tone matrix.
-Consider these tone dimensions: ${defaultDimensions.join(', ')}.
+Consider these tone dimensions: ${TONE_DIMENSIONS.join(', ')}.
 Return a JSON object with values between 0 and 1 that sum to approximately 1.0.
 Each dimension should be a key in the JSON object with its weight as the value.
 
 Content: ${combinedText}`;
-  
+
   try {
     const responseText = await callOpenAIViaFetch(prompt, openaiApiKey);
     const result = JSON.parse(responseText) as ToneAnalysisResponse;
-    
-    // Normalize to ensure values sum to 1
+
     const normalizedMatrix: Record<string, number> = {};
     let total = 0;
-    
-    defaultDimensions.forEach((dim) => {
+
+    TONE_DIMENSIONS.forEach((dim) => {
       const value = typeof result[dim] === 'number' ? result[dim] : 0;
       normalizedMatrix[dim] = value;
       total += value;
     });
-    
+
     if (total === 0) {
-      const equalWeight = 1 / defaultDimensions.length;
-      defaultDimensions.forEach((dim) => {
+      const equalWeight = 1 / TONE_DIMENSIONS.length;
+      TONE_DIMENSIONS.forEach((dim) => {
         normalizedMatrix[dim] = equalWeight;
       });
     } else {
-      defaultDimensions.forEach((dim) => {
-        normalizedMatrix[dim] = normalizedMatrix[dim] / total;
+      TONE_DIMENSIONS.forEach((dim) => {
+        normalizedMatrix[dim] = normalizedMatrix[dim]! / total;
       });
     }
-    
+
     return normalizedMatrix;
   } catch (error) {
     logger.warn('Tone analysis failed, using default', {
       error: error instanceof Error ? error.message : String(error),
     });
-    
-    // Fallback to equal weights
-    const equalWeight = 1 / defaultDimensions.length;
+
+    const equalWeight = 1 / TONE_DIMENSIONS.length;
     const defaultMatrix: Record<string, number> = {};
-    defaultDimensions.forEach((dim) => {
+    TONE_DIMENSIONS.forEach((dim) => {
       defaultMatrix[dim] = equalWeight;
     });
     return defaultMatrix;
@@ -855,8 +845,8 @@ async function generateAudiencePersonasViaFetch(
   brandDNA: BrandDNAResponse,
   openaiApiKey: string,
 ): Promise<ReadonlyArray<unknown>> {
-  const combinedText = textSamples.join('\n\n').substring(0, 40000);
-  
+  const combinedText = textSamples.join('\n\n').substring(0, TEXT_LIMIT_PERSONAS);
+
   const prompt = `You are a brand intelligence expert specializing in audience analysis.
 Analyze the brand content and generate detailed audience personas.
 Return a JSON object with a "personas" array, each persona with the following structure:
@@ -889,26 +879,25 @@ Return a JSON object with a "personas" array, each persona with the following st
 Generate 1-3 personas (primary, and optionally secondary/tertiary).
 Brand context:
 - Brand Values: ${(brandDNA.brandValues || []).join(', ')}
-- Price Range: ${brandDNA.priceRange || 'medium'}
+- Price Range: ${brandDNA.priceRange || DEFAULT_PRICE_RANGE}
 - Product Categories: ${(brandDNA.productCategories || []).join(', ')}
 
 Content to analyze: ${combinedText}`;
-  
+
   try {
     const responseText = await callOpenAIViaFetch(prompt, openaiApiKey);
     const result = JSON.parse(responseText) as PersonaResponse;
     const personas = result.personas || [];
-    
+
     if (Array.isArray(personas) && personas.length > 0) {
-      return personas.slice(0, 3);
+      return personas.slice(0, MAX_PERSONAS);
     }
-    
-    // Fallback persona
+
     return [{
-      name: 'Primary Customer',
+      name: DEFAULT_PRIMARY_CUSTOMER_NAME,
       type: 'primary',
       demographics: {
-        ageRange: '25-45',
+        ageRange: DEFAULT_AGE_RANGE,
       },
       psychographics: {
         interests: (brandDNA.messagingThemes || []).slice(0, 3),
@@ -918,10 +907,10 @@ Content to analyze: ${combinedText}`;
       },
       painPoints: [],
       buyingBehavior: {
-        preferredChannels: ['online'],
+        preferredChannels: [DEFAULT_CHANNEL],
         decisionFactors: (brandDNA.uniqueSellingPoints || []).slice(0, 3),
-        priceSensitivity: brandDNA.priceRange === 'high' ? 'low' : 'medium',
-        frequency: 'monthly',
+        priceSensitivity: brandDNA.priceRange === 'high' ? 'low' : DEFAULT_PRICE_SENSITIVITY,
+        frequency: DEFAULT_FREQUENCY,
       },
       contentPreferences: [],
     }];
@@ -929,13 +918,12 @@ Content to analyze: ${combinedText}`;
     logger.warn('Persona generation failed, using fallback', {
       error: error instanceof Error ? error.message : String(error),
     });
-    
-    // Fallback persona
+
     return [{
-      name: 'Primary Customer',
+      name: DEFAULT_PRIMARY_CUSTOMER_NAME,
       type: 'primary',
       demographics: {
-        ageRange: '25-45',
+        ageRange: DEFAULT_AGE_RANGE,
       },
       psychographics: {
         interests: [],
@@ -945,10 +933,10 @@ Content to analyze: ${combinedText}`;
       },
       painPoints: [],
       buyingBehavior: {
-        preferredChannels: ['online'],
+        preferredChannels: [DEFAULT_CHANNEL],
         decisionFactors: [],
-        priceSensitivity: 'medium',
-        frequency: 'monthly',
+        priceSensitivity: DEFAULT_PRICE_SENSITIVITY,
+        frequency: DEFAULT_FREQUENCY,
       },
       contentPreferences: [],
     }];
@@ -960,14 +948,13 @@ async function handleStoreSetup(ctx: RequestContext): Promise<Response> {
   const warnings: string[] = [];
 
   try {
-    // Use service role client to bypass RLS for all store operations
     const serviceSupabase = await getSupabaseClient({ clientType: 'service' });
-    
+
     const body = await req.json() as SetupRequestBody;
     const validation = validateSetupParams(body);
 
     if (!validation.valid) {
-      return createErrorResponse(validation.error ?? ERROR_INVALID_INPUT, STATUS_BAD_REQUEST, correlationId);
+      return createErrorResponse(validation.error ?? ERROR_INVALID_INPUT, STATUS_BAD_REQUEST, correlationId, undefined, req);
     }
 
     const storeId = body.storeId!;
@@ -975,7 +962,7 @@ async function handleStoreSetup(ctx: RequestContext): Promise<Response> {
 
     const ownershipValidation = await validateStoreOwnership(serviceSupabase, storeId, ctx.userId);
     if (!ownershipValidation.valid) {
-      return createErrorResponse(ownershipValidation.error ?? ERROR_STORE_NOT_FOUND_OR_ACCESS_DENIED, STATUS_NOT_FOUND, correlationId);
+      return createErrorResponse(ownershipValidation.error ?? ERROR_STORE_NOT_FOUND_OR_ACCESS_DENIED, STATUS_NOT_FOUND, correlationId, undefined, req);
     }
 
     logProgress(correlationId, STAGE_FETCHING_STORE, PERCENTAGE_FETCHING_STORE);
@@ -992,7 +979,7 @@ async function handleStoreSetup(ctx: RequestContext): Promise<Response> {
           throw new SupabaseClientError('Failed to fetch store', result.error);
         }
         if (!result.data) {
-          throw new UtilsError(ERROR_STORE_NOT_FOUND, ERROR_CODE_STORE_NOT_FOUND, STATUS_NOT_FOUND);
+          throw new UtilsError(ERROR_STORE_NOT_FOUND, ERROR_CODE_STORE_NOT_FOUND as string, STATUS_NOT_FOUND);
         }
         return result;
       },
@@ -1002,26 +989,24 @@ async function handleStoreSetup(ctx: RequestContext): Promise<Response> {
     );
 
     if (storeError || !store) {
-      throw new UtilsError(ERROR_STORE_NOT_FOUND, ERROR_CODE_STORE_NOT_FOUND, STATUS_NOT_FOUND);
+      throw new UtilsError(ERROR_STORE_NOT_FOUND, ERROR_CODE_STORE_NOT_FOUND as string, STATUS_NOT_FOUND);
     }
 
     const storeData = store as unknown as DatabaseStore;
 
     if (!CONFIG.OPENAI_API_KEY) {
-      throw new UtilsError(ERROR_OPENAI_NOT_CONFIGURED, ERROR_CODE_CONFIG_ERROR, STATUS_INTERNAL_ERROR);
+      throw new UtilsError(ERROR_OPENAI_NOT_CONFIGURED, ERROR_CODE_CONFIG_ERROR as string, STATUS_INTERNAL_ERROR);
     }
 
     if (!storeData.shop_domain || !storeData.access_token) {
-      throw new UtilsError(ERROR_STORE_MISSING_CREDENTIALS, ERROR_CODE_STORE_CONFIG_ERROR, STATUS_BAD_REQUEST);
+      throw new UtilsError(ERROR_STORE_MISSING_CREDENTIALS, ERROR_CODE_STORE_CONFIG_ERROR as string, STATUS_BAD_REQUEST);
     }
 
     logProgress(correlationId, STAGE_FETCHING_STORE_CONTENT, PERCENTAGE_FETCHING_STORE_CONTENT);
 
-    // Import Shopify API to fetch store content
     const { ShopifyAPI } = await import('../backend/src/integrations/ShopifyClient.ts');
     const shopifyAPI = new ShopifyAPI(storeData.shop_domain, storeData.access_token);
 
-    // Fetch ALL store content in parallel
     let shop: unknown = null;
     let products: unknown[] = [];
     let collections: unknown[] = [];
@@ -1056,10 +1041,9 @@ async function handleStoreSetup(ctx: RequestContext): Promise<Response> {
         correlationId,
         error: error instanceof Error ? error.message : String(error),
       });
-      warnings.push('Some store content could not be fetched, analysis may be limited');
+      warnings.push(WARNING_CONTENT_FETCH_FAILED);
     }
 
-    // Extract content from all sources
     const assets: StoreAssets = {
       shop: shop as StoreAssets['shop'],
       products: products as StoreAssets['products'],
@@ -1079,7 +1063,6 @@ async function handleStoreSetup(ctx: RequestContext): Promise<Response> {
 
     logProgress(correlationId, STAGE_ANALYZING_BRAND, PERCENTAGE_ANALYZING_BRAND);
 
-    // Perform comprehensive brand analysis
     logger.info('Starting comprehensive brand analysis', {
       correlationId,
       textSamplesCount: textSamples.length,
@@ -1091,22 +1074,19 @@ async function handleStoreSetup(ctx: RequestContext): Promise<Response> {
       articlesCount: contentData.articleText.length,
     });
 
-    // Run brand DNA and tone analysis in parallel for speed
     const [brandDNAResult, toneMatrix] = await Promise.all([
       analyzeBrandDNAViaFetch(textSamples, CONFIG.OPENAI_API_KEY, shopName),
       analyzeToneViaFetch(textSamples, CONFIG.OPENAI_API_KEY),
     ]);
 
-    // Generate personas based on brand DNA (sequential as it depends on brandDNA)
     const personas = await generateAudiencePersonasViaFetch(textSamples, brandDNAResult, CONFIG.OPENAI_API_KEY);
 
-    // Create brand DNA object
     const brandDNA: Readonly<Record<string, unknown>> = {
       brandName: brandDNAResult.brandName || shopName,
       brandValues: brandDNAResult.brandValues || [],
       targetAudiences: personas,
       productCategories: brandDNAResult.productCategories || [],
-      priceRange: brandDNAResult.priceRange || 'medium',
+      priceRange: brandDNAResult.priceRange || DEFAULT_PRICE_RANGE,
       toneKeywords: brandDNAResult.toneKeywords || [],
       messagingThemes: brandDNAResult.messagingThemes || [],
       uniqueSellingPoints: brandDNAResult.uniqueSellingPoints || [],
@@ -1116,11 +1096,10 @@ async function handleStoreSetup(ctx: RequestContext): Promise<Response> {
       brandArchetype: brandDNAResult.brandArchetype,
     };
 
-    // Default consistency score (can be enhanced later)
-    const consistencyScore: number = 75;
+    const consistencyScore: number = DEFAULT_CONSISTENCY_SCORE;
 
     if (!brandDNA || !toneMatrix) {
-      throw new UtilsError(ERROR_BRAND_ANALYSIS_FAILED, ERROR_CODE_ANALYSIS_ERROR, STATUS_INTERNAL_ERROR);
+      throw new UtilsError(ERROR_BRAND_ANALYSIS_FAILED, ERROR_CODE_ANALYSIS_ERROR as string, STATUS_INTERNAL_ERROR);
     }
 
     logProgress(correlationId, STAGE_SAVING_RESULTS, PERCENTAGE_SAVING_RESULTS);
@@ -1151,11 +1130,12 @@ async function handleStoreSetup(ctx: RequestContext): Promise<Response> {
 
     retryOperation(
       async () => {
+        const targetAudiences = (brandDNA.targetAudiences as ReadonlyArray<unknown> | undefined) ?? [];
         const result = await serviceSupabase.from(TABLE_BRAND_DNA_CACHE).insert({
           [COLUMN_STORE_ID]: storeId,
           [COLUMN_EXTRACTED_DNA]: brandDNA,
           [COLUMN_TONE_ANALYSIS]: toneMatrix,
-          [COLUMN_AUDIENCE_MODEL]: brandDNA.targetAudiences ?? [],
+          [COLUMN_AUDIENCE_MODEL]: targetAudiences,
           [COLUMN_CONSISTENCY_SCORE]: consistencyScore,
         });
         if (result.error) {
@@ -1179,16 +1159,17 @@ async function handleStoreSetup(ctx: RequestContext): Promise<Response> {
     logger.info('Store setup completed successfully', {
       correlationId,
       storeId,
-      consistencyScore: typeof consistencyScore === 'object' ? consistencyScore.overallScore : consistencyScore,
+      consistencyScore,
       textSamplesCount: textSamples.length,
       warnings: warnings.length,
     });
 
+    const targetAudiences = (brandDNA.targetAudiences as ReadonlyArray<unknown> | undefined) ?? [];
     const result: SetupResult = {
       success: true,
       brand_dna: brandDNA,
       tone_matrix: toneMatrix,
-      audience_personas: brandDNA.targetAudiences ?? [],
+      audience_personas: targetAudiences,
       consistency_score: consistencyScore,
       textSamplesAnalyzed: textSamples.length,
       ...(warnings.length > 0 && { warnings }),
@@ -1229,12 +1210,15 @@ async function routeRequest(ctx: RequestContext): Promise<Response> {
     }
   }
 
-  return createErrorResponse(ERROR_NOT_FOUND, STATUS_NOT_FOUND, ctx.correlationId);
+  return createErrorResponse(ERROR_NOT_FOUND, STATUS_NOT_FOUND, ctx.correlationId, undefined, ctx.req);
 }
 
 serve(async (req: Request) => {
   if (req.method === METHOD_OPTIONS) {
-    return new Response('ok', { headers: corsHeaders });
+    return new Response(null, {
+      status: STATUS_NO_CONTENT,
+      headers: createCORSHeaders(req, CONFIG.CORS_ORIGINS),
+    });
   }
 
   const config: EndpointConfig = {
@@ -1260,7 +1244,8 @@ serve(async (req: Request) => {
       error instanceof Error ? error.message : ERROR_INTERNAL_SERVER,
       error instanceof UtilsError ? error.statusCode : STATUS_INTERNAL_ERROR,
       correlationId,
-      { errorCode: error instanceof UtilsError ? error.code : ERROR_CODE_INTERNAL_ERROR },
+      { errorCode: error instanceof UtilsError ? error.code : ERROR_CODE_INTERNAL_ERROR as string },
+      req,
     );
   }
 });

@@ -1,11 +1,11 @@
-import { ReactNode } from 'react';
+import { type ReactNode } from 'react';
 import { ErrorBoundary } from './ErrorBoundary';
 
 interface LayoutProps {
-  children: ReactNode;
+  readonly children: ReactNode;
 }
 
-export default function Layout({ children }: LayoutProps) {
+export default function Layout({ children }: LayoutProps): JSX.Element {
   return (
     <ErrorBoundary>
       <div className="min-h-0 flex flex-col">

@@ -1,5 +1,7 @@
-import { ShopifyAPI } from '../integrations/ShopifyClient';
+import { ShopifyAPI } from '../integrations/ShopifyClient.ts';
 import OpenAI from 'openai';
+import { RateLimiter } from '../utils/rate-limiter.ts';
+import { retry } from '../utils/error-handling.ts';
 
 export interface AudiencePersona {
   readonly name: string;
@@ -128,7 +130,7 @@ interface StoreAssets {
 }
 
 interface ContentItem {
-  readonly type: string;
+  readonly type: 'product' | 'page' | 'article';
   readonly title: string;
   readonly content: string;
 }
@@ -175,8 +177,8 @@ interface OpenAIResponse {
 
 interface PromptConfig {
   readonly model: string;
-  readonly reasoning: { readonly effort: 'none' | 'low' | 'medium' | 'high' };
-  readonly text: { readonly verbosity: 'low' | 'medium' | 'high' };
+  readonly reasoning: { readonly effort: 'low' | 'medium' | 'high' };
+  readonly maxOutputTokens?: number;
   readonly responseFormat?: { readonly type: 'json_object' };
   readonly promptCacheKey: string;
   readonly promptCacheRetention: string;
@@ -209,9 +211,218 @@ interface StructureCheckResult {
   readonly recommendations: readonly string[];
 }
 
+interface CacheEntry<T> {
+  readonly value: T;
+  readonly expiresAt: number;
+}
+
+interface TextAnalysis {
+  readonly wordCount: number;
+  readonly sentences: readonly string[];
+  readonly paragraphs: readonly string[];
+}
+
+type LogLevel = 'info' | 'warn' | 'error';
+
+type InconsistencyType = 'voice' | 'messaging' | 'tone';
+type SeverityLevel = 'low' | 'medium' | 'high';
+
+interface ShopData {
+  readonly name?: string;
+  readonly description?: string;
+}
+
+interface ShopifyProduct {
+  readonly title?: string;
+  readonly body_html?: string;
+  readonly product_type?: string;
+  readonly tags?: string;
+}
+
+interface ShopifyCollection {
+  readonly body_html?: string;
+  readonly title?: string;
+}
+
+interface ShopifyPage {
+  readonly body_html?: string;
+  readonly title?: string;
+}
+
+interface ShopifyBlogArticle {
+  readonly title?: string;
+  readonly body_html?: string;
+}
+
+const structuredLog = (
+  level: LogLevel,
+  service: string,
+  message: string,
+  context?: Readonly<Record<string, unknown>>,
+): void => {
+  const payload = JSON.stringify({
+    level,
+    service,
+    message,
+    timestamp: new Date().toISOString(),
+    ...context,
+  });
+
+  if (typeof globalThis === 'undefined' || !('Deno' in globalThis)) {
+    return;
+  }
+
+  const encoder = new TextEncoder();
+  const deno = globalThis as unknown as { Deno: { stderr: { writeSync: (data: Uint8Array) => void }; stdout: { writeSync: (data: Uint8Array) => void } } };
+  
+  if (level === 'error') {
+    deno.Deno.stderr.writeSync(encoder.encode(payload + '\n'));
+    return;
+  }
+
+  deno.Deno.stdout.writeSync(encoder.encode(payload + '\n'));
+};
+
+const nowMs = (): number => Date.now();
+
+const getCache = <T>(cache: Map<string, CacheEntry<T>>, key: string): T | null => {
+  const entry = cache.get(key);
+  if (!entry) return null;
+  if (nowMs() > entry.expiresAt) {
+    cache.delete(key);
+    return null;
+  }
+  return entry.value;
+};
+
+const setCache = <T>(cache: Map<string, CacheEntry<T>>, key: string, value: T, ttlMs: number): void => {
+  cache.set(key, { value, expiresAt: nowMs() + ttlMs });
+};
+
+const cleanupExpiredCache = <T>(cache: Map<string, CacheEntry<T>>): void => {
+  const now = nowMs();
+  for (const [key, entry] of cache.entries()) {
+    if (now > entry.expiresAt) {
+      cache.delete(key);
+    }
+  }
+};
+
+const hashString = (input: string): string => {
+  let hash = 5381;
+  for (let i = 0; i < input.length; i++) {
+    hash = (hash * 33) ^ input.charCodeAt(i);
+  }
+  return (hash >>> 0).toString(36);
+};
+
+const countSyllables = (word: string): number => {
+  const normalized = word.toLowerCase().replace(/[^a-z]/g, '');
+  if (normalized.length <= 3) return 1;
+
+  let processed = normalized.replace(/(?:[^laeiouy]es|ed|[^laeiouy]e)$/, '');
+  processed = processed.replace(/^y/, '');
+  const matches = processed.match(/[aeiouy]{1,2}/g);
+  return matches ? matches.length : 1;
+};
+
+const extractTextContent = (content: string): string => {
+  return content.replace(/<[^>]*>/g, ' ');
+};
+
+const analyzeTextStructure = (textContent: string): TextAnalysis => {
+  const words = textContent.split(/\s+/).filter((w) => w.length > 0);
+  const sentences = textContent.split(/[.!?]+/).filter((s) => s.trim().length > 0);
+  const paragraphs = textContent.split(/\n\n+/).filter((p) => p.trim().length > 0);
+
+  return {
+    wordCount: words.length,
+    sentences,
+    paragraphs,
+  };
+};
+
+const calculateReadability = (content: string): number => {
+  const textContent = extractTextContent(content);
+  const sentences = textContent.split(/[.!?]+/).filter((s) => s.trim().length > 0);
+  const words = textContent.split(/\s+/).filter((w) => w.length > 0);
+  const syllables = words.reduce((sum, word) => sum + countSyllables(word), 0);
+
+  if (sentences.length === 0 || words.length === 0) return 0;
+
+  const avgSentenceLength = words.length / sentences.length;
+  const avgSyllablesPerWord = syllables / words.length;
+  const score = 206.835 - 1.015 * avgSentenceLength - 84.6 * avgSyllablesPerWord;
+
+  return Math.max(0, Math.min(100, score));
+};
+
+const truncateText = (text: string, maxLength: number): string => {
+  return text.length > maxLength ? text.substring(0, maxLength) : text;
+};
+
+const isInconsistencyType = (type: string): type is InconsistencyType => {
+  return type === 'voice' || type === 'messaging' || type === 'tone';
+};
+
+const isSeverityLevel = (severity: string): severity is SeverityLevel => {
+  return severity === 'low' || severity === 'medium' || severity === 'high';
+};
+
+const parseJSONResponse = <T>(text: string | undefined, fallback: T): T => {
+  if (!text) return fallback;
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    return fallback;
+  }
+};
+
+const extractShopData = (shop: unknown): ShopData | undefined => {
+  if (!shop || typeof shop !== 'object') return undefined;
+  const s = shop as Record<string, unknown>;
+  return {
+    name: typeof s.name === 'string' ? s.name : undefined,
+    description: typeof s.description === 'string' ? s.description : undefined,
+  };
+};
+
+const extractProducts = (products: unknown): ReadonlyArray<ShopifyProduct> => {
+  if (!Array.isArray(products)) return [];
+  return products.filter((p): p is ShopifyProduct => 
+    p !== null && typeof p === 'object'
+  );
+};
+
+const extractCollections = (collections: unknown): ReadonlyArray<ShopifyCollection> => {
+  if (!Array.isArray(collections)) return [];
+  return collections.filter((c): c is ShopifyCollection => 
+    c !== null && typeof c === 'object'
+  );
+};
+
+const extractPages = (pages: unknown): ReadonlyArray<ShopifyPage> => {
+  if (!Array.isArray(pages)) return [];
+  return pages.filter((p): p is ShopifyPage => 
+    p !== null && typeof p === 'object'
+  );
+};
+
+const extractBlogArticles = (articles: unknown): ReadonlyArray<ShopifyBlogArticle> => {
+  if (!Array.isArray(articles)) return [];
+  return articles.filter((a): a is ShopifyBlogArticle => 
+    a !== null && typeof a === 'object'
+  );
+};
+
 export class BrandIntelligence {
   private readonly shopifyAPI: ShopifyAPI;
   private readonly openai: OpenAI;
+  private readonly limiter: RateLimiter;
+  private readonly responseCache: Map<string, CacheEntry<OpenAIResponse>>;
+  private readonly inflight: Map<string, Promise<OpenAIResponse>>;
+  private cacheCleanupInterval?: number;
+
   private static readonly DEFAULT_TONE_DIMENSIONS: readonly string[] = [
     'expert',
     'conversational',
@@ -221,7 +432,8 @@ export class BrandIntelligence {
     'casual',
     'authoritative',
     'empathetic',
-  ];
+  ] as const;
+
   private static readonly MAX_TEXT_LENGTH = 50000;
   private static readonly MAX_PERSONA_TEXT_LENGTH = 40000;
   private static readonly MAX_CONTENT_ITEMS = 50;
@@ -229,6 +441,10 @@ export class BrandIntelligence {
   private static readonly MIN_WORD_LENGTH = 4;
   private static readonly MAX_PERSONAS = 3;
   private static readonly DEFAULT_CONSISTENCY_SCORE = 75;
+  private static readonly OPENAI_CACHE_TTL_MS = 10 * 60 * 1000;
+  private static readonly OPENAI_MAX_WAIT_MS = 60_000;
+  private static readonly CACHE_CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
+  private static readonly SERVICE_NAME = 'BrandIntelligence';
 
   private static readonly INDUSTRY_TONE_MAP: Readonly<Record<string, readonly string[]>> = {
     fashion: ['trendy', 'sophisticated', 'elegant', 'bold'],
@@ -241,7 +457,7 @@ export class BrandIntelligence {
     education: ['inspiring', 'clear', 'supportive', 'knowledgeable'],
     luxury: ['exclusive', 'refined', 'sophisticated', 'prestigious'],
     b2b: ['professional', 'authoritative', 'solution-focused', 'trustworthy'],
-  };
+  } as const;
 
   private static readonly COMMON_THEMES: readonly string[] = [
     'quality',
@@ -249,11 +465,45 @@ export class BrandIntelligence {
     'premium',
     'affordable',
     'innovative',
-  ];
+  ] as const;
+
+  private static readonly DEFAULT_RETRY_OPTIONS = {
+    maxAttempts: 3,
+    initialDelay: 1000,
+    backoffMultiplier: 2,
+    retryableErrors: ['rate limit', 'timeout', 'server_error'] as const,
+  } as const;
 
   constructor(shopifyAPI: ShopifyAPI, openaiApiKey: string) {
     this.shopifyAPI = shopifyAPI;
     this.openai = new OpenAI({ apiKey: openaiApiKey });
+    this.limiter = new RateLimiter({
+      maxRequests: 10,
+      windowMs: 1000,
+      burst: 2,
+      algorithm: 'token-bucket',
+      keyPrefix: 'openai-brand',
+      concurrency: 10,
+    });
+    this.responseCache = new Map();
+    this.inflight = new Map();
+    this.startCacheCleanup();
+  }
+
+  private startCacheCleanup(): void {
+    if (typeof globalThis !== 'undefined' && 'setInterval' in globalThis) {
+      this.cacheCleanupInterval = setInterval(() => {
+        cleanupExpiredCache(this.responseCache);
+      }, BrandIntelligence.CACHE_CLEANUP_INTERVAL_MS) as unknown as number;
+    }
+  }
+
+  destroy(): void {
+    if (this.cacheCleanupInterval !== undefined && typeof globalThis !== 'undefined' && 'clearInterval' in globalThis) {
+      clearInterval(this.cacheCleanupInterval);
+    }
+    this.responseCache.clear();
+    this.inflight.clear();
   }
 
   async analyzeBrand(
@@ -262,21 +512,16 @@ export class BrandIntelligence {
     textSamples?: readonly string[],
     toneOptions?: ToneAnalysisOptions,
   ): Promise<BrandAnalysis> {
-    const brandDNA = await this.scanStore(shopDomain, accessToken);
+    const brandDNAPromise = this.scanStore(shopDomain, accessToken);
+    const textSamplesPromise = textSamples && textSamples.length > 0
+      ? Promise.resolve(textSamples)
+      : this.extractTextSamples(shopDomain, accessToken);
 
-    const finalTextSamples = textSamples && textSamples.length > 0
-      ? textSamples
-      : await this.extractTextSamples(shopDomain, accessToken);
-
-    const toneMatrix = await this.analyzeTone(finalTextSamples, toneOptions);
-
-    const consistencyScore = await this.calculateConsistencyScore(
-      shopDomain,
-      accessToken,
-      brandDNA,
-      toneMatrix,
-      finalTextSamples,
-    );
+    const [brandDNA, finalTextSamples] = await Promise.all([brandDNAPromise, textSamplesPromise]);
+    const [toneMatrix, consistencyScore] = await Promise.all([
+      this.analyzeTone(finalTextSamples, toneOptions),
+      this.calculateConsistencyScore(shopDomain, accessToken, brandDNA, finalTextSamples),
+    ]);
 
     return {
       brandDNA,
@@ -294,17 +539,25 @@ export class BrandIntelligence {
       this.shopifyAPI.getBlogArticles(shopDomain, accessToken),
     ]);
 
+    const shopData = extractShopData(shop);
+    const productsArray = extractProducts(products);
+    const collectionsArray = extractCollections(collections);
+    const pagesArray = extractPages(pages);
+    const articlesArray = extractBlogArticles(blogArticles);
+
     const assets: StoreAssets = {
-      shop: shop as StoreAssets['shop'],
-      products: products as StoreAssets['products'],
-      collections: collections as StoreAssets['collections'],
-      pages: pages as StoreAssets['pages'],
-      blogArticles: blogArticles as StoreAssets['blogArticles'],
+      shop: shopData,
+      products: productsArray,
+      collections: collectionsArray,
+      pages: pagesArray,
+      blogArticles: articlesArray,
     };
 
     const textAssets = this.extractTextAssets(assets);
-    const brandDNA = await this.analyzeBrandDNA(textAssets, shop);
-    const personas = await this.generateAudiencePersonas(textAssets, brandDNA, products);
+    const [brandDNA, personas] = await Promise.all([
+      this.analyzeBrandDNA(textAssets, shopData),
+      this.generateAudiencePersonas(textAssets, textAssets),
+    ]);
 
     return {
       ...brandDNA,
@@ -319,22 +572,24 @@ export class BrandIntelligence {
     const combinedText = textSamples.join('\n\n');
     const dimensionsToAnalyze = this.buildToneDimensions(options);
     const staticPrefix = this.buildToneAnalysisStaticPrefix(dimensionsToAnalyze, options?.industry);
-    const variableContent = combinedText.substring(0, BrandIntelligence.MAX_TEXT_LENGTH);
+    const variableContent = truncateText(combinedText, BrandIntelligence.MAX_TEXT_LENGTH);
     const prompt = staticPrefix + variableContent;
 
     try {
       const response = await this.callOpenAI({
         model: 'gpt-5-mini',
         reasoning: { effort: 'medium' },
-        text: { verbosity: 'medium' },
         responseFormat: { type: 'json_object' },
         promptCacheKey: `tone-analysis-${options?.industry || 'default'}`,
         promptCacheRetention: '24h',
       }, prompt);
 
-      const result = JSON.parse(response.output_text || '{}') as ToneAnalysisResponse;
+      const result = parseJSONResponse<ToneAnalysisResponse>(response.output_text, {});
       return this.normalizeToneMatrix(result, dimensionsToAnalyze);
-    } catch {
+    } catch (error) {
+      structuredLog('error', BrandIntelligence.SERVICE_NAME, 'Tone analysis failed', {
+        error: error instanceof Error ? error.message : String(error),
+      });
       return this.getDefaultToneMatrix(dimensionsToAnalyze);
     }
   }
@@ -373,30 +628,29 @@ export class BrandIntelligence {
 
   private async extractTextSamples(shopDomain: string, accessToken: string): Promise<readonly string[]> {
     const products = await this.shopifyAPI.getProducts(shopDomain, accessToken);
-    return (products as ReadonlyArray<{ readonly title?: string; readonly body_html?: string }>)
+    const productsArray = extractProducts(products);
+    return productsArray
       .map((p) => `${p.title || ''} ${p.body_html || ''}`.trim())
       .filter((text) => text.length > 0)
       .slice(0, 50);
   }
 
-  private async analyzeBrandDNA(textAssets: string, shopData?: unknown): Promise<BrandDNA> {
+  private async analyzeBrandDNA(textAssets: string, shopData?: ShopData): Promise<BrandDNA> {
     const staticPrefix = this.buildBrandDNAStaticPrefix();
-    const variableContent = textAssets.substring(0, BrandIntelligence.MAX_TEXT_LENGTH);
+    const variableContent = truncateText(textAssets, BrandIntelligence.MAX_TEXT_LENGTH);
     const prompt = staticPrefix + variableContent;
 
     try {
       const response = await this.callOpenAI({
         model: 'gpt-5-mini',
         reasoning: { effort: 'high' },
-        text: { verbosity: 'high' },
         responseFormat: { type: 'json_object' },
         promptCacheKey: 'brand-dna-extraction',
         promptCacheRetention: '24h',
       }, prompt);
 
-      const result = JSON.parse(response.output_text || '{}') as BrandDNAResponse;
-      const shop = shopData as { readonly name?: string } | undefined;
-      const brandName = shop?.name || result.brandName || 'Store Brand';
+      const result = parseJSONResponse<BrandDNAResponse>(response.output_text, {});
+      const brandName = shopData?.name || result.brandName || 'Store Brand';
 
       return {
         brandName,
@@ -412,20 +666,22 @@ export class BrandIntelligence {
         brandPersonality: result.brandPersonality,
         brandArchetype: result.brandArchetype,
       };
-    } catch {
+    } catch (error) {
+      structuredLog('error', BrandIntelligence.SERVICE_NAME, 'Brand DNA analysis failed', {
+        error: error instanceof Error ? error.message : String(error),
+      });
       return this.fallbackBrandDNAExtraction(textAssets, shopData);
     }
   }
 
-  private fallbackBrandDNAExtraction(textAssets: string, shopData?: unknown): BrandDNA {
+  private fallbackBrandDNAExtraction(textAssets: string, shopData?: ShopData): BrandDNA {
     const words = textAssets.toLowerCase().split(/\s+/);
     const wordFreq = this.calculateWordFrequency(words);
     const themes = this.extractThemes(textAssets);
     const categories = this.extractCategories(textAssets);
-    const shop = shopData as { readonly name?: string } | undefined;
 
     return {
-      brandName: shop?.name || 'Store Brand',
+      brandName: shopData?.name || 'Store Brand',
       brandValues: themes.slice(0, 5),
       targetAudiences: [],
       productCategories: categories,
@@ -548,40 +804,42 @@ Each dimension should be a key in the JSON object with its weight as the value.
 
   private async generateAudiencePersonas(
     textAssets: string,
-    brandDNA: BrandDNA,
-    products: unknown,
+    brandDNAText: string,
   ): Promise<ReadonlyArray<AudiencePersona>> {
-    const staticPrefix = this.buildPersonaStaticPrefix(brandDNA);
-    const variableContent = textAssets.substring(0, BrandIntelligence.MAX_PERSONA_TEXT_LENGTH);
+    const staticPrefix = this.buildPersonaStaticPrefix(brandDNAText);
+    const variableContent = truncateText(textAssets, BrandIntelligence.MAX_PERSONA_TEXT_LENGTH);
     const prompt = staticPrefix + variableContent;
 
     try {
       const response = await this.callOpenAI({
         model: 'gpt-5-mini',
         reasoning: { effort: 'high' },
-        text: { verbosity: 'high' },
         responseFormat: { type: 'json_object' },
         promptCacheKey: 'audience-persona-generation',
         promptCacheRetention: '24h',
       }, prompt);
 
-      const result = JSON.parse(response.output_text || '{}') as PersonaResponse;
+      const result = parseJSONResponse<PersonaResponse>(response.output_text, { personas: [] });
       const personas = result.personas || [];
 
       if (Array.isArray(personas) && personas.length > 0) {
         return personas.slice(0, BrandIntelligence.MAX_PERSONAS);
       }
 
-      return [this.createFallbackPersona(brandDNA)];
-    } catch {
-      return [this.createFallbackPersona(brandDNA)];
+      return [this.createFallbackPersona()];
+    } catch (error) {
+      structuredLog('error', BrandIntelligence.SERVICE_NAME, 'Persona generation failed', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return [this.createFallbackPersona()];
     }
   }
 
-  private buildPersonaStaticPrefix(brandDNA: BrandDNA): string {
+  private buildPersonaStaticPrefix(brandContext: string): string {
+    const contextSummary = truncateText(brandContext, 500);
     return `You are a brand intelligence expert specializing in audience analysis.
 Analyze the brand content and generate detailed audience personas.
-Return a JSON array of personas, each with the following structure:
+Return a JSON object with a "personas" array, each persona with the following structure:
 {
   "name": "persona name",
   "type": "primary|secondary|tertiary",
@@ -609,15 +867,12 @@ Return a JSON array of personas, each with the following structure:
 }
 
 Generate 1-3 personas (primary, and optionally secondary/tertiary).
-Brand context:
-- Brand Values: ${brandDNA.brandValues.join(', ')}
-- Price Range: ${brandDNA.priceRange}
-- Product Categories: ${brandDNA.productCategories.join(', ')}
+Brand context: ${contextSummary}
 
 Content to analyze: `;
   }
 
-  private createFallbackPersona(brandDNA: BrandDNA): AudiencePersona {
+  private createFallbackPersona(): AudiencePersona {
     return {
       name: 'Primary Customer',
       type: 'primary',
@@ -625,16 +880,16 @@ Content to analyze: `;
         ageRange: '25-45',
       },
       psychographics: {
-        interests: brandDNA.messagingThemes.slice(0, 3),
-        values: brandDNA.brandValues.slice(0, 3),
+        interests: [],
+        values: [],
         lifestyle: [],
         motivations: [],
       },
       painPoints: [],
       buyingBehavior: {
         preferredChannels: ['online'],
-        decisionFactors: brandDNA.uniqueSellingPoints.slice(0, 3),
-        priceSensitivity: brandDNA.priceRange === 'high' ? 'low' : 'medium',
+        decisionFactors: [],
+        priceSensitivity: 'medium',
         frequency: 'monthly',
       },
       contentPreferences: [],
@@ -645,8 +900,7 @@ Content to analyze: `;
     shopDomain: string,
     accessToken: string,
     brandDNA: BrandDNA,
-    toneMatrix: ToneMatrix,
-    _textSamples: readonly string[],
+    textSamples: readonly string[],
   ): Promise<BrandConsistencyScore> {
     const [products, pages, blogArticles] = await Promise.all([
       this.shopifyAPI.getProducts(shopDomain, accessToken),
@@ -654,7 +908,12 @@ Content to analyze: `;
       this.shopifyAPI.getBlogArticles(shopDomain, accessToken),
     ]);
 
-    const allContent = this.buildContentItems(products, pages, blogArticles);
+    const productsArray = extractProducts(products);
+    const pagesArray = extractPages(pages);
+    const articlesArray = extractBlogArticles(blogArticles);
+
+    const allContent = this.buildContentItems(productsArray, pagesArray, articlesArray);
+    const toneMatrix = await this.analyzeTone(textSamples);
     const staticPrefix = this.buildConsistencyStaticPrefix(brandDNA, toneMatrix);
     const contentSummary = this.buildContentSummary(allContent);
     const prompt = staticPrefix + contentSummary;
@@ -663,13 +922,12 @@ Content to analyze: `;
       const response = await this.callOpenAI({
         model: 'gpt-5-mini',
         reasoning: { effort: 'medium' },
-        text: { verbosity: 'medium' },
         responseFormat: { type: 'json_object' },
         promptCacheKey: 'brand-consistency-analysis',
         promptCacheRetention: '24h',
       }, prompt);
 
-      const result = JSON.parse(response.output_text || '{}') as ConsistencyResponse;
+      const result = parseJSONResponse<ConsistencyResponse>(response.output_text, {});
 
       return {
         overallScore: result.overallScore ?? BrandIntelligence.DEFAULT_CONSISTENCY_SCORE,
@@ -679,36 +937,36 @@ Content to analyze: `;
         inconsistencies: this.mapInconsistencies(result.inconsistencies),
         recommendations: result.recommendations || [],
       };
-    } catch {
+    } catch (error) {
+      structuredLog('error', BrandIntelligence.SERVICE_NAME, 'Consistency check failed', {
+        error: error instanceof Error ? error.message : String(error),
+      });
       return this.createDefaultConsistencyScore();
     }
   }
 
   private buildContentItems(
-    products: unknown,
-    pages: unknown,
-    blogArticles: unknown,
+    products: ReadonlyArray<ShopifyProduct>,
+    pages: ReadonlyArray<ShopifyPage>,
+    blogArticles: ReadonlyArray<ShopifyBlogArticle>,
   ): ReadonlyArray<ContentItem> {
-    const productItems = (products as ReadonlyArray<{ readonly title?: string; readonly body_html?: string }>)
-      .map((p) => ({
-        type: 'product',
-        title: p.title || '',
-        content: p.body_html || '',
-      }));
+    const productItems: ContentItem[] = products.map((p) => ({
+      type: 'product' as const,
+      title: p.title || '',
+      content: p.body_html || '',
+    }));
 
-    const pageItems = (pages as ReadonlyArray<{ readonly title?: string; readonly body_html?: string }>)
-      .map((p) => ({
-        type: 'page',
-        title: p.title || '',
-        content: p.body_html || '',
-      }));
+    const pageItems: ContentItem[] = pages.map((p) => ({
+      type: 'page' as const,
+      title: p.title || '',
+      content: p.body_html || '',
+    }));
 
-    const articleItems = (blogArticles as ReadonlyArray<{ readonly title?: string; readonly body_html?: string }>)
-      .map((a) => ({
-        type: 'article',
-        title: a.title || '',
-        content: a.body_html || '',
-      }));
+    const articleItems: ContentItem[] = blogArticles.map((a) => ({
+      type: 'article' as const,
+      title: a.title || '',
+      content: a.body_html || '',
+    }));
 
     return [...productItems, ...pageItems, ...articleItems];
   }
@@ -716,7 +974,7 @@ Content to analyze: `;
   private buildContentSummary(content: ReadonlyArray<ContentItem>): string {
     return content
       .slice(0, BrandIntelligence.MAX_CONTENT_ITEMS)
-      .map((c) => `[${c.type}] ${c.title}: ${c.content.substring(0, BrandIntelligence.CONTENT_PREVIEW_LENGTH)}`)
+      .map((c) => `[${c.type}] ${c.title}: ${truncateText(c.content, BrandIntelligence.CONTENT_PREVIEW_LENGTH)}`)
       .join('\n\n');
   }
 
@@ -756,21 +1014,21 @@ Content to analyze: `;
       readonly severity: string;
     }>,
   ): ReadonlyArray<{
-    readonly type: 'voice' | 'messaging' | 'tone';
+    readonly type: InconsistencyType;
     readonly location: string;
     readonly description: string;
-    readonly severity: 'low' | 'medium' | 'high';
+    readonly severity: SeverityLevel;
   }> {
     if (!inconsistencies) return [];
 
     return inconsistencies
-      .filter((inc) => ['voice', 'messaging', 'tone'].includes(inc.type))
-      .filter((inc) => ['low', 'medium', 'high'].includes(inc.severity))
+      .filter((inc) => isInconsistencyType(inc.type))
+      .filter((inc) => isSeverityLevel(inc.severity))
       .map((inc) => ({
-        type: inc.type as 'voice' | 'messaging' | 'tone',
+        type: inc.type as InconsistencyType,
         location: inc.location,
         description: inc.description,
-        severity: inc.severity as 'low' | 'medium' | 'high',
+        severity: inc.severity as SeverityLevel,
       }));
   }
 
@@ -806,15 +1064,71 @@ Content to analyze: `;
   }
 
   private async callOpenAI(config: PromptConfig, input: string): Promise<OpenAIResponse> {
-    return await this.openai.responses.create({
-      model: config.model,
-      reasoning: config.reasoning,
-      text: config.text,
-      input,
-      response_format: config.responseFormat,
-      prompt_cache_key: config.promptCacheKey,
-      prompt_cache_retention: config.promptCacheRetention,
-    }) as OpenAIResponse;
+    const normalizedInput = truncateText(input, BrandIntelligence.MAX_TEXT_LENGTH);
+    const cacheKey = `${config.model}:${config.promptCacheKey}:${hashString(normalizedInput)}`;
+    const cached = getCache(this.responseCache, cacheKey);
+    if (cached) {
+      return cached;
+    }
+
+    const inflight = this.inflight.get(cacheKey);
+    if (inflight) {
+      return inflight;
+    }
+
+    const promise = (async (): Promise<OpenAIResponse> => {
+      const allowed = await this.limiter.waitForToken(config.model, BrandIntelligence.OPENAI_MAX_WAIT_MS);
+      if (!allowed) {
+        throw new Error('OpenAI rate limit wait exceeded');
+      }
+
+      const start = nowMs();
+      const result = await retry(
+        async () => {
+          const requestBody = {
+            model: config.model,
+            reasoning: config.reasoning,
+            messages: [{ role: 'user' as const, content: normalizedInput }],
+            max_tokens: config.maxOutputTokens,
+            response_format: config.responseFormat,
+          };
+
+          const response = await this.openai.responses.create(requestBody);
+          return { output_text: (response as { output_text?: string }).output_text } as OpenAIResponse;
+        },
+        {
+          ...BrandIntelligence.DEFAULT_RETRY_OPTIONS,
+          onRetry: (attempt, error) => {
+            structuredLog('warn', BrandIntelligence.SERVICE_NAME, 'OpenAI retry', {
+              attempt,
+              model: config.model,
+              promptCacheKey: config.promptCacheKey,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          },
+        },
+      );
+
+      setCache(this.responseCache, cacheKey, result, BrandIntelligence.OPENAI_CACHE_TTL_MS);
+      structuredLog('info', BrandIntelligence.SERVICE_NAME, 'OpenAI call ok', {
+        model: config.model,
+        promptCacheKey: config.promptCacheKey,
+        latencyMs: nowMs() - start,
+      });
+      return result;
+    })().catch((error) => {
+      structuredLog('error', BrandIntelligence.SERVICE_NAME, 'OpenAI call failed', {
+        model: config.model,
+        promptCacheKey: config.promptCacheKey,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }).finally(() => {
+      this.inflight.delete(cacheKey);
+    });
+
+    this.inflight.set(cacheKey, promise);
+    return promise;
   }
 }
 
@@ -823,6 +1137,9 @@ export class BrandSafety {
   private readonly forbiddenWords: Set<string>;
   private readonly brandDNA?: BrandDNA;
   private readonly toneMatrix?: ToneMatrix;
+  private readonly limiter: RateLimiter;
+  private readonly responseCache: Map<string, CacheEntry<unknown>>;
+
   private static readonly CHECK_WEIGHTS: CheckWeights = {
     toneConsistency: 10,
     duplicateContent: 15,
@@ -836,14 +1153,16 @@ export class BrandSafety {
     structure: 5,
     readability: 5,
     forbiddenWords: 10,
-  };
-  private static readonly MAX_CONTENT_LENGTH = 8000;
+  } as const;
+
   private static readonly MIN_READABILITY_SCORE = 60;
   private static readonly MIN_SEO_SCORE = 70;
   private static readonly MIN_PASSING_SCORE = 70;
   private static readonly MAX_SENTENCE_LENGTH = 20;
   private static readonly MIN_WORD_COUNT = 300;
   private static readonly MAX_PARAGRAPH_LENGTH = 150;
+  private static readonly OPENAI_CACHE_TTL_MS = 5 * 60 * 1000;
+  private static readonly SERVICE_NAME = 'BrandSafety';
 
   constructor(
     apiKey: string,
@@ -859,6 +1178,15 @@ export class BrandSafety {
     );
     this.brandDNA = options?.brandDNA;
     this.toneMatrix = options?.toneMatrix;
+    this.limiter = new RateLimiter({
+      maxRequests: 5,
+      windowMs: 1000,
+      burst: 1,
+      algorithm: 'token-bucket',
+      keyPrefix: 'openai-safety',
+      concurrency: 5,
+    });
+    this.responseCache = new Map();
   }
 
   async checkContent(
@@ -866,16 +1194,22 @@ export class BrandSafety {
     options?: SafetyCheckOptions,
   ): Promise<SafetyCheck> {
     const defaultOptions = this.buildDefaultOptions(options);
-    const brandDNA = defaultOptions.brandDNA || this.brandDNA;
-    const toneMatrix = defaultOptions.toneMatrix || this.toneMatrix;
-
     const allIssues: SafetyIssue[] = [];
     const recommendations: string[] = [];
     const checkResults: SafetyCheck['checks'] = {};
     let totalScore = 100;
 
-    if (defaultOptions.checkSEO) {
-      const seoCheck = await this.checkSEOQuality(content);
+    const seoPromise = defaultOptions.checkSEO
+      ? this.checkSEOQuality(content)
+      : Promise.resolve(null);
+
+    const structurePromise = defaultOptions.checkStructure
+      ? Promise.resolve(this.checkContentStructure(content))
+      : Promise.resolve(null);
+
+    const [seoCheck, structureCheck] = await Promise.all([seoPromise, structurePromise]);
+
+    if (seoCheck) {
       checkResults.seo = {
         passed: seoCheck.score >= BrandSafety.MIN_SEO_SCORE,
         score: seoCheck.score,
@@ -888,8 +1222,7 @@ export class BrandSafety {
       }
     }
 
-    if (defaultOptions.checkStructure) {
-      const structureCheck = this.checkContentStructure(content);
+    if (structureCheck) {
       checkResults.structure = {
         passed: structureCheck.issues.length === 0,
         issues: structureCheck.issues.map((i) => i.message),
@@ -901,7 +1234,7 @@ export class BrandSafety {
       }
     }
 
-    const readability = this.checkReadability(content);
+    const readability = calculateReadability(content);
     checkResults.readability = {
       passed: readability >= BrandSafety.MIN_READABILITY_SCORE,
       score: readability,
@@ -934,8 +1267,8 @@ export class BrandSafety {
     const issuesList: SafetyIssue[] = [];
     let score = 100;
 
-    const textContent = this.extractTextContent(content);
-    const analysis = this.analyzeTextStructure(textContent);
+    const textContent = extractTextContent(content);
+    const analysis = analyzeTextStructure(textContent);
 
     if (analysis.wordCount < BrandSafety.MIN_WORD_COUNT) {
       issues.push('Content is too short for SEO (minimum 300 words recommended)');
@@ -1005,32 +1338,9 @@ export class BrandSafety {
     return { issues, recommendations };
   }
 
-  private checkReadability(content: string): number {
-    const textContent = this.extractTextContent(content);
-    const sentences = textContent.split(/[.!?]+/).filter((s) => s.trim().length > 0);
-    const words = textContent.split(/\s+/).filter((w) => w.length > 0);
-    const syllables = words.reduce((sum, word) => sum + this.countSyllables(word), 0);
-
-    if (sentences.length === 0 || words.length === 0) return 0;
-
-    const avgSentenceLength = words.length / sentences.length;
-    const avgSyllablesPerWord = syllables / words.length;
-    const score = 206.835 - 1.015 * avgSentenceLength - 84.6 * avgSyllablesPerWord;
-
-    return Math.max(0, Math.min(100, score));
-  }
-
-  private countSyllables(word: string): number {
-    const normalized = word.toLowerCase().replace(/[^a-z]/g, '');
-    if (normalized.length <= 3) return 1;
-
-    let processed = normalized.replace(/(?:[^laeiouy]es|ed|[^laeiouy]e)$/, '');
-    processed = processed.replace(/^y/, '');
-    const matches = processed.match(/[aeiouy]{1,2}/g);
-    return matches ? matches.length : 1;
-  }
-
-  private buildDefaultOptions(options?: SafetyCheckOptions): Required<Omit<SafetyCheckOptions, 'brandDNA' | 'toneMatrix' | 'existingContent'>> & Pick<SafetyCheckOptions, 'brandDNA' | 'toneMatrix' | 'existingContent'> {
+  private buildDefaultOptions(
+    options?: SafetyCheckOptions,
+  ): Required<Omit<SafetyCheckOptions, 'brandDNA' | 'toneMatrix' | 'existingContent'>> & Pick<SafetyCheckOptions, 'brandDNA' | 'toneMatrix' | 'existingContent'> {
     return {
       checkForbiddenWords: false,
       checkTone: false,
@@ -1057,26 +1367,6 @@ export class BrandSafety {
       return issues.filter((i) => i.severity === 'critical' || i.severity === 'high').length === 0;
     }
     return totalScore >= BrandSafety.MIN_PASSING_SCORE && issues.filter((i) => i.severity === 'critical').length === 0;
-  }
-
-  private extractTextContent(content: string): string {
-    return content.replace(/<[^>]*>/g, ' ');
-  }
-
-  private analyzeTextStructure(textContent: string): {
-    readonly wordCount: number;
-    readonly sentences: readonly string[];
-    readonly paragraphs: readonly string[];
-  } {
-    const words = textContent.split(/\s+/).filter((w) => w.length > 0);
-    const sentences = textContent.split(/[.!?]+/).filter((s) => s.trim().length > 0);
-    const paragraphs = textContent.split(/\n\n+/).filter((p) => p.trim().length > 0);
-
-    return {
-      wordCount: words.length,
-      sentences,
-      paragraphs,
-    };
   }
 
   private checkHeadingStructure(content: string): {

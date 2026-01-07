@@ -14,7 +14,17 @@ import {
   validateAuthHeader,
   createCORSHeaders,
 } from '../_shared/utils.ts';
-// AnalyticsCollector removed - using inline implementation for Deno compatibility
+import type { BlogPostContent } from '../../../backend/src/core/BlogComposer.ts';
+import { PlanManager } from '../../../backend/src/core/PlanManager.ts';
+import { GDPRDataGuard } from '../../../backend/src/core/GDPRDataGuard.ts';
+import { BlogComposer } from '../../../backend/src/core/BlogComposer.ts';
+import { KeywordMiner } from '../../../backend/src/core/KeywordMiner.ts';
+import { SEOOptimizer } from '../../../backend/src/core/SEOOptimizer.ts';
+import { ContentGraph } from '../../../backend/src/core/ContentGraph.ts';
+import { ProductContextEngine } from '../../../backend/src/core/ProductContextEngine.ts';
+import { ImageGenerator } from '../../../backend/src/core/ImageGenerator.ts';
+import { JobQueue } from '../../../backend/src/core/JobQueue.ts';
+import { ShopifyClient } from '../../../backend/src/integrations/ShopifyClient.ts';
 
 interface DenoEnv {
   readonly get?: (key: string) => string | undefined;
@@ -49,7 +59,7 @@ interface APIResponse {
 
 interface RequestContext {
   readonly req: APIRequest;
-  readonly supabase: ReturnType<typeof getSupabaseClient>;
+  readonly supabase: Awaited<ReturnType<typeof getSupabaseClient>>;
   readonly correlationId: string;
   readonly userId?: string;
   readonly storeId?: string;
@@ -173,6 +183,68 @@ interface EventValidationResult {
   readonly error?: string;
 }
 
+interface PostUpdateBody {
+  readonly title?: string;
+  readonly content?: string;
+  readonly excerpt?: string;
+  readonly seoTitle?: string;
+  readonly seoDescription?: string;
+  readonly keywords?: ReadonlyArray<string>;
+  readonly status?: string;
+  readonly scheduled_publish_at?: string;
+  readonly review_status?: 'pending' | 'approved' | 'rejected' | 'auto_approved';
+  readonly reviewed_at?: string;
+  readonly review_feedback?: Readonly<Record<string, unknown>>;
+}
+
+interface PostCreationBody {
+  readonly storeId?: string;
+  readonly topic?: string;
+  readonly keywords?: ReadonlyArray<string>;
+  readonly products?: ReadonlyArray<string>;
+  readonly structure?: string;
+  readonly language?: string;
+  readonly experienceLevel?: string;
+  readonly audiencePersona?: string;
+  readonly includeCitations?: boolean;
+  readonly validateQuality?: boolean;
+  readonly regenerateFrom?: string;
+}
+
+interface PostCreationParams {
+  readonly storeId: string;
+  readonly topic: string;
+  readonly keywords?: ReadonlyArray<string>;
+  readonly products?: ReadonlyArray<string>;
+  readonly structure?: string;
+  readonly language?: string;
+  readonly experienceLevel?: string;
+  readonly audiencePersona?: string;
+  readonly includeCitations?: boolean;
+  readonly validateQuality?: boolean;
+}
+
+interface DatabasePost {
+  readonly id: string;
+  readonly store_id: string;
+  readonly [key: string]: unknown;
+}
+
+interface DatabaseStore {
+  readonly id: string;
+  readonly plan_id?: string | null;
+  readonly tone_matrix?: Readonly<Record<string, number>> | null;
+  readonly brand_dna?: Readonly<Record<string, unknown>> | null;
+  readonly is_active: boolean;
+  readonly shop_domain: string;
+  readonly access_token: string;
+  readonly content_preferences?: {
+    readonly topic_preferences?: string[];
+    readonly keyword_focus?: string[];
+    readonly content_angles?: string[];
+  };
+}
+
 const ENV_SUPABASE_URL = 'SUPABASE_URL';
 const ENV_SUPABASE_ANON_KEY = 'SUPABASE_ANON_KEY';
 const ENV_SUPABASE_SERVICE_ROLE_KEY = 'SUPABASE_SERVICE_ROLE_KEY';
@@ -200,6 +272,8 @@ const BEARER_PREFIX_LENGTH = 7;
 const MIN_TOKEN_LENGTH = 10;
 const METHOD_GET = 'GET';
 const METHOD_POST = 'POST';
+const METHOD_PATCH = 'PATCH';
+const METHOD_DELETE = 'DELETE';
 const METHOD_OPTIONS = 'OPTIONS';
 const STATUS_OK = 200;
 const STATUS_BAD_REQUEST = 400;
@@ -220,7 +294,7 @@ const HEADER_ACCESS_CONTROL_ALLOW_HEADERS = 'Access-Control-Allow-Headers';
 const HEADER_ACCESS_CONTROL_ALLOW_METHODS = 'Access-Control-Allow-Methods';
 const HEADER_ACCESS_CONTROL_MAX_AGE = 'Access-Control-Max-Age';
 const CORS_HEADERS_VALUE = 'authorization, x-client-info, apikey, content-type, x-correlation-id, x-request-id';
-const CORS_METHODS_VALUE = 'GET, POST, OPTIONS';
+const CORS_METHODS_VALUE = 'GET, POST, PATCH, DELETE, OPTIONS';
 const CORS_MAX_AGE_VALUE = '86400';
 const ENCODING_NONE = 'none';
 const PATH_SEPARATOR = '/';
@@ -266,6 +340,8 @@ const COLUMN_STORE_ID = 'store_id';
 const COLUMN_SHOP_DOMAIN = 'shop_domain';
 const COLUMN_ACCESS_TOKEN = 'access_token';
 const COLUMN_PLAN_ID = 'plan_id';
+const COLUMN_TONE_MATRIX = 'tone_matrix';
+const COLUMN_BRAND_DNA = 'brand_dna';
 const COLUMN_IS_ACTIVE = 'is_active';
 const COLUMN_IS_PAUSED = 'is_paused';
 const COLUMN_TRIAL_STARTED_AT = 'trial_started_at';
@@ -280,17 +356,54 @@ const COLUMN_POSITION = 'position';
 const COLUMN_CONVERSIONS = 'conversions';
 const COLUMN_REVENUE = 'revenue';
 const COLUMN_TITLE = 'title';
+const COLUMN_CONTENT = 'content';
+const COLUMN_EXCERPT = 'excerpt';
+const COLUMN_SEO_TITLE = 'seo_title';
+const COLUMN_SEO_DESCRIPTION = 'seo_description';
+const COLUMN_KEYWORDS = 'keywords';
+const COLUMN_PRIMARY_KEYWORD = 'primary_keyword';
+const COLUMN_PRODUCT_MENTIONS = 'product_mentions';
+const COLUMN_FEATURED_IMAGE_URL = 'featured_image_url';
+const COLUMN_STRUCTURED_DATA = 'structured_data';
+const COLUMN_SCHEDULED_PUBLISH_AT = 'scheduled_publish_at';
+const COLUMN_UPDATED_AT = 'updated_at';
+const COLUMN_STATUS = 'status';
 const STATUS_PUBLISHED = 'published';
 const STATUS_DRAFT = 'draft';
 const STATUS_SCHEDULED = 'scheduled';
 const STATUS_ARCHIVED = 'archived';
 const VALID_STATUSES: ReadonlyArray<string> = [STATUS_PUBLISHED, STATUS_DRAFT, STATUS_SCHEDULED, STATUS_ARCHIVED, 'queued'];
+const ERROR_POST_NOT_FOUND = 'Post not found';
+const ERROR_POST_ID_REQUIRED = 'postId is required';
+const ERROR_CODE_POST_NOT_FOUND = 'POST_NOT_FOUND';
+const ENV_FLUX_API_KEY = 'FLUX_API_KEY';
+const ENV_CREATE_POST_TIMEOUT = 'CREATE_POST_TIMEOUT';
+const ENV_ENABLE_IMAGE_GENERATION = 'ENABLE_IMAGE_GENERATION';
+const ENV_ENABLE_LLM_SNIPPETS = 'ENABLE_LLM_SNIPPETS';
+const ENV_ENABLE_SEO_OPTIMIZATION = 'ENABLE_SEO_OPTIMIZATION';
+const ENV_ENABLE_PRODUCT_MENTIONS = 'ENABLE_PRODUCT_MENTIONS';
+const ENV_ENABLE_INTERNAL_LINKS = 'ENABLE_INTERNAL_LINKS';
+const DEFAULT_CREATE_POST_TIMEOUT = 300000;
+const DEFAULT_MAX_REQUEST_SIZE_POSTS = 10485760;
+const MAX_KEYWORDS = 50;
+const MAX_TOPIC_LENGTH = 500;
+const IMAGE_WIDTH = 1280;
+const IMAGE_HEIGHT = 720;
+const IMAGE_FORMAT = 'webp';
+const IMAGE_QUALITY = 85;
+const JOB_PRIORITY_NORMAL = 'normal';
+const JOB_MAX_ATTEMPTS = 3;
+const JOB_TYPE_LLM_SNIPPET = 'llm_snippet';
+const DEFAULT_TONE_MATRIX: Readonly<Record<string, number>> = {
+  expert: 0.3,
+  conversational: 0.3,
+  aspirational: 0.2,
+  friendly: 0.2,
+};
 const RATE_LIMIT_WINDOW_MS = 60000;
-// Optimized cache TTLs to reduce Edge Function invocations
-// Increased TTLs for data that doesn't change frequently
-const CACHE_TTL_QUOTA = 120000; // 2 minutes (was 30s) - quota updates less frequently
-const CACHE_TTL_POSTS = 120000; // 2 minutes (was 60s) - posts don't change that often
-const CACHE_TTL_ANALYTICS = 600000; // 10 minutes (was 5) - analytics can be cached longer
+const CACHE_TTL_QUOTA = 120000;
+const CACHE_TTL_POSTS = 120000;
+const CACHE_TTL_ANALYTICS = 600000;
 const RATE_LIMIT_QUOTA = 100;
 const RATE_LIMIT_POSTS = 200;
 const RATE_LIMIT_ANALYTICS = 100;
@@ -333,12 +446,14 @@ const CONFIG = {
   SUPABASE_ANON_KEY: getEnv(ENV_SUPABASE_ANON_KEY, ''),
   SUPABASE_SERVICE_ROLE_KEY: getEnv(ENV_SUPABASE_SERVICE_ROLE_KEY, ''),
   OPENAI_API_KEY: getEnv(ENV_OPENAI_API_KEY, ''),
+  FLUX_API_KEY: getEnv(ENV_FLUX_API_KEY, ''),
   GOOGLE_CLIENT_ID: getEnv('GOOGLE_CLIENT_ID', ''),
   GOOGLE_CLIENT_SECRET: getEnv('GOOGLE_CLIENT_SECRET', ''),
   ENABLE_CACHING: getEnv(ENV_ENABLE_CACHING, 'true') !== 'false',
   DEFAULT_PAGE_SIZE,
   MAX_PAGE_SIZE,
   DEFAULT_TIMEOUT,
+  CREATE_POST_TIMEOUT: parseInt(getEnv(ENV_CREATE_POST_TIMEOUT, String(DEFAULT_CREATE_POST_TIMEOUT))),
   ENABLE_AUDIT_LOGGING: true,
   ENABLE_METRICS: true,
   CORS_ORIGINS: getEnv(ENV_CORS_ORIGINS, '*').split(','),
@@ -348,6 +463,11 @@ const CONFIG = {
   ENABLE_RETRY: getEnv(ENV_ENABLE_RETRY, 'true') !== 'false',
   MAX_RETRIES: parseInt(getEnv(ENV_MAX_RETRIES, String(DEFAULT_MAX_RETRIES))),
   RETRY_DELAY_MS: parseInt(getEnv(ENV_RETRY_DELAY_MS, String(DEFAULT_RETRY_DELAY_MS))),
+  ENABLE_IMAGE_GENERATION: getEnv(ENV_ENABLE_IMAGE_GENERATION, 'true') !== 'false',
+  ENABLE_LLM_SNIPPETS: getEnv(ENV_ENABLE_LLM_SNIPPETS, 'true') !== 'false',
+  ENABLE_SEO_OPTIMIZATION: getEnv(ENV_ENABLE_SEO_OPTIMIZATION, 'true') !== 'false',
+  ENABLE_PRODUCT_MENTIONS: getEnv(ENV_ENABLE_PRODUCT_MENTIONS, 'true') !== 'false',
+  ENABLE_INTERNAL_LINKS: getEnv(ENV_ENABLE_INTERNAL_LINKS, 'true') !== 'false',
 };
 
 function getCORSHeaders(req: Request): Readonly<Record<string, string>> {
@@ -478,18 +598,9 @@ function generateCorrelationId(): string {
   return `${CORRELATION_PREFIX}${Date.now()}-${Math.random().toString(ID_RADIX).substring(2, 2 + ID_LENGTH)}`;
 }
 
-// ============================================================================
-// StoreId Resolution Helpers
-// ============================================================================
+const storeIdCache = new Map<string, { readonly storeId: string; readonly timestamp: number }>();
+const STORE_ID_CACHE_TTL = 5 * 60 * 1000;
 
-// Cache for shopDomain -> storeId lookups (short TTL to reduce DB calls)
-const storeIdCache = new Map<string, { storeId: string; timestamp: number }>();
-const STORE_ID_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
-
-/**
- * Resolve storeId from shopDomain using cache or database lookup
- * This is the single source of truth for shopDomain -> storeId resolution
- */
 async function resolveStoreIdFromShopDomain(
   shopDomain: string,
   supabase: Awaited<ReturnType<typeof getSupabaseClient>>,
@@ -536,9 +647,6 @@ async function resolveStoreIdFromShopDomain(
   }
 }
 
-/**
- * Extract shopDomain from URL path (e.g., /store/{shopDomain})
- */
 function extractShopDomainFromPath(url: URL): string | null {
   const pathParts = url.pathname.split(PATH_SEPARATOR).filter((p) => p);
   const storeIndex = pathParts.indexOf('store');
@@ -550,10 +658,6 @@ function extractShopDomainFromPath(url: URL): string | null {
   return null;
 }
 
-/**
- * Comprehensive storeId resolution - tries multiple sources
- * Priority: 1. Query params, 2. Request body, 3. Context, 4. URL path (shopDomain lookup)
- */
 async function resolveStoreId(
   ctx: RequestContext,
   options: {
@@ -610,10 +714,6 @@ async function resolveStoreId(
   return { storeId: null, shopDomain: null, source: 'not_found' };
 }
 
-/**
- * Helper to get storeId with proper error handling
- * Returns storeId or throws/returns error response
- */
 async function getStoreIdOrError(
   ctx: RequestContext,
   options: {
@@ -668,10 +768,6 @@ async function getStoreIdOrError(
   return { storeId: result.storeId, shopDomain: result.shopDomain };
 }
 
-// ============================================================================
-// Request Context
-// ============================================================================
-
 async function createRequestContext(req: Request, requiresAuth: boolean = true): Promise<RequestContext> {
   const correlationId = req.headers.get(HEADER_X_CORRELATION_ID) ?? generateCorrelationId();
   const authHeader = req.headers.get(HEADER_AUTHORIZATION);
@@ -682,35 +778,27 @@ async function createRequestContext(req: Request, requiresAuth: boolean = true):
   }
 
   if (!CONFIG.SUPABASE_URL || !CONFIG.SUPABASE_ANON_KEY) {
-    const missingVars = [];
+    const missingVars: string[] = [];
     if (!CONFIG.SUPABASE_URL) missingVars.push('SUPABASE_URL');
     if (!CONFIG.SUPABASE_ANON_KEY) missingVars.push('SUPABASE_ANON_KEY');
     throw new UtilsError(
       `Missing required environment variables: ${missingVars.join(', ')}`,
-      ERROR_CODE_CONFIG_ERROR,
+      ERROR_CODE_CONFIG_ERROR as string,
       STATUS_INTERNAL_ERROR,
     );
   }
 
   const supabase = authHeader ? await createAuthenticatedClient(authHeader) : await getSupabaseClient({ clientType: 'anon' });
   
-  // Try to extract storeId from URL path for /store/{shopDomain} requests
   const url = new URL(req.url);
   let storeId: string | undefined;
-  let shopDomain: string | undefined;
   
-  // Check for shopDomain in URL path
-  shopDomain = extractShopDomainFromPath(url) || undefined;
+  const shopDomain = extractShopDomainFromPath(url) || undefined;
   
-  // Check for storeId in query params
   const storeIdFromParams = url.searchParams.get(PARAM_STORE_ID);
   if (storeIdFromParams) {
     storeId = storeIdFromParams;
   }
-  
-  // If we have shopDomain but no storeId, try to resolve it (async)
-  // Note: We don't await here to avoid blocking context creation
-  // The actual resolution happens in handlers via resolveStoreId helper
 
   return {
     req: req as APIRequest,
@@ -861,7 +949,6 @@ async function createSuccessResponse(
 
   const corsHeaders = options.request ? getCORSHeaders(options.request) : createCORSHeaders({ headers: new Headers() } as Request, CONFIG.CORS_ORIGINS);
 
-  // Enable compression by default if request is provided (for performance optimization)
   const shouldCompress = options.compression !== false && options.request;
   if (shouldCompress) {
     const compression = acceptsCompression(options.request);
@@ -957,7 +1044,6 @@ async function handleQuota(ctx: RequestContext): Promise<Response> {
     shopDomain: url.searchParams.get('shopDomain') || undefined,
   });
   
-  // If it's a Response, it's an error response - return it
   if (storeIdResult instanceof Response) {
     return storeIdResult;
   }
@@ -965,11 +1051,8 @@ async function handleQuota(ctx: RequestContext): Promise<Response> {
   const { storeId } = storeIdResult;
 
   try {
-    // Use service role client to bypass RLS when fetching store
-    // The anon client might not have permission to read stores due to RLS policies
     const serviceSupabase = await getSupabaseClient({ clientType: 'service' });
     
-    // First, ensure store has a plan - assign free_trial if missing
     const { data: store, error: storeCheckError } = await retryOperation(
       async () => {
         const result = await serviceSupabase
@@ -978,13 +1061,10 @@ async function handleQuota(ctx: RequestContext): Promise<Response> {
           .eq(COLUMN_ID, storeId)
           .single();
         if (result.error) {
-          // Check if it's a "not found" error
           const errorCode = (result.error as { code?: string })?.code;
           if (errorCode === 'PGRST116') {
-            // Return a result that indicates not found
             return { data: null, error: result.error };
           }
-          // Log detailed error for debugging
           const errorMessage = (result.error as { message?: string })?.message || String(result.error);
           const errorDetails = (result.error as { details?: string })?.details;
           const errorHint = (result.error as { hint?: string })?.hint;
@@ -1011,14 +1091,13 @@ async function handleQuota(ctx: RequestContext): Promise<Response> {
 
     const storeData = store as { id: string; plan_id: string | null; trial_started_at?: string | null; trial_ends_at?: string | null };
     
-    // If store has no plan, initialize trial using enterprise-grade manager
     if (!storeData.plan_id) {
-      const { PlanTrialManager } = await import('../backend/src/core/PlanTrialManager.ts');
-      const planTrialManager = new PlanTrialManager(serviceSupabase);
+      const { PlanManager } = await import('../backend/src/core/PlanManager.ts');
+      const planManager = new PlanManager(serviceSupabase);
 
       const initResult = await retryOperation(
         async () => {
-          return await planTrialManager.initializeTrial(storeId, 14, correlationId, false);
+          return await planManager.initializeTrial(storeId, 14, correlationId, false);
         },
         CONFIG.MAX_RETRIES,
         CONFIG.RETRY_DELAY_MS,
@@ -1030,7 +1109,7 @@ async function handleQuota(ctx: RequestContext): Promise<Response> {
           error: initResult.error,
           storeId,
         });
-        throw new SupabaseClientError('Failed to initialize trial', new Error(initResult.error || 'Unknown error'));
+        throw new SupabaseClientError('Failed to initialize trial', { error: initResult.error || 'Unknown error' });
       }
 
       logger.info('Initialized trial for store without plan', {
@@ -1042,14 +1121,12 @@ async function handleQuota(ctx: RequestContext): Promise<Response> {
 
     const quotaStatus = await retryOperation(
       async () => {
-        // Use service role client for RPC call as well to ensure consistency
         const result = await serviceSupabase.rpc(RPC_GET_STORE_QUOTA_STATUS, {
           [PARAM_STORE_UUID]: storeId,
         });
         
         if (result.error) {
-          // Log detailed error for debugging
-          logger.error('RPC get_store_quota_status error', {
+          logger.error('RPC get_store_quota_status (cached) error', {
             correlationId,
             storeId,
             error: result.error,
@@ -1061,19 +1138,15 @@ async function handleQuota(ctx: RequestContext): Promise<Response> {
           throw new SupabaseClientError('Failed to fetch quota', result.error);
         }
         
-        // The RPC function returns a TABLE, so result.data is an array
-        // Get the first row (should only be one row per store)
         const quotaData = Array.isArray(result.data) && result.data.length > 0 
           ? result.data[0] 
           : null;
         
         if (!quotaData) {
-          // If no data returned, it might be a new store - return default values
-          logger.warn('RPC get_store_quota_status returned no data, using defaults', {
+          logger.warn('RPC get_store_quota_status (cached) returned no data, using defaults', {
             correlationId,
             storeId,
           });
-          // Return default quota structure
           return {
             store_id: storeId,
             plan_name: 'free_trial',
@@ -1112,7 +1185,6 @@ async function handlePosts(ctx: RequestContext): Promise<Response> {
   const url = new URL(req.url);
   const status = url.searchParams.get(PARAM_STATUS);
 
-  // Use comprehensive storeId resolution
   const storeIdResult = await getStoreIdOrError(ctx, {
     queryParams: url.searchParams,
     shopDomain: url.searchParams.get('shopDomain') || undefined,
@@ -1190,7 +1262,6 @@ async function handleAnalytics(ctx: RequestContext): Promise<Response> {
   const startDate = url.searchParams.get(PARAM_START);
   const endDate = url.searchParams.get(PARAM_END);
 
-  // Use comprehensive storeId resolution
   const storeIdResult = await getStoreIdOrError(ctx, {
     queryParams: url.searchParams,
     shopDomain: url.searchParams.get('shopDomain') || undefined,
@@ -1224,8 +1295,6 @@ async function handleAnalytics(ctx: RequestContext): Promise<Response> {
           }
 
           const result = await metricsQuery;
-          // Don't throw on error for analytics - return empty array instead
-          // This handles empty tables gracefully
           if (result.error) {
             logger.warn('Metrics query returned error, returning empty', {
               correlationId,
@@ -1257,8 +1326,6 @@ async function handleAnalytics(ctx: RequestContext): Promise<Response> {
           }
 
           const result = await topPostsQuery;
-          // Don't throw on error for analytics - return empty array instead
-          // This handles empty tables gracefully
           if (result.error) {
             logger.warn('Top posts query returned error, returning empty', {
               correlationId,
@@ -1325,8 +1392,6 @@ async function handleCheckScheduleConflicts(ctx: RequestContext): Promise<Respon
       return createErrorResponse('storeId, postId, and scheduledAt are required', STATUS_BAD_REQUEST, correlationId);
     }
 
-    // Scheduler import disabled for Deno compatibility
-    // Return empty conflicts for now - can be re-enabled with Deno-compatible Scheduler
     logger.warn('Schedule conflict check not available in Edge Function', { correlationId });
     
     return createSuccessResponse(
@@ -1349,12 +1414,6 @@ async function handleStore(ctx: RequestContext): Promise<Response> {
   const url = new URL(req.url);
   const pathParts = url.pathname.split(PATH_SEPARATOR).filter((p) => p);
   
-  // Extract shop domain from path
-  // Path could be: /store/{shopDomain} or /api-router/store/{shopDomain}
-  // Supabase functions receive pathname relative to /functions/v1/{function-name}
-  // So if function is 'api-router' and request is /functions/v1/api-router/store/{shopDomain}
-  // The pathname would be /store/{shopDomain} (relative to function)
-  // But if called as /api-router/store/{shopDomain}, pathname might be /api-router/store/{shopDomain}
   const storeIndex = pathParts.indexOf('store');
   if (storeIndex === -1 || storeIndex >= pathParts.length - 1) {
     return createErrorResponse('Shop domain is required', STATUS_BAD_REQUEST, correlationId, undefined, ctx.req);
@@ -1374,13 +1433,10 @@ async function handleStore(ctx: RequestContext): Promise<Response> {
           .eq(COLUMN_SHOP_DOMAIN, shopDomain)
           .single();
         if (result.error) {
-          // Check if it's a "not found" error before throwing
           const errorCode = (result.error as { code?: string })?.code;
           if (errorCode === 'PGRST116') {
-            // Return a result that indicates not found
             return { data: null, error: result.error };
           }
-          // Log the actual error for debugging
           logger.error('Supabase query error when fetching store', {
             shopDomain,
             errorCode,
@@ -1395,7 +1451,6 @@ async function handleStore(ctx: RequestContext): Promise<Response> {
       CONFIG.RETRY_DELAY_MS,
     );
 
-    // Check if it's a "not found" error - if so, proceed to auto-create
     const isNotFoundError = error && (() => {
       const errorObj = error as { code?: string; message?: string };
       const errorCode = errorObj.code;
@@ -1404,7 +1459,6 @@ async function handleStore(ctx: RequestContext): Promise<Response> {
     })();
 
     if (error && !isNotFoundError) {
-      // Real error (not just "not found") - log and return
       const errorObj = error as { code?: string; message?: string; details?: string; hint?: string };
       logger.error('Store fetch error', {
         correlationId,
@@ -1425,30 +1479,22 @@ async function handleStore(ctx: RequestContext): Promise<Response> {
       );
     }
 
-    // If store not found (either error is "not found" or store is null), check with service role client first
-    // The regular client might not see the store due to RLS, but the store might actually exist
     if (!store || isNotFoundError) {
-      // Use service role client to bypass RLS and check if store actually exists
       try {
         const serviceSupabase = await getSupabaseClient({ clientType: 'service' });
         
-        // First, check if the store exists using service role client (bypasses RLS)
         const { data: existingStore, error: checkError } = await serviceSupabase
           .from(TABLE_STORES)
           .select('*')
           .eq(COLUMN_SHOP_DOMAIN, shopDomain)
           .single();
         
-        // If store exists, cache and return it
         if (existingStore && !checkError) {
-          // Cache the storeId for future lookups
           storeIdCache.set(shopDomain, { storeId: existingStore.id, timestamp: Date.now() });
           logger.info('Store found with service role client', { correlationId, shopDomain, storeId: existingStore.id });
           return createSuccessResponse(existingStore, correlationId, {}, { compression: true, request: req });
         }
         
-        // Store truly doesn't exist - proceed with auto-creation
-        // Get the free_trial plan
         const { data: plan, error: planError } = await serviceSupabase
           .from('plan_limits')
           .select('id')
@@ -1468,18 +1514,14 @@ async function handleStore(ctx: RequestContext): Promise<Response> {
           );
         }
         
-        // Create the store using service role client to bypass RLS
-        // Don't set trial dates here - they will be set when setup is completed (complete-setup endpoint)
-        // This prevents resetting trial dates when user uninstalls and reinstalls the app
         const { data: newStore, error: createError } = await serviceSupabase
           .from(TABLE_STORES)
           .insert({
             [COLUMN_SHOP_DOMAIN]: shopDomain,
-            [COLUMN_ACCESS_TOKEN]: 'auto-created-placeholder-token', // Placeholder - should be updated via OAuth
+            [COLUMN_ACCESS_TOKEN]: 'auto-created-placeholder-token',
             [COLUMN_PLAN_ID]: plan.id,
             [COLUMN_IS_ACTIVE]: true,
             [COLUMN_IS_PAUSED]: false,
-            // Don't set trial_started_at and trial_ends_at here - will be set on setup completion if needed
             language_settings: { primary: 'en', enabled: ['en'] },
             frequency_settings: { interval: 'weekly', count: 3 },
           })
@@ -1487,13 +1529,11 @@ async function handleStore(ctx: RequestContext): Promise<Response> {
           .single();
         
         if (createError || !newStore) {
-          // Check if it's a duplicate key error (store already exists)
           const errorCode = createError ? (createError as { code?: string })?.code : undefined;
           const errorMessage = createError ? (createError as { message?: string; details?: string })?.message || String(createError) : 'Unknown error';
           const errorDetails = createError ? (createError as { details?: string })?.details : undefined;
           
           if (errorCode === '23505' || errorMessage.includes('duplicate key') || errorMessage.includes('unique constraint')) {
-            // Store already exists - fetch it instead
             logger.warn('Store creation failed due to duplicate key, fetching existing store', { correlationId, shopDomain });
             const { data: fetchedStore, error: fetchError } = await serviceSupabase
               .from(TABLE_STORES)
@@ -1502,7 +1542,6 @@ async function handleStore(ctx: RequestContext): Promise<Response> {
               .single();
             
             if (fetchedStore && !fetchError) {
-              // Cache the storeId
               storeIdCache.set(shopDomain, { storeId: fetchedStore.id, timestamp: Date.now() });
               logger.info('Fetched existing store after duplicate key error', { correlationId, shopDomain, storeId: fetchedStore.id });
               return createSuccessResponse(fetchedStore, correlationId, {}, { compression: true, request: req });
@@ -1523,7 +1562,6 @@ async function handleStore(ctx: RequestContext): Promise<Response> {
           );
         }
         
-        // Cache the new storeId
         storeIdCache.set(shopDomain, { storeId: newStore.id, timestamp: Date.now() });
         logger.info('Store auto-created successfully', { correlationId, shopDomain, storeId: newStore.id });
         return createSuccessResponse(newStore, correlationId, {}, { compression: true, request: req });
@@ -1546,14 +1584,11 @@ async function handleStore(ctx: RequestContext): Promise<Response> {
       }
     }
 
-    // Cache the storeId for future lookups (store found in initial lookup)
     if (store?.id) {
       storeIdCache.set(shopDomain, { storeId: store.id, timestamp: Date.now() });
     }
     return createSuccessResponse(store, correlationId, {}, { compression: true, request: req });
   } catch (error) {
-    // Check if it's a "not found" error
-    // If it's a SupabaseClientError, check the details
     let errorCode: string | undefined;
     if (error instanceof SupabaseClientError) {
       const details = (error as { response?: { code?: string } }).response;
@@ -1576,7 +1611,6 @@ async function handleStore(ctx: RequestContext): Promise<Response> {
       stack: error instanceof Error ? error.stack : undefined,
       errorCode,
     });
-    // Return error response instead of throwing
     return createErrorResponse(
       error instanceof Error ? error.message : 'Internal server error',
       STATUS_INTERNAL_ERROR,
@@ -1821,7 +1855,6 @@ async function handleCompleteSetup(ctx: RequestContext): Promise<Response> {
     return createErrorResponse('shopDomain is required', STATUS_BAD_REQUEST, correlationId);
   }
 
-  // Minimal validation of frequency settings shape (must include preferredDays + preferredTimes arrays)
   const fs = body.frequencySettings as { preferredDays?: unknown; preferredTimes?: unknown } | null | undefined;
   if (
     !fs ||
@@ -1837,10 +1870,8 @@ async function handleCompleteSetup(ctx: RequestContext): Promise<Response> {
     );
   }
 
-  // Use service role for updates (browser clients won't have shop_domain JWT claims for RLS)
   const serviceSupabase = await getSupabaseClient({ clientType: 'service' });
 
-  // Verify storeId belongs to the shopDomain we were called with (basic tenant safety)
   const { data: existingStore, error: existingErr } = await serviceSupabase
     .from(TABLE_STORES)
     .select('id, shop_domain')
@@ -1854,7 +1885,6 @@ async function handleCompleteSetup(ctx: RequestContext): Promise<Response> {
     return createErrorResponse('Store/shop mismatch', STATUS_UNAUTHORIZED, correlationId);
   }
 
-  // Check if store has a plan and trial status
   const { data: storeBeforeUpdate, error: storeFetchError } = await serviceSupabase
     .from(TABLE_STORES)
     .select('plan_id, trial_ends_at, plan_limits(plan_name)')
@@ -1869,32 +1899,24 @@ async function handleCompleteSetup(ctx: RequestContext): Promise<Response> {
     updates.content_preferences = body.contentPreferences;
   }
 
-    // Use enterprise-grade trial manager for setup completion
-    // Only reset trial dates if:
-    // 1. Store has no plan_id (brand new store), OR
-    // 2. Trial has expired (trial_ends_at is in the past or null)
-    // This prevents resetting an active trial when re-running setup from settings
     if (storeBeforeUpdate && !storeFetchError) {
       const planId = (storeBeforeUpdate as { plan_id?: string | null }).plan_id;
       const trialEndsAt = (storeBeforeUpdate as { trial_ends_at?: string | null }).trial_ends_at;
       
-      // Check if trial has expired (null or in the past)
       const trialExpired = !trialEndsAt || new Date(trialEndsAt) < new Date();
       
-      // Only reset if no plan OR trial has expired
       if (!planId || trialExpired) {
-        const { PlanTrialManager } = await import('../backend/src/core/PlanTrialManager.ts');
-        const planTrialManager = new PlanTrialManager(serviceSupabase);
+        const { PlanManager } = await import('../backend/src/core/PlanManager.ts');
+        const planManager = new PlanManager(serviceSupabase);
 
-        const initResult = await planTrialManager.initializeTrial(
+        const initResult = await planManager.initializeTrial(
           storeId,
           14,
           correlationId,
-          trialExpired, // Force reset if trial expired
+          trialExpired,
         );
 
         if (initResult.success && !planId) {
-          // Update plan_id in updates if it was set by initializeTrial
           const { data: freeTrialPlan } = await serviceSupabase
             .from('plan_limits')
             .select('id')
@@ -1932,11 +1954,9 @@ async function handleCompleteSetup(ctx: RequestContext): Promise<Response> {
 
   logger.info('Setup completed', { correlationId, storeId, shopDomain });
 
-  // After setup is complete, ensure queue is filled
   try {
     const { ArticlesQueue } = await import('../backend/src/core/ArticlesQueue.ts');
     
-    // Get store data for AI generation
     const { data: store } = await serviceSupabase
       .from('stores')
       .select('brand_dna, tone_matrix, content_preferences, plan_id, plan_limits(plan_name)')
@@ -1954,13 +1974,11 @@ async function handleCompleteSetup(ctx: RequestContext): Promise<Response> {
         brandDNA as { [key: string]: unknown },
       );
       
-      // Refill queue to ensure it's at target size
       await queue.refillQueue(storeId);
       
       logger.info('Queue refilled after setup', { correlationId, storeId });
     }
   } catch (queueError) {
-    // Log but don't fail the setup if queue refill fails
     logger.warn('Failed to refill queue after setup', {
       correlationId,
       storeId,
@@ -1971,7 +1989,6 @@ async function handleCompleteSetup(ctx: RequestContext): Promise<Response> {
   return createSuccessResponse(updatedStore, correlationId, { cached: false }, { compression: true, request: req });
 }
 
-// Billing check endpoint - returns current billing/plan status for a store
 async function handleBillingCheck(ctx: RequestContext): Promise<Response> {
   const { req, correlationId } = ctx;
   const url = new URL(req.url);
@@ -1987,7 +2004,6 @@ async function handleBillingCheck(ctx: RequestContext): Promise<Response> {
     }
   }
   
-  // Use comprehensive storeId resolution
   const storeIdResult = await getStoreIdOrError(ctx, {
     queryParams: url.searchParams,
     body,
@@ -2003,7 +2019,6 @@ async function handleBillingCheck(ctx: RequestContext): Promise<Response> {
   try {
     const serviceSupabase = await getSupabaseClient({ clientType: 'service' });
     
-    // Get store billing info
     const { data: store, error } = await serviceSupabase
       .from(TABLE_STORES)
       .select(`
@@ -2133,14 +2148,13 @@ async function handleTrack(req: Request, correlationId: string): Promise<Respons
     }));
 
     let eventsRecorded = 0;
-    try {
-      // Direct insert into analytics table (Deno-compatible)
-      const insertData = eventsToRecord.map((event) => ({
+      try {
+        const insertData = eventsToRecord.map((event) => ({
         store_id: event.storeId,
         post_id: event.postId,
         event_type: event.eventType,
         event_data: event.eventData || {},
-        timestamp: event.metadata?.timestamp ? new Date(event.metadata.timestamp).toISOString() : new Date().toISOString(),
+        timestamp: event.metadata?.timestamp && typeof event.metadata.timestamp === 'number' ? new Date(event.metadata.timestamp).toISOString() : new Date().toISOString(),
         user_agent: event.metadata?.userAgent || null,
         referrer: event.metadata?.referrer || null,
         ip_address: event.metadata?.ipAddress || null,
@@ -2195,13 +2209,10 @@ async function handleTrack(req: Request, correlationId: string): Promise<Respons
   }
 }
 
-// Batch dashboard endpoint - combines store, quota, posts, and analytics in a single call
-// This reduces Edge Function invocations from 4-6 calls to 1 call
 async function handleDashboardBatch(ctx: RequestContext): Promise<Response> {
   const { req, correlationId } = ctx;
   const url = new URL(req.url);
 
-  // Parse request body if POST
   let body: { storeId?: string; shopDomain?: string } = {};
   if (req.method === METHOD_POST) {
     try {
@@ -2228,9 +2239,7 @@ async function handleDashboardBatch(ctx: RequestContext): Promise<Response> {
   try {
     const serviceSupabase = await getSupabaseClient({ clientType: 'service' });
 
-    // Fetch all data in parallel to minimize execution time
     const [quotaResult, postsResult, scheduledPostsResult, draftPostsResult, analyticsResult] = await Promise.all([
-      // Quota status
       retryOperation(
         async () => {
           const result = await serviceSupabase.rpc(RPC_GET_STORE_QUOTA_STATUS, {
@@ -2238,7 +2247,7 @@ async function handleDashboardBatch(ctx: RequestContext): Promise<Response> {
           });
           
           if (result.error) {
-            logger.error('RPC get_store_quota_status error in batch', {
+            logger.error('RPC get_store_quota_status (cached) error in batch', {
               correlationId,
               storeId: storeId!,
               error: result.error,
@@ -2270,7 +2279,6 @@ async function handleDashboardBatch(ctx: RequestContext): Promise<Response> {
         CONFIG.MAX_RETRIES,
         CONFIG.RETRY_DELAY_MS,
       ),
-      // Published posts
       retryOperation(
         async () => {
           const result = await serviceSupabase
@@ -2288,7 +2296,6 @@ async function handleDashboardBatch(ctx: RequestContext): Promise<Response> {
         CONFIG.MAX_RETRIES,
         CONFIG.RETRY_DELAY_MS,
       ),
-      // Scheduled posts
       retryOperation(
         async () => {
           const result = await serviceSupabase
@@ -2306,7 +2313,6 @@ async function handleDashboardBatch(ctx: RequestContext): Promise<Response> {
         CONFIG.MAX_RETRIES,
         CONFIG.RETRY_DELAY_MS,
       ),
-      // Draft posts
       retryOperation(
         async () => {
           const result = await serviceSupabase
@@ -2324,19 +2330,16 @@ async function handleDashboardBatch(ctx: RequestContext): Promise<Response> {
         CONFIG.MAX_RETRIES,
         CONFIG.RETRY_DELAY_MS,
       ),
-      // Analytics (last 30 days summary) - Optimized to use SQL aggregation
       retryOperation(
         async () => {
-          // Try to use materialized view first (much faster)
           const summaryResult = await serviceSupabase
             .from('analytics_summary_30d')
             .select('pageviews, clicks, conversions, total_events')
             .eq(COLUMN_STORE_ID, storeId!)
             .order('event_date', { ascending: false })
-            .limit(30); // Last 30 days
+            .limit(30);
           
           if (!summaryResult.error && summaryResult.data && summaryResult.data.length > 0) {
-            // Aggregate from materialized view
             const summary = summaryResult.data.reduce((acc: { pageviews: number; clicks: number; conversions: number; totalEvents: number }, row: { pageviews: number; clicks: number; conversions: number; total_events: number }) => {
               acc.pageviews += row.pageviews || 0;
               acc.clicks += row.clicks || 0;
@@ -2348,12 +2351,10 @@ async function handleDashboardBatch(ctx: RequestContext): Promise<Response> {
             return summary;
           }
           
-          // Fallback to direct query with SQL aggregation (faster than JavaScript filtering)
           const endDate = new Date();
           const startDate = new Date();
           startDate.setDate(startDate.getDate() - 30);
 
-          // Use RPC function for aggregation (if available) or aggregate in SQL
           const result = await serviceSupabase.rpc('get_analytics_summary', {
             store_uuid: storeId!,
             start_date: startDate.toISOString(),
@@ -2364,7 +2365,6 @@ async function handleDashboardBatch(ctx: RequestContext): Promise<Response> {
             return result.data;
           }
           
-          // Final fallback: aggregate in SQL using select with filters
           const fallbackResult = await serviceSupabase
             .from('analytics')
             .select('event_type')
@@ -2376,7 +2376,6 @@ async function handleDashboardBatch(ctx: RequestContext): Promise<Response> {
             throw new SupabaseClientError('Failed to fetch analytics', fallbackResult.error);
           }
           
-          // Aggregate in JavaScript as last resort
           const events = fallbackResult.data ?? [];
           return {
             totalEvents: events.length,
@@ -2412,19 +2411,787 @@ async function handleDashboardBatch(ctx: RequestContext): Promise<Response> {
   }
 }
 
+async function fetchPost(
+  supabase: Awaited<ReturnType<typeof getSupabaseClient>>,
+  postId: string,
+): Promise<{ data: DatabasePost; error: null } | { data: null; error: Error }> {
+  return await retryOperation(
+    async () => {
+      const result = await supabase
+        .from(TABLE_BLOG_POSTS)
+        .select(`${COLUMN_ID}, ${COLUMN_STORE_ID}`)
+        .eq(COLUMN_ID, postId)
+        .single();
+
+      if (result.error) {
+        throw new SupabaseClientError('Failed to fetch post', result.error);
+      }
+      if (!result.data) {
+        throw new UtilsError(ERROR_POST_NOT_FOUND, ERROR_CODE_POST_NOT_FOUND, STATUS_NOT_FOUND);
+      }
+      return { data: result.data as DatabasePost, error: null };
+    },
+    CONFIG.MAX_RETRIES,
+    CONFIG.RETRY_DELAY_MS,
+  );
+}
+
+function validatePostUpdateParams(params: Readonly<Record<string, unknown>>): { readonly valid: boolean; readonly error?: string; readonly warnings?: ReadonlyArray<string> } {
+  const warnings: string[] = [];
+
+  if (params.status && !VALID_STATUSES.includes(params.status as string)) {
+    return { valid: false, error: `Invalid status. Must be one of: ${VALID_STATUSES.join(', ')}` };
+  }
+
+  if (params.title !== undefined && (typeof params.title !== 'string' || params.title.trim().length === 0)) {
+    return { valid: false, error: 'title must be a non-empty string' };
+  }
+
+  if (params.content !== undefined && typeof params.content !== 'string') {
+    return { valid: false, error: 'content must be a string' };
+  }
+
+  return { valid: true, warnings: warnings.length > 0 ? warnings : undefined };
+}
+
+function validatePostCreationParams(params: Readonly<Record<string, unknown>>): { readonly valid: boolean; readonly error?: string; readonly warnings?: ReadonlyArray<string> } {
+  const warnings: string[] = [];
+
+  if (!params.storeId || typeof params.storeId !== 'string') {
+    return { valid: false, error: 'storeId is required and must be a string' };
+  }
+
+  if (!params.topic || typeof params.topic !== 'string' || params.topic.trim().length === 0) {
+    return { valid: false, error: 'topic is required and must be a non-empty string' };
+  }
+
+  if (params.topic.length > MAX_TOPIC_LENGTH) {
+    return { valid: false, error: 'topic must be less than 500 characters' };
+  }
+
+  if (params.keywords !== undefined && !Array.isArray(params.keywords)) {
+    return { valid: false, error: 'keywords must be an array' };
+  }
+
+  if (params.keywords && Array.isArray(params.keywords) && params.keywords.length > MAX_KEYWORDS) {
+    warnings.push('Too many keywords provided, only first 50 will be used');
+  }
+
+  if (params.products !== undefined && !Array.isArray(params.products)) {
+    return { valid: false, error: 'products must be an array' };
+  }
+
+  return { valid: true, warnings: warnings.length > 0 ? warnings : undefined };
+}
+
+async function handleCreatePost(ctx: RequestContext): Promise<Response> {
+  const { supabase, req, correlationId } = ctx;
+  const warnings: string[] = [];
+
+  try {
+    const body = await req.json() as Readonly<Record<string, unknown>>;
+    const validation = validatePostCreationParams(body);
+
+    if (!validation.valid) {
+      return createErrorResponse(validation.error ?? ERROR_INVALID_INPUT, STATUS_BAD_REQUEST, correlationId);
+    }
+
+    if (validation.warnings) {
+      warnings.push(...validation.warnings);
+    }
+
+    const params: PostCreationParams = {
+      storeId: body.storeId as string,
+      topic: (body.topic as string).trim(),
+      keywords: Array.isArray(body.keywords) ? (body.keywords as string[]).slice(0, MAX_KEYWORDS) : [],
+      products: Array.isArray(body.products) ? (body.products as string[]) : [],
+      structure: body.structure as string | undefined,
+      language: 'en',
+      experienceLevel: body.experienceLevel as string | undefined,
+      audiencePersona: body.audiencePersona as string | undefined,
+      includeCitations: body.includeCitations !== false,
+      validateQuality: body.validateQuality !== false,
+    };
+
+    if (body.regenerateFrom) {
+      const { data: limitCheck, error: limitError } = await supabase
+        .rpc('check_regeneration_limits', {
+          store_uuid: params.storeId,
+          post_uuid: body.regenerateFrom as string,
+          regenerated_from_uuid: body.regenerateFrom as string,
+        });
+
+      if (limitError) {
+        throw new UtilsError(
+          `Failed to check regeneration limits: ${limitError.message}`,
+          ERROR_CODE_INTERNAL_ERROR,
+          STATUS_INTERNAL_ERROR,
+        );
+      }
+
+      const limitResult = limitCheck as { allowed: boolean; reason?: string; limit_type?: string } | null;
+      if (!limitResult || !limitResult.allowed) {
+        return createErrorResponse(
+          limitResult?.reason ?? 'Regeneration limit reached',
+          STATUS_BAD_REQUEST,
+          correlationId,
+          { limitType: limitResult?.limit_type },
+        );
+      }
+    }
+
+    const { data: store, error: storeError } = await retryOperation(
+      async () => {
+        const result = await supabase
+          .from(TABLE_STORES)
+          .select(`${COLUMN_ID}, ${COLUMN_PLAN_ID}, ${COLUMN_TONE_MATRIX}, ${COLUMN_BRAND_DNA}, ${COLUMN_IS_ACTIVE}, ${COLUMN_SHOP_DOMAIN}, ${COLUMN_ACCESS_TOKEN}, content_preferences`)
+          .eq(COLUMN_ID, params.storeId)
+          .single();
+
+        if (result.error) {
+          throw new SupabaseClientError('Failed to fetch store', result.error);
+        }
+        if (!result.data) {
+          throw new UtilsError('Store not found', 'STORE_NOT_FOUND', STATUS_NOT_FOUND);
+        }
+        return result;
+      },
+      CONFIG.MAX_RETRIES,
+      CONFIG.RETRY_DELAY_MS,
+    );
+
+    if (storeError || !store) {
+      throw new UtilsError('Store not found', 'STORE_NOT_FOUND', STATUS_NOT_FOUND);
+    }
+
+    const storeData = store as unknown as DatabaseStore;
+
+    if (!storeData.is_active) {
+      return createErrorResponse('Store is not active', 403, correlationId);
+    }
+
+    const planManager = new PlanManager(supabase);
+    const enforcementResult = await retryOperation(
+      async () => {
+        return await planManager.enforceQuotaWithLock(params.storeId, 'create_article', correlationId);
+      },
+      CONFIG.MAX_RETRIES,
+      CONFIG.RETRY_DELAY_MS,
+    );
+
+    if (!enforcementResult.allowed) {
+      return createErrorResponse(
+        enforcementResult.reason || 'Article quota exceeded',
+        403,
+        correlationId,
+        {
+          quotaStatus: enforcementResult.quotaStatus,
+          trialStatus: enforcementResult.trialStatus,
+        },
+      );
+    }
+
+    if (!CONFIG.OPENAI_API_KEY) {
+      throw new UtilsError('OPENAI_API_KEY not configured', ERROR_CODE_CONFIG_ERROR, STATUS_INTERNAL_ERROR);
+    }
+
+    const gdprGuard = new GDPRDataGuard(supabase);
+    const toneMatrix = (storeData.tone_matrix as Readonly<Record<string, number>> | null) ?? DEFAULT_TONE_MATRIX;
+    const blogComposer = new BlogComposer(CONFIG.OPENAI_API_KEY, toneMatrix, storeData.brand_dna ?? {});
+    const keywordMiner = new KeywordMiner(CONFIG.OPENAI_API_KEY);
+
+    let finalKeywords = params.keywords && params.keywords.length > 0 ? [...params.keywords] : [];
+    const contentPreferences = storeData.content_preferences || {};
+    if (contentPreferences.keyword_focus && contentPreferences.keyword_focus.length > 0) {
+      finalKeywords = [...finalKeywords, ...contentPreferences.keyword_focus];
+      finalKeywords = Array.from(new Set(finalKeywords));
+    }
+    
+    if (finalKeywords.length === 0) {
+      try {
+        const keywordCluster = await retryOperation(
+          async () => await keywordMiner.mineKeywords(params.topic),
+          CONFIG.MAX_RETRIES,
+          CONFIG.RETRY_DELAY_MS,
+        );
+        finalKeywords = [
+          keywordCluster.primaryKeyword.keyword,
+          ...keywordCluster.longTailKeywords.map((k) => k.keyword),
+        ];
+      } catch (error) {
+        logger.error('Keyword mining failed', { correlationId, error: error instanceof Error ? error.message : String(error) });
+        warnings.push('Keyword mining failed, proceeding without keywords');
+      }
+    }
+
+    const sanitizedTopic = await retryOperation(
+      async () => await gdprGuard.sanitizeContent(params.topic, params.storeId, undefined, 'content_generation'),
+      CONFIG.MAX_RETRIES,
+      CONFIG.RETRY_DELAY_MS,
+    );
+
+    const sanitizedKeywords = await Promise.all(
+      finalKeywords.map((kw) =>
+        retryOperation(
+          async () => {
+            const result = await gdprGuard.sanitizeContent(kw, params.storeId, undefined, 'keyword_research');
+            return result.sanitizedContent;
+          },
+          CONFIG.MAX_RETRIES,
+          CONFIG.RETRY_DELAY_MS,
+        ),
+      ),
+    );
+
+    const postContent = await retryOperation(
+      async () =>
+        await blogComposer.composePost(sanitizedTopic.sanitizedContent, sanitizedKeywords, {
+          structure: params.structure as 'default' | 'how-to' | 'listicle' | 'comparison' | 'tutorial' | 'case-study' | undefined,
+          language: 'en',
+          experienceLevel: params.experienceLevel as 'beginner' | 'intermediate' | 'advanced' | undefined,
+          audiencePersona: params.audiencePersona,
+          includeCitations: params.includeCitations,
+          validateQuality: params.validateQuality,
+          contentPreferences: {
+            topic_preferences: contentPreferences.topic_preferences,
+            keyword_focus: contentPreferences.keyword_focus,
+            content_angles: contentPreferences.content_angles,
+          },
+        }),
+      CONFIG.MAX_RETRIES,
+      CONFIG.RETRY_DELAY_MS,
+    );
+
+    let seoOptimizedContent = postContent.content;
+    let seoMetadata: Readonly<Record<string, unknown>> | undefined;
+    if (CONFIG.ENABLE_SEO_OPTIMIZATION) {
+      try {
+        const contentGraph = new ContentGraph(supabase, CONFIG.OPENAI_API_KEY);
+        const seoOptimizer = new SEOOptimizer(CONFIG.OPENAI_API_KEY, supabase, contentGraph, storeData.shop_domain);
+        const [seoHealthScore, keywordAnalysis, structuredData] = await Promise.all([
+          retryOperation(
+            async () => await seoOptimizer.calculateSEOHealthScore({
+              title: postContent.title,
+              content: postContent.content,
+              metaDescription: postContent.seoDescription,
+              keywords: sanitizedKeywords,
+              primaryKeyword: postContent.primaryKeyword,
+            }),
+            CONFIG.MAX_RETRIES,
+            CONFIG.RETRY_DELAY_MS,
+          ),
+          retryOperation(
+            async () => await seoOptimizer.analyzeKeywords(postContent.content, sanitizedKeywords),
+            CONFIG.MAX_RETRIES,
+            CONFIG.RETRY_DELAY_MS,
+          ),
+          retryOperation(
+            async () => await seoOptimizer.generateStructuredData({
+              title: postContent.title,
+              content: postContent.content,
+              excerpt: postContent.excerpt,
+              keywords: sanitizedKeywords,
+            }),
+            CONFIG.MAX_RETRIES,
+            CONFIG.RETRY_DELAY_MS,
+          ),
+        ]);
+        seoMetadata = { seoHealthScore, keywordAnalysis, structuredData };
+      } catch (seoError) {
+        logger.warn('SEO optimization failed', { correlationId, error: seoError instanceof Error ? seoError.message : String(seoError) });
+        warnings.push('SEO optimization failed');
+      }
+    }
+
+    let finalContent = seoOptimizedContent;
+    let productMentions: ReadonlyArray<unknown> | undefined;
+    if (params.products && params.products.length > 0 && CONFIG.ENABLE_PRODUCT_MENTIONS) {
+      try {
+        const shopifyClient = new ShopifyClient(storeData.shop_domain, storeData.access_token);
+        const productContextEngine = new ProductContextEngine(
+          shopifyClient,
+          CONFIG.OPENAI_API_KEY,
+          storeData.brand_dna as Readonly<Record<string, unknown>> | null,
+        );
+        const productResult = await retryOperation(
+          async () =>
+            await productContextEngine.injectProductMentions(seoOptimizedContent, params.products!, {
+              maxMentions: 5,
+              naturalPlacement: true,
+              contextualRelevance: true,
+            }),
+          CONFIG.MAX_RETRIES,
+          CONFIG.RETRY_DELAY_MS,
+        );
+        finalContent = productResult.content;
+        productMentions = productResult.mentions;
+      } catch (productError) {
+        logger.warn('Product mention injection failed', { correlationId, error: productError instanceof Error ? productError.message : String(productError) });
+        warnings.push('Product mention injection failed');
+      }
+    }
+
+    const sanitizedContent = await retryOperation(
+      async () =>
+        await gdprGuard.sanitizeContent(finalContent, params.storeId, undefined, 'content_generation'),
+      CONFIG.MAX_RETRIES,
+      CONFIG.RETRY_DELAY_MS,
+    );
+
+    let featuredImageUrl: string | null = null;
+    if (CONFIG.ENABLE_IMAGE_GENERATION && CONFIG.FLUX_API_KEY && postContent.imagePrompt) {
+      try {
+        const imageGenerator = new ImageGenerator(CONFIG.FLUX_API_KEY);
+        const imageResult = await retryOperation(
+          async () =>
+            await imageGenerator.generateFeaturedImage(postContent.imagePrompt!, postContent.title, sanitizedKeywords),
+          CONFIG.MAX_RETRIES,
+          CONFIG.RETRY_DELAY_MS,
+        );
+        try {
+          const shopifyClient = new ShopifyClient(storeData.shop_domain, storeData.access_token);
+          const cdnResult = await retryOperation(
+            async () =>
+              await shopifyClient.imageCDN.uploadImage(imageResult.imageUrl, {
+                width: IMAGE_WIDTH,
+                height: IMAGE_HEIGHT,
+                format: IMAGE_FORMAT,
+                quality: IMAGE_QUALITY,
+                altText: postContent.title,
+              }),
+            CONFIG.MAX_RETRIES,
+            CONFIG.RETRY_DELAY_MS,
+          );
+          featuredImageUrl = cdnResult.cdnUrl;
+        } catch (cdnError) {
+          logger.warn('Shopify CDN upload failed', { correlationId, error: cdnError instanceof Error ? cdnError.message : String(cdnError) });
+          featuredImageUrl = imageResult.imageUrl;
+          warnings.push('Image CDN upload failed');
+        }
+      } catch (imageError) {
+        logger.error('Image generation failed', { correlationId, error: imageError instanceof Error ? imageError.message : String(imageError) });
+        warnings.push('Image generation failed');
+      }
+    }
+
+    const { data: storeSettings } = await supabase
+      .from(TABLE_STORES)
+      .select('review_window_hours, require_approval')
+      .eq(COLUMN_ID, params.storeId)
+      .single();
+
+    const reviewWindowHours = (storeSettings as { review_window_hours?: number } | null)?.review_window_hours ?? 24;
+    const requireApproval = (storeSettings as { require_approval?: boolean } | null)?.require_approval ?? false;
+    const reviewStatus = requireApproval ? 'pending' : 'auto_approved';
+    const autoPublishAt = new Date();
+    autoPublishAt.setHours(autoPublishAt.getHours() + reviewWindowHours);
+
+    const { data: post, error: postError } = await retryOperation(
+      async () => {
+        const insertData: Record<string, unknown> = {
+          [COLUMN_STORE_ID]: params.storeId,
+          [COLUMN_TITLE]: postContent.title,
+          [COLUMN_CONTENT]: sanitizedContent.sanitizedContent,
+          [COLUMN_EXCERPT]: postContent.excerpt,
+          [COLUMN_SEO_TITLE]: postContent.seoTitle,
+          [COLUMN_SEO_DESCRIPTION]: postContent.seoDescription,
+          [COLUMN_KEYWORDS]: sanitizedKeywords,
+          [COLUMN_PRIMARY_KEYWORD]: postContent.primaryKeyword,
+          [COLUMN_STATUS]: STATUS_DRAFT,
+          review_status: reviewStatus,
+          auto_publish_at: requireApproval ? autoPublishAt.toISOString() : null,
+          [COLUMN_PRODUCT_MENTIONS]: params.products && params.products.length > 0 ? { product_ids: params.products } : null,
+          [COLUMN_FEATURED_IMAGE_URL]: featuredImageUrl,
+          [COLUMN_STRUCTURED_DATA]: {
+            ...(postContent.imagePrompt ? { image_prompt: postContent.imagePrompt } : {}),
+            ...(postContent.citations && postContent.citations.length > 0 ? { citations: postContent.citations } : {}),
+            ...(postContent.qualityScore !== undefined ? { quality_score: postContent.qualityScore } : {}),
+            ...(postContent.qualityIssues && postContent.qualityIssues.length > 0 ? { quality_issues: postContent.qualityIssues } : {}),
+            ...(seoMetadata || {}),
+          },
+        };
+
+        if (body.regenerateFrom) {
+          insertData.regenerated_from = body.regenerateFrom as string;
+          insertData.regeneration_count = 0;
+        }
+
+        const result = await supabase
+          .from(TABLE_BLOG_POSTS)
+          .insert(insertData)
+          .select()
+          .single();
+
+        if (result.error) {
+          throw new SupabaseClientError('Failed to create post', result.error);
+        }
+        return result;
+      },
+      CONFIG.MAX_RETRIES,
+      CONFIG.RETRY_DELAY_MS,
+    );
+
+    if (postError) {
+      throw postError;
+    }
+
+    if (body.regenerateFrom && post) {
+      const postData = post as DatabasePost;
+      await supabase.rpc('increment_regeneration_count', {
+        post_uuid: body.regenerateFrom as string,
+      }).catch(async () => {
+        const { data: originalPost } = await supabase
+          .from(TABLE_BLOG_POSTS)
+          .select('regeneration_count')
+          .eq(COLUMN_ID, body.regenerateFrom as string)
+          .single();
+        
+        if (originalPost) {
+          const currentCount = (originalPost as { regeneration_count?: number }).regeneration_count ?? 0;
+          await supabase
+            .from(TABLE_BLOG_POSTS)
+            .update({ regeneration_count: currentCount + 1 })
+            .eq(COLUMN_ID, body.regenerateFrom);
+        }
+      });
+
+      await supabase
+        .from('regeneration_usage')
+        .insert({
+          store_id: params.storeId,
+          post_id: postData[COLUMN_ID] as string,
+          regenerated_from_post_id: body.regenerateFrom as string,
+          usage_date: new Date().toISOString().split('T')[0],
+        });
+    }
+
+    await retryOperation(
+      async () => {
+        const quotaManager = new PlanManager(supabase);
+        await quotaManager.recordUsage(params.storeId, (post as DatabasePost)[COLUMN_ID] as string, 'generated');
+        return { data: true };
+      },
+      CONFIG.MAX_RETRIES,
+      CONFIG.RETRY_DELAY_MS,
+    );
+
+    if (CONFIG.ENABLE_INTERNAL_LINKS) {
+      try {
+        const contentGraph = new ContentGraph(supabase, CONFIG.OPENAI_API_KEY);
+        await retryOperation(
+          async () => {
+            const internalLinks = await contentGraph.rebuildInternalLinks(
+              params.storeId,
+              (post as DatabasePost)[COLUMN_ID] as string,
+            );
+            await supabase
+              .from(TABLE_BLOG_POSTS)
+              .update({ internal_links: internalLinks })
+              .eq(COLUMN_ID, (post as DatabasePost)[COLUMN_ID]);
+            return internalLinks;
+          },
+          CONFIG.MAX_RETRIES,
+          CONFIG.RETRY_DELAY_MS,
+        );
+      } catch (linkError) {
+        logger.warn('Internal link generation failed', { correlationId, error: linkError instanceof Error ? linkError.message : String(linkError) });
+        warnings.push('Internal link generation failed');
+      }
+    }
+
+    if (CONFIG.ENABLE_LLM_SNIPPETS) {
+      try {
+        const jobQueue = new JobQueue(supabase);
+        await retryOperation(
+          async () =>
+            await jobQueue.enqueue(
+              JOB_TYPE_LLM_SNIPPET,
+              {
+                postId: (post as DatabasePost)[COLUMN_ID] as string,
+                storeId: params.storeId,
+                title: postContent.title,
+                content: sanitizedContent.sanitizedContent,
+                keywords: sanitizedKeywords,
+                seoMetadata: seoMetadata ?? {},
+              },
+              {
+                priority: JOB_PRIORITY_NORMAL,
+                maxAttempts: JOB_MAX_ATTEMPTS,
+              },
+            ),
+          CONFIG.MAX_RETRIES,
+          CONFIG.RETRY_DELAY_MS,
+        );
+      } catch (error) {
+        logger.error('Failed to enqueue LLM snippet job', { correlationId, error: error instanceof Error ? error.message : String(error) });
+        warnings.push('LLM snippet generation job enqueue failed');
+      }
+    }
+
+    return createSuccessResponse(
+      post,
+      correlationId,
+      warnings.length > 0 ? { warnings } : undefined,
+      { compression: true, request: req },
+    );
+  } catch (error) {
+    logger.error('Post creation failed', {
+      correlationId,
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+    });
+    throw error;
+  }
+}
+
+async function handleUpdatePost(ctx: RequestContext): Promise<Response> {
+  const { supabase, req, correlationId } = ctx;
+  const url = new URL(req.url);
+  const pathParts = url.pathname.split(PATH_SEPARATOR).filter((p) => p);
+  const postId = pathParts.length >= 2 && pathParts[0] === 'posts-api' ? pathParts[1] : pathParts[pathParts.length - 1];
+
+  if (!postId) {
+    return createErrorResponse(ERROR_POST_ID_REQUIRED, STATUS_BAD_REQUEST, correlationId);
+  }
+
+  try {
+    const body = await req.json() as Readonly<Record<string, unknown>>;
+    const validation = validatePostUpdateParams(body);
+
+    if (!validation.valid) {
+      return createErrorResponse(validation.error ?? ERROR_INVALID_INPUT, STATUS_BAD_REQUEST, correlationId);
+    }
+
+    const fetchResult = await fetchPost(supabase, postId);
+    if (fetchResult.error || !fetchResult.data) {
+      throw new UtilsError(ERROR_POST_NOT_FOUND, ERROR_CODE_POST_NOT_FOUND, STATUS_NOT_FOUND);
+    }
+
+    const updates: Record<string, unknown> = {
+      [COLUMN_UPDATED_AT]: new Date().toISOString(),
+    };
+
+    if (body.title !== undefined) updates[COLUMN_TITLE] = (body.title as string).trim();
+    if (body.content !== undefined) updates[COLUMN_CONTENT] = body.content;
+    if (body.excerpt !== undefined) updates[COLUMN_EXCERPT] = body.excerpt;
+    if (body.seoTitle !== undefined) updates[COLUMN_SEO_TITLE] = body.seoTitle;
+    if (body.seoDescription !== undefined) updates[COLUMN_SEO_DESCRIPTION] = body.seoDescription;
+    if (body.keywords !== undefined) updates[COLUMN_KEYWORDS] = body.keywords;
+    if (body.status !== undefined) updates[COLUMN_STATUS] = body.status;
+    if (body.scheduled_publish_at !== undefined) {
+      updates[COLUMN_SCHEDULED_PUBLISH_AT] = (body.scheduled_publish_at as string) || null;
+    }
+    if (body.review_status !== undefined) updates.review_status = body.review_status;
+    if (body.reviewed_at !== undefined) updates.reviewed_at = (body.reviewed_at as string) || new Date().toISOString();
+    if (body.review_feedback !== undefined) updates.review_feedback = body.review_feedback;
+
+    const { data: updatedPost, error: updateError } = await retryOperation(
+      async () => {
+        const result = await supabase
+          .from(TABLE_BLOG_POSTS)
+          .update(updates)
+          .eq(COLUMN_ID, postId)
+          .select()
+          .single();
+
+        if (result.error) {
+          throw new SupabaseClientError('Failed to update post', result.error);
+        }
+        return result;
+      },
+      CONFIG.MAX_RETRIES,
+      CONFIG.RETRY_DELAY_MS,
+    );
+
+    if (updateError || !updatedPost) {
+      throw new UtilsError('Failed to update post', ERROR_CODE_INTERNAL_ERROR, STATUS_INTERNAL_ERROR);
+    }
+
+    return createSuccessResponse(updatedPost, correlationId, {}, { compression: true, request: req });
+  } catch (error) {
+    logger.error('Post update failed', {
+      correlationId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
+  }
+}
+
+async function handleDeletePost(ctx: RequestContext): Promise<Response> {
+  const { supabase, req, correlationId } = ctx;
+  const url = new URL(req.url);
+  const pathParts = url.pathname.split(PATH_SEPARATOR).filter((p) => p);
+  const postId = pathParts.length >= 2 && pathParts[0] === 'posts-api' ? pathParts[1] : pathParts[pathParts.length - 1];
+
+  if (!postId) {
+    return createErrorResponse(ERROR_POST_ID_REQUIRED, STATUS_BAD_REQUEST, correlationId);
+  }
+
+  try {
+    const fetchResult = await fetchPost(supabase, postId);
+    if (fetchResult.error || !fetchResult.data) {
+      throw new UtilsError(ERROR_POST_NOT_FOUND, ERROR_CODE_POST_NOT_FOUND, STATUS_NOT_FOUND);
+    }
+
+    const { error: deleteError } = await retryOperation(
+      async () => {
+        const result = await supabase
+          .from(TABLE_BLOG_POSTS)
+          .delete()
+          .eq(COLUMN_ID, postId);
+
+        if (result.error) {
+          throw new SupabaseClientError('Failed to delete post', result.error);
+        }
+        return result;
+      },
+      CONFIG.MAX_RETRIES,
+      CONFIG.RETRY_DELAY_MS,
+    );
+
+    if (deleteError) {
+      throw new UtilsError('Failed to delete post', ERROR_CODE_INTERNAL_ERROR, STATUS_INTERNAL_ERROR);
+    }
+
+    return createSuccessResponse({ success: true, postId }, correlationId, {}, { compression: true, request: req });
+  } catch (error) {
+    logger.error('Post deletion failed', {
+      correlationId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
+  }
+}
+
+async function handleSchedulePost(ctx: RequestContext): Promise<Response> {
+  const { supabase, req, correlationId } = ctx;
+  const url = new URL(req.url);
+  const pathParts = url.pathname.split(PATH_SEPARATOR).filter((p) => p);
+  const postId = pathParts.length >= 3 && pathParts[0] === 'posts-api' ? pathParts[1] : pathParts[pathParts.length - 2];
+
+  if (!postId) {
+    return createErrorResponse(ERROR_POST_ID_REQUIRED, STATUS_BAD_REQUEST, correlationId);
+  }
+
+  try {
+    const body = await req.json() as { scheduled_at: string };
+    
+    if (!body.scheduled_at) {
+      return createErrorResponse('scheduled_at is required', STATUS_BAD_REQUEST, correlationId);
+    }
+
+    const scheduledDate = new Date(body.scheduled_at);
+    if (isNaN(scheduledDate.getTime())) {
+      return createErrorResponse('Invalid scheduled_at date format', STATUS_BAD_REQUEST, correlationId);
+    }
+
+    if (scheduledDate < new Date()) {
+      return createErrorResponse('scheduled_at must be in the future', STATUS_BAD_REQUEST, correlationId);
+    }
+
+    const fetchResult = await fetchPost(supabase, postId);
+    if (fetchResult.error || !fetchResult.data) {
+      throw new UtilsError(ERROR_POST_NOT_FOUND, ERROR_CODE_POST_NOT_FOUND, STATUS_NOT_FOUND);
+    }
+
+    const updates: Record<string, unknown> = {
+      [COLUMN_SCHEDULED_PUBLISH_AT]: scheduledDate.toISOString(),
+      [COLUMN_STATUS]: 'scheduled',
+      [COLUMN_UPDATED_AT]: new Date().toISOString(),
+    };
+
+    const { data: updatedPost, error: updateError } = await retryOperation(
+      async () => {
+        const result = await supabase
+          .from(TABLE_BLOG_POSTS)
+          .update(updates)
+          .eq(COLUMN_ID, postId)
+          .select()
+          .single();
+
+        if (result.error) {
+          throw new SupabaseClientError('Failed to schedule post', result.error);
+        }
+        return result;
+      },
+      CONFIG.MAX_RETRIES,
+      CONFIG.RETRY_DELAY_MS,
+    );
+
+    if (updateError || !updatedPost) {
+      throw new UtilsError('Failed to schedule post', ERROR_CODE_INTERNAL_ERROR, STATUS_INTERNAL_ERROR);
+    }
+
+    return createSuccessResponse(updatedPost, correlationId, {}, { compression: true, request: req });
+  } catch (error) {
+    logger.error('Post scheduling failed', {
+      correlationId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
+  }
+}
+
 async function routeRequest(ctx: RequestContext): Promise<Response> {
   const url = new URL(ctx.req.url);
   const pathParts = url.pathname.split(PATH_SEPARATOR).filter((p) => p);
   const path = pathParts[pathParts.length - 1] ?? '';
 
-  // Check if this is analytics track endpoint (POST /analytics/track)
-  // Path structure: /api-router/analytics/track -> pathParts = ['api-router', 'analytics', 'track']
+  if (pathParts.length >= 2 && pathParts[0] === 'posts-api') {
+    const method = ctx.req.method;
+    const lastPart = pathParts[pathParts.length - 1];
+    const secondLastPart = pathParts.length >= 3 ? pathParts[pathParts.length - 2] : null;
+
+    if (lastPart === 'schedule' && secondLastPart && method === METHOD_POST) {
+      const postId = secondLastPart;
+      return handleRequest(ctx.req, handleSchedulePost, {
+        requiresAuth: true,
+        compression: true,
+        rateLimit: { maxRequests: RATE_LIMIT_POSTS, windowMs: RATE_LIMIT_WINDOW_MS },
+        timeout: DEFAULT_CREATE_POST_TIMEOUT,
+        maxRequestSize: DEFAULT_MAX_REQUEST_SIZE_POSTS,
+      });
+    }
+
+    const postId = lastPart;
+
+    if (method === METHOD_PATCH) {
+      return handleRequest(ctx.req, handleUpdatePost, {
+        requiresAuth: true,
+        compression: true,
+        rateLimit: { maxRequests: RATE_LIMIT_POSTS, windowMs: RATE_LIMIT_WINDOW_MS },
+        timeout: DEFAULT_CREATE_POST_TIMEOUT,
+        validateInput: validatePostUpdateParams,
+        maxRequestSize: DEFAULT_MAX_REQUEST_SIZE_POSTS,
+      });
+    }
+
+    if (method === METHOD_DELETE) {
+      return handleRequest(ctx.req, handleDeletePost, {
+        requiresAuth: true,
+        compression: true,
+        rateLimit: { maxRequests: RATE_LIMIT_POSTS, windowMs: RATE_LIMIT_WINDOW_MS },
+        timeout: DEFAULT_CREATE_POST_TIMEOUT,
+      });
+    }
+  }
+
+  if (path === 'create-post' && ctx.req.method === METHOD_POST) {
+    return handleRequest(ctx.req, handleCreatePost, {
+      requiresAuth: true,
+      compression: true,
+      rateLimit: { maxRequests: 10, windowMs: RATE_LIMIT_WINDOW_MS },
+      timeout: DEFAULT_CREATE_POST_TIMEOUT,
+      validateInput: validatePostCreationParams,
+      maxRequestSize: DEFAULT_MAX_REQUEST_SIZE_POSTS,
+    });
+  }
+
   if (pathParts.length >= 3 && pathParts[pathParts.length - 2] === 'analytics' && path === 'track' && ctx.req.method === METHOD_POST) {
     const correlationId = ctx.correlationId;
     return await handleTrack(ctx.req, correlationId);
   }
 
-  // Check if this is a nested route (e.g., /schedule/check-conflicts)
   if (pathParts.length >= 2 && pathParts[0] === 'schedule' && pathParts[1] === 'check-conflicts') {
     return handleRequest(ctx.req, handleCheckScheduleConflicts, {
       requiresAuth: true,
@@ -2433,7 +3200,6 @@ async function routeRequest(ctx: RequestContext): Promise<Response> {
     });
   }
 
-  // Check if this is regeneration limits check
   if (pathParts.length >= 2 && pathParts[0] === 'regeneration' && pathParts[1] === 'check-limits') {
     return handleRequest(ctx.req, handleRegenerationLimits, {
       requiresAuth: true,
@@ -2442,7 +3208,6 @@ async function routeRequest(ctx: RequestContext): Promise<Response> {
     });
   }
 
-  // Check if this is a queue route
   if (pathParts.length >= 2 && pathParts[pathParts.length - 2] === 'queue') {
     return handleRequest(ctx.req, handleQueue, {
       requiresAuth: true,
@@ -2451,7 +3216,6 @@ async function routeRequest(ctx: RequestContext): Promise<Response> {
     });
   }
   
-  // Check if this is a queue route (direct /queue)
   if (pathParts[pathParts.length - 1] === 'queue') {
     return handleRequest(ctx.req, handleQueue, {
       requiresAuth: true,
@@ -2460,27 +3224,24 @@ async function routeRequest(ctx: RequestContext): Promise<Response> {
     });
   }
 
-  // Check if this is a billing check endpoint
   if (pathParts.length >= 2 && pathParts[0] === 'billing' && pathParts[1] === 'check') {
     return handleRequest(ctx.req, handleBillingCheck, {
       requiresAuth: true,
       compression: true,
       rateLimit: { maxRequests: RATE_LIMIT_QUOTA, windowMs: RATE_LIMIT_WINDOW_MS },
-      cache: { ttl: 60000 }, // Cache for 1 minute
+      cache: { ttl: 60000 },
     });
   }
 
-  // Check if this is a billing check endpoint
   if (pathParts.length >= 2 && pathParts[pathParts.length - 2] === 'billing' && pathParts[pathParts.length - 1] === 'check') {
     return handleRequest(ctx.req, handleBillingCheck, {
       requiresAuth: true,
       compression: true,
       rateLimit: { maxRequests: RATE_LIMIT_QUOTA, windowMs: RATE_LIMIT_WINDOW_MS },
-      cache: { ttl: 60000 }, // Cache for 1 minute
+      cache: { ttl: 60000 },
     });
   }
 
-  // Check if this is a batch dashboard endpoint (combines store, quota, posts, analytics)
   if (pathParts.length >= 2 && pathParts[pathParts.length - 2] === 'dashboard' && pathParts[pathParts.length - 1] === 'batch') {
     return handleRequest(ctx.req, handleDashboardBatch, {
       requiresAuth: true,
@@ -2506,11 +3267,7 @@ async function routeRequest(ctx: RequestContext): Promise<Response> {
         compression: true,
         rateLimit: { maxRequests: RATE_LIMIT_QUOTA, windowMs: RATE_LIMIT_WINDOW_MS },
         cache: { ttl: CACHE_TTL_QUOTA },
-        validateInput: (params) => {
-          // storeId can come from params, body, or ctx.storeId (set from URL path)
-          // We'll check for it in the handler, so validation is lenient here
-          return { valid: true };
-        },
+        validateInput: () => ({ valid: true }),
       },
     },
     posts: {
@@ -2521,8 +3278,6 @@ async function routeRequest(ctx: RequestContext): Promise<Response> {
         rateLimit: { maxRequests: RATE_LIMIT_POSTS, windowMs: RATE_LIMIT_WINDOW_MS },
         cache: { ttl: CACHE_TTL_POSTS },
         validateInput: (params) => {
-          // storeId can come from params or ctx.storeId (set from URL path)
-          // We'll check for it in the handler, so validation is lenient here
           const validationParams = params as ValidationParams;
           if (validationParams.status) {
             if (!VALID_STATUSES.includes(validationParams.status)) {
@@ -2561,7 +3316,7 @@ async function routeRequest(ctx: RequestContext): Promise<Response> {
         requiresAuth: true,
         compression: true,
         rateLimit: { maxRequests: RATE_LIMIT_POSTS, windowMs: RATE_LIMIT_WINDOW_MS },
-        cache: { ttl: 30000 }, // 30 seconds
+        cache: { ttl: 30000 },
       },
     },
   };
@@ -2575,7 +3330,6 @@ async function routeRequest(ctx: RequestContext): Promise<Response> {
   return handleRequest(ctx.req, matchedRoute.handler, matchedRoute.config);
 }
 
-// Wrap the entire serve handler to catch any errors that might occur during initialization
 try {
   serve(async (req: Request) => {
     if (req.method === METHOD_OPTIONS) {
@@ -2586,20 +3340,16 @@ try {
       const url = new URL(req.url);
       const pathParts = url.pathname.split(PATH_SEPARATOR).filter((p) => p);
       
-      // Handle /store/{shopDomain} route - check if 'store' is in path and has a value after it
-      // Path could be: /functions/v1/api-router/store/{shopDomain} or /functions/v1/store/{shopDomain}
-      // Let handleRequest create the context to ensure proper error handling
       const storeIndex = pathParts.indexOf('store');
       if (storeIndex !== -1 && storeIndex < pathParts.length - 1) {
         return await handleRequest(req, handleStore, {
-          requiresAuth: false, // Store lookup by shop domain doesn't require auth
+          requiresAuth: false,
           compression: true,
           rateLimit: { maxRequests: 100, windowMs: 60000 },
-          cache: { ttl: 300000 }, // 5 minutes
+          cache: { ttl: 300000 },
         });
       }
       
-      // For other routes, create context and route
       const ctx = await createRequestContext(req);
       return await routeRequest(ctx);
     } catch (error) {
@@ -2610,7 +3360,6 @@ try {
         stack: error instanceof Error ? error.stack : undefined,
       });
 
-      // Ensure we always return our error format, not Supabase's generic format
       try {
         return createErrorResponse(
           error instanceof Error ? error.message : ERROR_INTERNAL_SERVER,
@@ -2625,7 +3374,6 @@ try {
           },
         );
       } catch (responseError) {
-        // Fallback if even createErrorResponse fails
         logger.error('Failed to create error response', { error: responseError });
         return new Response(
           JSON.stringify({
@@ -2651,9 +3399,10 @@ try {
     }
   });
 } catch (initError) {
-  // Catch any errors during module initialization
-  console.error('FATAL: Function initialization failed:', initError);
-  // This won't help if the error happens before serve() is called, but it's a safety net
+  logger.error('FATAL: Function initialization failed', {
+    error: initError instanceof Error ? initError.message : String(initError),
+    stack: initError instanceof Error ? initError.stack : undefined,
+  });
   serve(async (req: Request) => {
     const correlationId = req.headers.get(HEADER_X_CORRELATION_ID) ?? `${Date.now()}-${Math.random()}`;
     return new Response(
