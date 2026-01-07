@@ -19,6 +19,18 @@ export interface SettingsData {
 
 type Mutable<T> = { -readonly [K in keyof T]: T[K] };
 
+// Deep-partial shape for UI updates (lets us toggle individual notification fields without requiring `enabled`)
+export interface SettingsUpdates {
+  readonly brand_safety_enabled?: boolean;
+  readonly notifications?: {
+    readonly email?: {
+      readonly enabled?: boolean;
+      readonly article_published?: boolean;
+      readonly article_scheduled?: boolean;
+    };
+  };
+}
+
 export interface UseSettingsDataOptions {
   readonly enableRealTime?: boolean;
   readonly refetchInterval?: number;
@@ -34,7 +46,7 @@ export interface UseSettingsDataReturn {
   readonly isError: boolean;
   readonly error: Error | null;
   readonly saveSettings: () => void;
-  readonly updateSettings: (updates: Partial<SettingsData>) => void;
+  readonly updateSettings: (updates: SettingsUpdates) => void;
   readonly resetSettings: () => void;
   readonly isSaving: boolean;
   readonly saveError: Error | null;
@@ -118,14 +130,18 @@ const validateSettingsData = (settings: SettingsData | null): SettingsData | nul
   if (typeof settings.brand_safety_enabled !== 'boolean') {
     return null;
   }
+  const email = settings.notifications?.email;
+  if (email && typeof email === 'object' && typeof email.enabled !== 'boolean') {
+    return null;
+  }
   return settings;
 };
 
-const validatePartialSettings = (updates: Partial<SettingsData> | null | undefined): Partial<SettingsData> => {
+const validatePartialSettings = (updates: SettingsUpdates | null | undefined): SettingsUpdates => {
   if (!updates || typeof updates !== 'object') {
     return {};
   }
-  const validated: Mutable<Partial<SettingsData>> = {};
+  const validated: Mutable<SettingsUpdates> = {};
   if ('brand_safety_enabled' in updates && typeof updates.brand_safety_enabled === 'boolean') {
     validated.brand_safety_enabled = updates.brand_safety_enabled;
   }
@@ -133,12 +149,7 @@ const validatePartialSettings = (updates: Partial<SettingsData> | null | undefin
     const notifications = updates.notifications;
     const email = notifications.email;
     if (email !== null && typeof email === 'object') {
-      type MutableEmail = {
-        enabled?: boolean;
-        article_published?: boolean;
-        article_scheduled?: boolean;
-      };
-      const validatedEmail: MutableEmail = {};
+      const validatedEmail: Mutable<NonNullable<NonNullable<SettingsUpdates['notifications']>['email']>> = {};
       if (typeof email.enabled === 'boolean') {
         validatedEmail.enabled = email.enabled;
       }
@@ -156,14 +167,52 @@ const validatePartialSettings = (updates: Partial<SettingsData> | null | undefin
   return validated;
 };
 
+function mergeSettings(base: SettingsData, updates: SettingsUpdates): SettingsData {
+  const baseEmail = base.notifications?.email;
+  const updEmail = updates.notifications?.email;
+
+  const mergedEmail =
+    baseEmail || updEmail
+      ? {
+          enabled: (updEmail?.enabled ?? baseEmail?.enabled ?? false) as boolean,
+          article_published: updEmail?.article_published ?? baseEmail?.article_published,
+          article_scheduled: updEmail?.article_scheduled ?? baseEmail?.article_scheduled,
+        }
+      : undefined;
+
+  const mergedNotifications =
+    base.notifications || updates.notifications
+      ? {
+          email: mergedEmail,
+        }
+      : undefined;
+
+  return {
+    brand_safety_enabled: updates.brand_safety_enabled ?? base.brand_safety_enabled,
+    notifications: mergedNotifications,
+  };
+}
+
 function mapStoreToSettings(store: StoreWithSettings | null): SettingsData | null {
   if (!isStoreWithSettings(store)) {
     return null;
   }
   try {
+    const email = store.notifications?.email;
+    const normalizedNotifications =
+      email && typeof email === 'object'
+        ? {
+            email: {
+              enabled: typeof email.enabled === 'boolean' ? email.enabled : false,
+              article_published: typeof email.article_published === 'boolean' ? email.article_published : undefined,
+              article_scheduled: typeof email.article_scheduled === 'boolean' ? email.article_scheduled : undefined,
+            },
+          }
+        : store.notifications || undefined;
+
     return {
       brand_safety_enabled: typeof store.brand_safety_enabled === 'boolean' ? store.brand_safety_enabled : true,
-      notifications: store.notifications || undefined,
+      notifications: normalizedNotifications,
     };
   } catch {
     return null;
@@ -185,7 +234,7 @@ export function useSettingsData(
   const queryClient = useQueryClient();
   const { isOnline } = useNetworkStatus();
   const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
-  const [localSettings, setLocalSettings] = useState<Partial<SettingsData>>({});
+  const [localSettings, setLocalSettings] = useState<SettingsUpdates>({});
 
   const validatedRefetchInterval = useMemo(
     () => validateRefetchInterval(refetchInterval),
@@ -235,7 +284,7 @@ export function useSettingsData(
       return null;
     }
     try {
-      const merged = { ...settings, ...localSettings };
+      const merged = mergeSettings(settings, localSettings);
       return validateSettingsData(merged);
     } catch {
       return settings;
@@ -305,7 +354,7 @@ export function useSettingsData(
   }, [autoSave, hasUnsavedChanges, mergedSettings, validatedAutoSaveDelay, saveMutation]);
 
   const updateSettings = useCallback(
-    (updates: Partial<SettingsData>) => {
+    (updates: SettingsUpdates) => {
       if (!isMountedRef.current) {
         return;
       }
@@ -316,7 +365,14 @@ export function useSettingsData(
         }
         setLocalSettings((prev) => {
           try {
-            return { ...prev, ...validated };
+            // Deep-merge notifications.email
+            const nextEmail = validated.notifications?.email
+              ? { ...(prev.notifications?.email ?? {}), ...validated.notifications.email }
+              : prev.notifications?.email;
+            const nextNotifications = validated.notifications
+              ? { ...(prev.notifications ?? {}), ...(validated.notifications ?? {}), email: nextEmail }
+              : prev.notifications;
+            return { ...prev, ...validated, notifications: nextNotifications };
           } catch {
             return prev;
           }
