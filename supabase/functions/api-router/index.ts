@@ -1092,7 +1092,6 @@ async function handleQuota(ctx: RequestContext): Promise<Response> {
     const storeData = store as { id: string; plan_id: string | null; trial_started_at?: string | null; trial_ends_at?: string | null };
     
     if (!storeData.plan_id) {
-      const { PlanManager } = await import('../backend/src/core/PlanManager.ts');
       const planManager = new PlanManager(serviceSupabase);
 
       const initResult = await retryOperation(
@@ -1906,7 +1905,6 @@ async function handleCompleteSetup(ctx: RequestContext): Promise<Response> {
       const trialExpired = !trialEndsAt || new Date(trialEndsAt) < new Date();
       
       if (!planId || trialExpired) {
-        const { PlanManager } = await import('../backend/src/core/PlanManager.ts');
         const planManager = new PlanManager(serviceSupabase);
 
         const initResult = await planManager.initializeTrial(
