@@ -14,17 +14,17 @@ import {
   validateAuthHeader,
   createCORSHeaders,
 } from '../_shared/utils.ts';
-import type { BlogPostContent } from '../../../backend/src/core/BlogComposer.ts';
-import { PlanManager } from '../../../backend/src/core/PlanManager.ts';
-import { GDPRDataGuard } from '../../../backend/src/core/GDPRDataGuard.ts';
-import { BlogComposer } from '../../../backend/src/core/BlogComposer.ts';
-import { KeywordMiner } from '../../../backend/src/core/KeywordMiner.ts';
-import { SEOOptimizer } from '../../../backend/src/core/SEOOptimizer.ts';
-import { ContentGraph } from '../../../backend/src/core/ContentGraph.ts';
-import { ProductContextEngine } from '../../../backend/src/core/ProductContextEngine.ts';
-import { ImageGenerator } from '../../../backend/src/core/ImageGenerator.ts';
-import { JobQueue } from '../../../backend/src/core/JobQueue.ts';
-import { ShopifyClient } from '../../../backend/src/integrations/ShopifyClient.ts';
+import type { BlogPostContent } from '../backend/src/core/BlogComposer.ts';
+import { PlanManager } from '../backend/src/core/PlanManager.ts';
+import { GDPRDataGuard } from '../backend/src/core/GDPRDataGuard.ts';
+import { BlogComposer } from '../backend/src/core/BlogComposer.ts';
+import { KeywordMiner } from '../backend/src/core/KeywordMiner.ts';
+import { SEOOptimizer } from '../backend/src/core/SEOOptimizer.ts';
+import { ContentGraph } from '../backend/src/core/ContentGraph.ts';
+import { ProductContextEngine } from '../backend/src/core/ProductContextEngine.ts';
+import { ImageGenerator } from '../backend/src/core/ImageGenerator.ts';
+import { JobQueue } from '../backend/src/core/JobQueue.ts';
+import { ShopifyClient } from '../backend/src/integrations/ShopifyClient.ts';
 
 interface DenoEnv {
   readonly get?: (key: string) => string | undefined;
