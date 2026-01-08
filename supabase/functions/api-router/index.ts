@@ -25,6 +25,7 @@ import { ProductContextEngine } from '../backend/src/core/ProductContextEngine.t
 import { ImageGenerator } from '../backend/src/core/ImageGenerator.ts';
 import { JobQueue } from '../backend/src/core/JobQueue.ts';
 import { ShopifyClient } from '../backend/src/integrations/ShopifyClient.ts';
+import { ArticlesQueue } from '../backend/src/core/ArticlesQueue.ts';
 
 interface DenoEnv {
   readonly get?: (key: string) => string | undefined;
@@ -1704,7 +1705,6 @@ async function handleQueue(ctx: RequestContext): Promise<Response> {
         return createErrorResponse('storeId is required', STATUS_BAD_REQUEST, correlationId);
       }
       
-      const { ArticlesQueue } = await import('../backend/src/core/ArticlesQueue.ts');
       const serviceSupabase = await getSupabaseClient({ clientType: 'service' });
       const queue = new ArticlesQueue(serviceSupabase);
       const metrics = await queue.getQueueMetrics(targetStoreId);
@@ -1721,7 +1721,6 @@ async function handleQueue(ctx: RequestContext): Promise<Response> {
         return createErrorResponse('storeId is required', STATUS_BAD_REQUEST, correlationId);
       }
       
-      const { ArticlesQueue } = await import('../backend/src/core/ArticlesQueue.ts');
       const serviceSupabase = await getSupabaseClient({ clientType: 'service' });
       
       // Get store data for AI generation
@@ -1757,7 +1756,6 @@ async function handleQueue(ctx: RequestContext): Promise<Response> {
         return createErrorResponse('articleIds array is required', STATUS_BAD_REQUEST, correlationId);
       }
       
-      const { ArticlesQueue } = await import('../backend/src/core/ArticlesQueue.ts');
       const serviceSupabase = await getSupabaseClient({ clientType: 'service' });
       const queue = new ArticlesQueue(serviceSupabase);
       
@@ -1781,7 +1779,6 @@ async function handleQueue(ctx: RequestContext): Promise<Response> {
         return createErrorResponse('articleId is required', STATUS_BAD_REQUEST, correlationId);
       }
       
-      const { ArticlesQueue } = await import('../backend/src/core/ArticlesQueue.ts');
       const serviceSupabase = await getSupabaseClient({ clientType: 'service' });
       
       // Get store data for AI generation
@@ -1817,7 +1814,6 @@ async function handleQueue(ctx: RequestContext): Promise<Response> {
       return createErrorResponse('storeId is required', STATUS_BAD_REQUEST, correlationId);
     }
     
-    const { ArticlesQueue } = await import('../backend/src/core/ArticlesQueue.ts');
     const serviceSupabase = await getSupabaseClient({ clientType: 'service' });
     const queue = new ArticlesQueue(serviceSupabase);
     const queueList = await queue.getQueue(targetStoreId);
@@ -1953,8 +1949,6 @@ async function handleCompleteSetup(ctx: RequestContext): Promise<Response> {
   logger.info('Setup completed', { correlationId, storeId, shopDomain });
 
   try {
-    const { ArticlesQueue } = await import('../backend/src/core/ArticlesQueue.ts');
-    
     const { data: store } = await serviceSupabase
       .from('stores')
       .select('brand_dna, tone_matrix, content_preferences, plan_id, plan_limits(plan_name)')
