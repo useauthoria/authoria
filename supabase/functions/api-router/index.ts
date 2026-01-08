@@ -1093,30 +1093,40 @@ async function handleQuota(ctx: RequestContext): Promise<Response> {
     const storeData = store as { id: string; plan_id: string | null; trial_started_at?: string | null; trial_ends_at?: string | null };
     
     if (!storeData.plan_id) {
-      const planManager = new PlanManager(serviceSupabase);
+      try {
+        const planManager = new PlanManager(serviceSupabase);
 
-      const initResult = await retryOperation(
-        async () => {
-          return await planManager.initializeTrial(storeId, 14, correlationId, false);
-        },
-        CONFIG.MAX_RETRIES,
-        CONFIG.RETRY_DELAY_MS,
-      );
+        const initResult = await retryOperation(
+          async () => {
+            return await planManager.initializeTrial(storeId, 14, correlationId, false);
+          },
+          CONFIG.MAX_RETRIES,
+          CONFIG.RETRY_DELAY_MS,
+        );
 
-      if (!initResult.success) {
-        logger.error('Failed to initialize trial', {
+        if (!initResult.success) {
+          logger.error('Failed to initialize trial', {
+            correlationId,
+            error: initResult.error,
+            storeId,
+          });
+          throw new SupabaseClientError('Failed to initialize trial', { error: initResult.error || 'Unknown error' });
+        }
+
+        logger.info('Initialized trial for store without plan', {
           correlationId,
-          error: initResult.error,
           storeId,
+          trialStatus: initResult.trialStatus,
         });
-        throw new SupabaseClientError('Failed to initialize trial', { error: initResult.error || 'Unknown error' });
+      } catch (planError) {
+        logger.error('Error in PlanManager initialization', {
+          correlationId,
+          storeId,
+          error: planError instanceof Error ? planError.message : String(planError),
+          stack: planError instanceof Error ? planError.stack : undefined,
+        });
+        // Continue anyway - we'll try to get quota status
       }
-
-      logger.info('Initialized trial for store without plan', {
-        correlationId,
-        storeId,
-        trialStatus: initResult.trialStatus,
-      });
     }
 
     const quotaStatus = await retryOperation(
@@ -1174,9 +1184,29 @@ async function handleQuota(ctx: RequestContext): Promise<Response> {
     logger.error('Quota fetch error', {
       correlationId,
       error: error instanceof Error ? error.message : String(error),
+      errorStack: error instanceof Error ? error.stack : undefined,
+      errorName: error instanceof Error ? error.name : typeof error,
       storeId,
     });
-    throw error;
+    
+    // Return a more detailed error response
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    const errorCode = error instanceof UtilsError ? error.code : 'QUOTA_FETCH_ERROR';
+    const statusCode = error instanceof UtilsError ? error.statusCode : STATUS_INTERNAL_ERROR;
+    
+    return createErrorResponse(
+      errorMessage || 'Failed to fetch quota status',
+      statusCode,
+      correlationId,
+      {
+        code: errorCode,
+        storeId,
+        debugInfo: {
+          errorName: error instanceof Error ? error.name : typeof error,
+        },
+      },
+      req,
+    );
   }
 }
 
@@ -2397,9 +2427,29 @@ async function handleDashboardBatch(ctx: RequestContext): Promise<Response> {
     logger.error('Dashboard batch error', {
       correlationId,
       error: error instanceof Error ? error.message : String(error),
+      errorStack: error instanceof Error ? error.stack : undefined,
+      errorName: error instanceof Error ? error.name : typeof error,
       storeId,
     });
-    throw error;
+    
+    // Return a more detailed error response
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    const errorCode = error instanceof UtilsError ? error.code : 'DASHBOARD_BATCH_ERROR';
+    const statusCode = error instanceof UtilsError ? error.statusCode : STATUS_INTERNAL_ERROR;
+    
+    return createErrorResponse(
+      errorMessage || 'Failed to fetch dashboard data',
+      statusCode,
+      correlationId,
+      {
+        code: errorCode,
+        storeId,
+        debugInfo: {
+          errorName: error instanceof Error ? error.name : typeof error,
+        },
+      },
+      req,
+    );
   }
 }
 
